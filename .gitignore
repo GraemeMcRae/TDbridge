@@ -1,0 +1,88 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor and IDE settings (VSCode, PyCharm, etc.)
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Scratch / local notes
+scratch/
+*.local.md
+
+# BOX files
+.clasprc.json
+.clasp*.json
+node_modules/
+
+credentials.txt
+[Bb][Oo][Xx]*credentials*.txt
+
+# Environment variables and secrets
+.env
+*.env
+.env.local
+.env.*.local
+[Cc]onfidential*
+[Ss]ecret*
+[Dd]ebug*
+
+# Google credentials
+google_credentials*.json
+google_oauth_client*.json
+google_oauth_token*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pyo
+*.pyd
+venv*/
+env/
+ENV/
+
+# Microsoft Office backup files
+~$*
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+*.log.*
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+junk*
+Versioning*
+_file_dates_snapshot.json
+
+# Backups of project files
+*BK202*.*
+
+# CSV files used by this project
+Trip*.csv
+*concat*.csv
+*concat*.xl*
+Work_Order*.csv
+
+# HCF_login_status.json - keeps track of logged in users across bot restarts
+*login_status*.json
+
+# Browser
+bm/
+browser_data*/
+verbose*.png
+debug*.png
+page_dump*.json
+screenshot*.png
