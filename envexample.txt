@@ -1,0 +1,44 @@
+# TDbridge Bot Configuration
+# NEVER commit the actual .env files to git!
+# Environment can be 'test' or 'prod', and is set by the --env command line option passed to bot.py
+# One of the two Bot configurations (Discord Token and Channel ID) is selected
+# Discord Tokens are found using https://discord.com/developers/applications then click Bot > Reset Token
+#    WARNING! Resetting the token of an existing bot will cause it to fail immediately!
+# Discord Channel IDs are found by right-clicking channel in Discord with Developer Mode on to copy ID
+
+# Test Bot configuration - Discord
+TEST_DISCORD_BOT_TOKEN="<bot-token>"
+TEST_DISCORD_BOT_NAME=TDbridgeTest
+TEST_DISCORD_BOT_NICKNAME="TDbridge TESTING"
+TEST_DISCORD_BOT_APPLICATION_ID="1508644856690507806"
+TEST_DISCORD_BOT_PUBLIC_KEY="b2152976a1cf99282d1929b24fc8dede17babcd2f59ab90c4fa2d05f4891a2d0"
+# Test Bot configuration - Telegram
+TEST_TELEGRAM_BOT_TOKEN="<bot-token>"
+TEST_TELEGRAM_BOT_NAME="TDbridge Test"
+TEST_TELEGRAM_BOT_USERNAME="TDbridgeTestBot"
+TEST_TELEGRAM_BOT_URL="https://t.me/TDbridgeTestBot"
+TEST_GOOGLE_SPREADSHEET_NAME="TDbridge Config Test"
+# Emojis -- the following parameter isn't in use for TDbridge, but it is used in HCF to discern the sentiment driving the use of certain emojis
+TEST_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, ok_hand, white_check_mark, pray, sunglasses, muscle, 100, checkered_flag, raised_hands"
+
+# Prod Bot configuration - Discord
+PROD_DISCORD_BOT_TOKEN="<bot-token>"
+PROD_DISCORD_BOT_NAME=TDbridge
+PROD_DISCORD_BOT_NICKNAME="TDbridge"
+PROD_DISCORD_BOT_APPLICATION_ID="1508650784730910870"
+PROD_DISCORD_BOT_PUBLIC_KEY="0a476d1cb4e7237801bbda81ec7067e3fc2155fe8bd73dc9b187d6cb106041b0"
+# Prod Bot configuration - Telegram
+PROD_TELEGRAM_BOT_TOKEN="<bot-token>"
+PROD_TELEGRAM_BOT_NAME=TDbridge
+PROD_TELEGRAM_BOT_USERNAME="TDbridgeProdBot"
+PROD_TELEGRAM_BOT_URL="https://t.me/TDbridgeProdBot"
+PROD_GOOGLE_SPREADSHEET_NAME="TDbridge Config"
+# Emojis -- the following parameter isn't in use for TDbridge, but it is used in HCF to discern the sentiment driving the use of certain emojis
+PROD_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, ok_hand, white_check_mark, pray, sunglasses, muscle, 100, checkered_flag, raised_hands"
+
+# Time Zone
+LOCAL_TIMEZONE="America/Los_Angeles"
+
+# Google Credentials for service account <serviceaccountname>@<botname>.iam.gserviceaccount.com
+# IMPORTANT: Make sure google_credentials.json is included in .gitignore
+GOOGLE_CREDENTIALS_FILE=google_credentials_TDbridge.json
