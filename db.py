@@ -80,6 +80,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_dc
     ON message_map (dc_channel_id, dc_message_id);
 """
 
+# bot_status table — persists a small set of key-value pairs across restarts.
+# Keys are plain strings; values are stored as text and interpreted by the
+# caller.  There is at most one row per key (INSERT OR REPLACE).
+_CREATE_BOT_STATUS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS bot_status (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+"""
+
 
 def _connect() -> sqlite3.Connection:
     """Open a new SQLite connection with WAL mode for better concurrency."""
@@ -100,6 +111,7 @@ def init_db() -> None:
         conn.execute(_CREATE_TABLE_SQL)
         conn.execute(_CREATE_INDEX_TG_SQL)
         conn.execute(_CREATE_INDEX_DC_SQL)
+        conn.execute(_CREATE_BOT_STATUS_TABLE_SQL)
     logger.info(f"SQLite message store initialised: {_DB_PATH}")
 
 
@@ -231,6 +243,31 @@ def delete_by_dc(dc_channel_id: str, dc_message_id: str) -> bool:
     if deleted:
         logger.debug(f"DB delete: dc({dc_channel_id},{dc_message_id})")
     return deleted
+
+
+def set_status_value(key: str, value: str) -> None:
+    """Persist a key-value pair in the bot_status table.
+
+    Uses INSERT OR REPLACE so the row is created on first write and updated
+    on subsequent writes.  Thread-safe (opens its own connection).
+    """
+    sql = """
+        INSERT OR REPLACE INTO bot_status (key, value, updated_at)
+        VALUES (?, ?, ?)
+    """
+    with _connect() as conn:
+        conn.execute(sql, (key, value, time.time()))
+
+
+def get_status_value(key: str, default: str = "") -> str:
+    """Retrieve a persisted key-value pair from the bot_status table.
+
+    Returns `default` if the key does not exist.
+    """
+    sql = "SELECT value FROM bot_status WHERE key = ? LIMIT 1"
+    with _connect() as conn:
+        row = conn.execute(sql, (key,)).fetchone()
+    return row[0] if row else default
 
 
 def purge_older_than(days: int = 30) -> int:

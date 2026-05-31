@@ -119,6 +119,31 @@ class BotStatus:
 status = BotStatus()
 
 
+def _save_unlocked_timestamps() -> None:
+    """Persist the three last-unlocked timestamps to SQLite.
+
+    Called by sheets_manager._update_lock_status() whenever a table is
+    found to be unlocked, so the timestamps are immediately durable.
+
+    This is a module-level function (not a DashboardReporter method) to
+    avoid a circular import: bot.py creates the DashboardReporter instance,
+    and sheets_manager.py cannot import from bot.py without creating a cycle.
+    Instead, sheets_manager imports this function directly from
+    dashboard_reporter, which has no dependency on bot.py.
+    """
+    import db as _db
+    s = status
+    try:
+        _db.set_status_value("d_user_last_unlocked",
+                             s.d_user_last_unlocked.isoformat())
+        _db.set_status_value("d_channel_last_unlocked",
+                             s.d_channel_last_unlocked.isoformat())
+        _db.set_status_value("t_group_last_unlocked",
+                             s.t_group_last_unlocked.isoformat())
+    except Exception as e:
+        logger.warning(f"_save_unlocked_timestamps: DB write failed: {e}")
+
+
 class DashboardReporter:
     """Manages periodic Status Report log lines for the Manager Dashboard.
 
@@ -183,6 +208,91 @@ class DashboardReporter:
             pass
         finally:
             logger.info("DashboardReporter: periodic Status Report stopped")
+
+    # ── Persistence ────────────────────────────────────────────────────────────
+
+    def load_from_db(self) -> None:
+        """Restore persisted status fields from SQLite.
+
+        Call once during startup, after init_db() but before emit_startup().
+        Fields that are not found in the DB (e.g. first-ever run) are left
+        at their default values from BotStatus.__init__().
+
+        Persisted fields:
+            tg_last_update  — aware datetime of the last Telegram update
+                              received before the previous shutdown.  Restored
+                              so that tg_idle_min is accurate immediately after
+                              restart rather than showing 9999.
+            bridged_30m     — rolling 30-minute bridge count.  Restored so the
+                              next Status Report reflects activity before the
+                              restart as well as after.
+        """
+        import db as _db
+        s = self._status
+
+        def _restore_dt(key: str, attr: str) -> None:
+            """Restore a single datetime field from the DB."""
+            raw = _db.get_status_value(key, "")
+            if raw:
+                try:
+                    setattr(s, attr, datetime.fromisoformat(raw))
+                    logger.info(f"DashboardReporter: restored {attr}={getattr(s, attr)}")
+                except (ValueError, TypeError) as e:
+                    logger.warning(
+                        f"DashboardReporter: could not parse {key}={raw!r}: {e}"
+                    )
+
+        raw_tg = _db.get_status_value("tg_last_update", "")
+        if raw_tg:
+            try:
+                s.tg_last_update = datetime.fromisoformat(raw_tg)
+                logger.info(
+                    f"DashboardReporter: restored tg_last_update={s.tg_last_update}"
+                )
+            except (ValueError, TypeError) as e:
+                logger.warning(f"DashboardReporter: could not parse tg_last_update {raw_tg!r}: {e}")
+
+        raw_bridged = _db.get_status_value("bridged_30m", "")
+        if raw_bridged:
+            try:
+                s.bridged_30m = int(raw_bridged)
+                logger.info(
+                    f"DashboardReporter: restored bridged_30m={s.bridged_30m}"
+                )
+            except (ValueError, TypeError) as e:
+                logger.warning(f"DashboardReporter: could not parse bridged_30m {raw_bridged!r}: {e}")
+
+        # Restore the last-unlocked timestamps for all three tables.
+        # These must survive a restart so that if a table is still locked
+        # when the bot restarts, locked_min continues from where it left off
+        # rather than resetting to 0.
+        _restore_dt("d_user_last_unlocked",    "d_user_last_unlocked")
+        _restore_dt("d_channel_last_unlocked", "d_channel_last_unlocked")
+        _restore_dt("t_group_last_unlocked",   "t_group_last_unlocked")
+
+    def save_to_db(self) -> None:
+        """Persist status fields that should survive a restart.
+
+        Called automatically after each periodic report (so values are at
+        most 30 minutes stale after a crash) and during graceful shutdown.
+        Also called by bot.py whenever tg_last_update changes, so the value
+        is written frequently and stays accurate.
+        """
+        import db as _db
+        s = self._status
+
+        if s.tg_last_update is not None:
+            _db.set_status_value("tg_last_update", s.tg_last_update.isoformat())
+        _db.set_status_value("bridged_30m", str(s.bridged_30m))
+
+        # Persist the last-unlocked timestamps for all three tables so that
+        # locked_min is accurate after a restart even if a table is still locked.
+        _db.set_status_value("d_user_last_unlocked",
+                             s.d_user_last_unlocked.isoformat())
+        _db.set_status_value("d_channel_last_unlocked",
+                             s.d_channel_last_unlocked.isoformat())
+        _db.set_status_value("t_group_last_unlocked",
+                             s.t_group_last_unlocked.isoformat())
 
     # ── Private helpers ────────────────────────────────────────────────────────
 
@@ -259,3 +369,10 @@ class DashboardReporter:
 
         if reset_counters:
             s.bridged_30m = 0
+
+        # Persist after every emit so values survive a crash or restart.
+        # Use a try/except so a DB failure never silences the log line.
+        try:
+            self.save_to_db()
+        except Exception as e:
+            logger.warning(f"DashboardReporter: could not persist status to DB: {e}")

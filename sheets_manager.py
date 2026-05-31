@@ -267,6 +267,20 @@ def _update_lock_status(table_name: str, column_headers: list) -> None:
     setattr(_status, f"{prefix}_last_checked", now)
     if not is_locked:
         setattr(_status, f"{prefix}_last_unlocked", now)
+        # Persist the updated last-unlocked timestamp immediately so that if
+        # the bot restarts while the table is locked, locked_min continues
+        # from where it left off rather than resetting to 0.
+        # We call save_to_db() on the module-level reporter instance in
+        # dashboard_reporter rather than importing from bot.py (which would
+        # create a circular import: bot → sheets_manager → bot).
+        try:
+            import dashboard_reporter as _dr_mod
+            # The reporter instance is created in bot.py but save_to_db()
+            # only needs the status object, which lives in dashboard_reporter.
+            # We call it via a small helper to avoid tight coupling.
+            _dr_mod._save_unlocked_timestamps()
+        except Exception:
+            pass
     else:
         lock_col = next(h for h in column_headers if h.lower().startswith("lock"))
         logger.warning(

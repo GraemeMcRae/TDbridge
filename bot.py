@@ -623,9 +623,13 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"TG→DC: received message {tg_msg_id} from '{sender_name}' "
         f"in group {tg_group_id} ('{tg_chat.title}')"
     )
-    # Update Telegram connectivity timestamp for the health dashboard
-    from datetime import timezone as _tz
+    # Update Telegram connectivity timestamp for the health dashboard.
+    # Persist immediately so tg_idle_min is accurate after a restart.
     bot_status.tg_last_update = localnow()
+    try:
+        _dashboard_reporter.save_to_db()
+    except Exception:
+        pass
 
     # ---- Upsert T_Group info and check admin status ----
     asyncio.ensure_future(sheets_manager.upsert_t_group(
@@ -855,6 +859,10 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"in #{channel.name}"
     )
     bot_status.bridged_30m += 1
+    try:
+        _dashboard_reporter.save_to_db()
+    except Exception:
+        pass
 
 
 async def route_tg_edit_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -972,6 +980,10 @@ async def route_tg_reaction_to_discord(update: Update, context: ContextTypes.DEF
         f"tg_msg {tg_msg_id} in group {tg_group_id}"
     )
     bot_status.tg_last_update = localnow()
+    try:
+        _dashboard_reporter.save_to_db()
+    except Exception:
+        pass
 
     loop = asyncio.get_running_loop()
     record = await loop.run_in_executor(None, db.find_by_tg, tg_group_id, tg_msg_id)
@@ -1262,6 +1274,10 @@ class TDbridgeDiscordClient(discord.Client):
                     str(message.author.id),
                 )
                 bot_status.bridged_30m += 1
+                try:
+                    _dashboard_reporter.save_to_db()
+                except Exception:
+                    pass
 
         except Exception as e:
             logger.error(f"Failed to send Discord message to Telegram group {tg_group_id}: {e}")
@@ -1858,6 +1874,10 @@ async def _startup(discord_client: discord.Client) -> None:
     # Initialise SQLite
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, db.init_db)
+
+    # Restore persisted status fields so the first Status Report after a
+    # restart shows accurate tg_idle_min and bridged_30m rather than 9999/0.
+    _dashboard_reporter.load_from_db()
 
     # Initial Sheets load — read T_Group only.
     # D_User and D_Channel are intentionally skipped here because
