@@ -55,6 +55,7 @@ from telegram.ext import (
 from config import config, localnow
 import db
 import sheets_manager
+from dashboard_reporter import DashboardReporter, status as bot_status
 
 # On Linux (server), Telegram updates are received via webhook — the bot runs
 # its own HTTPS server and Telegram POSTs updates to it.
@@ -100,6 +101,10 @@ _tg_app: Optional[Application] = None
 _sheets_refresh_task: Optional[asyncio.Task] = None
 _db_purge_task: Optional[asyncio.Task] = None
 _discord_refresh_task: Optional[asyncio.Task] = None
+_dashboard_task: Optional[asyncio.Task] = None
+
+# Dashboard reporter — emits Status Report log lines every 30 minutes
+_dashboard_reporter = DashboardReporter(config, bot_status)
 
 
 # ===========================================================================
@@ -618,6 +623,9 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"TG→DC: received message {tg_msg_id} from '{sender_name}' "
         f"in group {tg_group_id} ('{tg_chat.title}')"
     )
+    # Update Telegram connectivity timestamp for the health dashboard
+    from datetime import timezone as _tz
+    bot_status.tg_last_update = localnow()
 
     # ---- Upsert T_Group info and check admin status ----
     asyncio.ensure_future(sheets_manager.upsert_t_group(
@@ -846,6 +854,7 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"TG→DC: bridged TG msg {tg_msg_id} → DC msg {dc_msg_id} "
         f"in #{channel.name}"
     )
+    bot_status.bridged_30m += 1
 
 
 async def route_tg_edit_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -962,6 +971,7 @@ async def route_tg_reaction_to_discord(update: Update, context: ContextTypes.DEF
         f"TG→DC reaction: {actor_name} reacted {emoji_str!r} to "
         f"tg_msg {tg_msg_id} in group {tg_group_id}"
     )
+    bot_status.tg_last_update = localnow()
 
     loop = asyncio.get_running_loop()
     record = await loop.run_in_executor(None, db.find_by_tg, tg_group_id, tg_msg_id)
@@ -1020,6 +1030,7 @@ class TDbridgeDiscordClient(discord.Client):
         logger.info(
             f"Discord bot ready: {self.user} (id={self.user.id})"
         )
+        bot_status.dc_connected = True
         # Set the bot's nickname in every guild it belongs to, as configured
         # in .env (e.g. TEST_DISCORD_BOT_NICKNAME="TDbridge TESTING").
         # Nickname is per-guild, so we loop over all guilds.
@@ -1250,6 +1261,7 @@ class TDbridgeDiscordClient(discord.Client):
                     root_tg_msg_id or tg_msg_id,
                     str(message.author.id),
                 )
+                bot_status.bridged_30m += 1
 
         except Exception as e:
             logger.error(f"Failed to send Discord message to Telegram group {tg_group_id}: {e}")
@@ -1872,6 +1884,10 @@ async def _startup(discord_client: discord.Client) -> None:
     _db_purge_task         = asyncio.create_task(_db_purge_loop())
     _discord_refresh_task  = asyncio.create_task(_discord_refresh_loop(discord_client))
 
+    # Emit startup Status Report and start the 30-minute reporting loop
+    _dashboard_reporter.emit_startup()
+    _dashboard_task = asyncio.create_task(_dashboard_reporter.run_loop())
+
     logger.info("=== TDbridge ready ===")
 
 
@@ -1890,7 +1906,13 @@ async def _shutdown() -> None:
     _shutdown_called = True
     logger.info("TDbridge shutting down…")
 
-    for task in [_sheets_refresh_task, _db_purge_task, _discord_refresh_task]:
+    # Emit shutdown Status Report before stopping
+    _dashboard_reporter.emit_shutdown()
+    _dashboard_reporter.stop()
+
+    bot_status.dc_connected = False
+
+    for task in [_sheets_refresh_task, _db_purge_task, _discord_refresh_task, _dashboard_task]:
         if task:
             task.cancel()
             try:

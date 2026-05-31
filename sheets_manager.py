@@ -239,6 +239,51 @@ def _build_caches_from_managers() -> None:
 # Synchronous refresh (runs in executor — must not be called on event loop)
 # ---------------------------------------------------------------------------
 
+
+def _update_lock_status(table_name: str, column_headers: list) -> None:
+    """Update per-table lock timestamps in the dashboard status object.
+
+    Called after every refresh_table() call.  A table is user-locked if any
+    column header begins with "lock" (case-insensitive).
+
+    Args:
+        table_name:      One of "D_User", "D_Channel", "T_Group"
+        column_headers:  List of column header strings from the sheet (row 1)
+    """
+    from datetime import timezone
+    from datetime import datetime as _dt
+    from dashboard_reporter import status as _status
+
+    now = _dt.now(tz=timezone.utc)
+    is_locked = any(h.lower().startswith("lock") for h in column_headers)
+
+    _prefix_map = {
+        "D_User":    "d_user",
+        "D_Channel": "d_channel",
+        "T_Group":   "t_group",
+    }
+    prefix = _prefix_map.get(table_name, table_name.lower().replace(" ", "_"))
+
+    setattr(_status, f"{prefix}_last_checked", now)
+    if not is_locked:
+        setattr(_status, f"{prefix}_last_unlocked", now)
+    else:
+        lock_col = next(h for h in column_headers if h.lower().startswith("lock"))
+        logger.warning(
+            f"Table {table_name} is user-locked "
+            f"(column starting with 'lock' found: {lock_col!r})"
+        )
+
+
+def _mark_sheets_ok(ok: bool) -> None:
+    """Update sheets_last_ok in the dashboard status object."""
+    try:
+        from dashboard_reporter import status as _status
+        _status.sheets_last_ok = ok
+    except Exception:
+        pass  # never let status tracking break the main code path
+
+
 def _refresh_sync(
     skip_d_user: bool = False,
     skip_d_channel: bool = False,
@@ -261,11 +306,16 @@ def _refresh_sync(
     try:
         if not skip_d_user:
             _d_user_tm.refresh_table()
+            _update_lock_status("D_User", _d_user_tm.actual_columns)
         if not skip_d_channel:
             _d_channel_tm.refresh_table()
+            _update_lock_status("D_Channel", _d_channel_tm.actual_columns)
         _t_group_tm.refresh_table()
+        _update_lock_status("T_Group", _t_group_tm.actual_columns)
         _build_caches_from_managers()
+        _mark_sheets_ok(True)
     except Exception as e:
+        _mark_sheets_ok(False)
         logger.error(f"Sheets refresh failed: {e}", exc_info=True)
 
 
@@ -286,6 +336,8 @@ def _startup_refresh_sync() -> None:
     """
     try:
         _t_group_tm.refresh_table()
+        _update_lock_status("T_Group", _t_group_tm.actual_columns)
+        _mark_sheets_ok(True)
         # D_User and D_Channel records are empty at this point; the cache
         # will be built correctly by _build_caches_from_managers() after
         # the Discord refresh upserts complete.
@@ -294,6 +346,7 @@ def _startup_refresh_sync() -> None:
             "D_User and D_Channel deferred to Discord refresh"
         )
     except Exception as e:
+        _mark_sheets_ok(False)
         logger.error(f"Startup Sheets load failed: {e}", exc_info=True)
 
 
@@ -358,6 +411,7 @@ def batch_upsert_d_users_sync(
 
     # Single read of the entire table
     _d_user_tm.refresh_table()
+    _update_lock_status("D_User", _d_user_tm.actual_columns)
     all_ids = [u["discord_id"] for u in users]
     existing = _d_user_tm.find_rows_in_cache("D_ID", all_ids)
 
@@ -455,6 +509,7 @@ def batch_upsert_d_channels_sync(channels: list[dict]) -> None:
     now_serial = datetime_to_serial(localnow())
 
     _d_channel_tm.refresh_table()
+    _update_lock_status("D_Channel", _d_channel_tm.actual_columns)
     all_ids = [c["channel_id"] for c in channels]
     existing = _d_channel_tm.find_rows_in_cache("D_ChannelID", all_ids)
 
