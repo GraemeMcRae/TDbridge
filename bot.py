@@ -1809,16 +1809,23 @@ async def _start_telegram_app() -> None:
         # its own bootstrap loop (including retry on rate-limit).  We do NOT
         # call bot.set_webhook() separately — doing so would trigger two
         # set_webhook calls in quick succession and cause a 429 flood error.
+        # url_path must match the path component of the webhook URL so that
+        # tornado serves requests at that path.  Extract it from the configured
+        # webhook URL (e.g. "https://host:88/tgwebhook" → "/tgwebhook").
+        from urllib.parse import urlparse
+        webhook_path = urlparse(config.telegram_webhook_url).path.lstrip("/")
+
         await tg_app.updater.start_webhook(
             listen="127.0.0.1",
             port=config.telegram_webhook_port,
+            url_path=webhook_path,
             secret_token=config.telegram_webhook_secret or None,
             webhook_url=config.telegram_webhook_url,
             allowed_updates=_ALLOWED_UPDATES,
         )
         logger.info(
-            f"Telegram webhook server listening on 127.0.0.1:{config.telegram_webhook_port} "
-            f"(plain HTTP — TLS handled by stunnel) "
+            f"Telegram webhook server listening on 127.0.0.1:{config.telegram_webhook_port}"
+            f"/{webhook_path} (plain HTTP — TLS handled by stunnel) "
             f"— allowed_updates={_ALLOWED_UPDATES}"
         )
 
