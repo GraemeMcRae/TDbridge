@@ -77,7 +77,7 @@ PROD_DELETE_BEHAVIOR=delete
 # If deletion of the Telegram message fails, post a notification? true | false
 PROD_DELETE_FAIL_NOTIFY=true
 # What to do when a Discord message on an Active channel can't be routed to any Telegram group: "warn" | "ignore"
-PROD_UNROUTABLE_BEHAVIOR=warn
+PROD_UNROUTABLE_BEHAVIOR=ignore
 # How to bridge reactions from Telegram to Discord: "react" | "reply" | "both" | "neither"
 PROD_REACTIONS_TTOD=both
 # How to bridge reactions from Discord to Telegram: "react" | "reply" | "both" | "neither"

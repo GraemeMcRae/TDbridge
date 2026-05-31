@@ -436,17 +436,56 @@ The mapped Discord user is tagged at the top of the message.
 
 ### Discord → Telegram
 
-A Discord message is bridged to Telegram when:
+TDbridge applies these rules in order, stopping at the first match.
 
-1. **Reply to a bridged message** — always routes to the same Telegram group
-   as the original message, regardless of channel or tags
-2. **Tagged user** — the first `@mention` in the message (left to right) whose
-   row in D_User_Sheet is Active, has a T_GroupID, and has a D_ChannelID
-   matching the channel the message was sent in
-3. **Sender fallback** — if no tagged user matches, the sender's own D_User
-   row is used (same Active + T_GroupID + D_ChannelID requirements)
-4. **Unroutable** — if none of the above apply, behaviour is controlled by
-   `UNROUTABLE_BEHAVIOR`
+**Rule 1 — Reply to a bridged message**
+
+If the Discord message is a reply to a message that was previously bridged
+(in either direction), it is always sent to the same Telegram group as that
+original message.  The channel the reply was sent in and any @mentions in the
+reply are both ignored for routing purposes — the reply chain determines the
+destination.
+
+**Rule 2 — Tagged user**
+
+If this is a new message (not a reply), TDbridge scans the @mentions in the
+message from left to right and uses the *first* mentioned user who meets all
+three conditions:
+- `D_UserStatus = Active` in D_User_Sheet
+- `T_GroupID` is filled in (they have a Telegram group)
+- `D_ChannelID` matches the channel the message was sent in
+
+The message is sent to that user's Telegram group.  If you tag multiple users,
+only the first qualifying one determines the destination.
+
+**Rule 3 — Sender fallback**
+
+If no tagged user qualifies, TDbridge checks whether the *sender* meets the
+same three conditions (Active, has T_GroupID, D_ChannelID matches).  If so,
+the message is sent to the sender's own Telegram group.
+
+**Rule 4 — Unroutable**
+
+If none of the above rules produce a match, TDbridge cannot determine where
+to send the message.  Behaviour is controlled by `UNROUTABLE_BEHAVIOR` in `.env`:
+
+- `warn` — TDbridge posts a reply in Discord: *"⚠️ Could not route this
+  message to Telegram."*  Use this during initial setup to catch
+  configuration gaps.
+- `ignore` — The message is silently dropped (logged at INFO level only).
+  Use this in production once everything is configured.
+
+**Example** (using a channel called #dispatch-comms)
+
+| Scenario | Result |
+|---|---|
+| Reply to a previously bridged message | Sent to the Telegram group of that message's chain, regardless of channel or tags |
+| New message tagging @Angel (Active, T_GroupID set, D_ChannelID = dispatch-comms) | Sent to Angel's Telegram group |
+| New message tagging @Angel then @Boont — Angel is Inactive, Boont is Active with dispatch-comms | Sent to Boont's Telegram group (Angel skipped, Boont is first qualifying mention) |
+| New message, no tags, sender is Active with dispatch-comms as their channel | Sent to sender's Telegram group |
+| New message, no tags, sender has no T_GroupID | Unroutable — behaviour per `UNROUTABLE_BEHAVIOR` |
+| Message in a channel not listed as Active in D_Channel_Sheet | Silently ignored — TDbridge does not monitor that channel |
+
 
 ### User-locking a table
 
