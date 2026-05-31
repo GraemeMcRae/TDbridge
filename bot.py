@@ -1775,15 +1775,20 @@ async def _start_telegram_app() -> None:
         # ---- Linux: webhook mode ----
         # Verify TLS cert files are readable before starting the server.
         # Fail loudly here rather than with a cryptic SSL error later.
-        import ssl
         for label, path in [("cert", config.tls_cert_file), ("key", config.tls_key_file)]:
             if not os.path.exists(path):
                 raise FileNotFoundError(
                     f"TLS {label} file not found: {path}\n"
                     f"Check TLS_CERT_FILE / TLS_KEY_FILE in .env"
                 )
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_context.load_cert_chain(config.tls_cert_file, config.tls_key_file)
+            try:
+                with open(path, "r") as _f:
+                    _f.read(1)
+            except PermissionError:
+                raise PermissionError(
+                    f"TLS {label} file exists but is not readable: {path}\n"
+                    f"Run: sudo chmod 640 /etc/letsencrypt/archive/hcf.squadrontrucking.com/*.pem"
+                )
         logger.info(f"TLS certificate loaded: {config.tls_cert_file}")
 
         await tg_app.bot.set_webhook(
@@ -1796,12 +1801,16 @@ async def _start_telegram_app() -> None:
             f"— allowed_updates={_ALLOWED_UPDATES}"
         )
 
+        # In python-telegram-bot v21, ssl_context is no longer accepted by
+        # start_webhook().  Instead, pass the cert and key file paths directly;
+        # PTB builds its own SSLContext internally from these paths.
         await tg_app.updater.start_webhook(
             listen="0.0.0.0",
             port=config.telegram_webhook_port,
             secret_token=config.telegram_webhook_secret or None,
             webhook_url=config.telegram_webhook_url,
-            ssl_context=ssl_context,
+            key=config.tls_key_file,
+            cert=config.tls_cert_file,
         )
         logger.info(
             f"Telegram webhook HTTPS server listening on port {config.telegram_webhook_port}"
