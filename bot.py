@@ -1789,6 +1789,18 @@ async def _start_telegram_app() -> None:
                     f"TLS {label} file exists but is not readable: {path}\n"
                     f"Run: sudo chmod 640 /etc/letsencrypt/archive/hcf.squadrontrucking.com/*.pem"
                 )
+        # Build ssl.SSLContext manually so the full certificate chain from
+        # fullchain.pem is presented to Telegram's servers.  When PTB's
+        # start_webhook() receives key=/cert= paths it passes them to tornado
+        # which only loads the leaf certificate, causing Telegram to reject
+        # the connection with TLSV1_ALERT_UNKNOWN_CA.  By building the context
+        # ourselves and passing it via ssl_context=, tornado uses the full chain.
+        import ssl
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(
+            certfile=config.tls_cert_file,   # fullchain.pem — leaf + intermediates
+            keyfile=config.tls_key_file,     # privkey.pem
+        )
         logger.info(f"TLS certificate loaded: {config.tls_cert_file}")
 
         # start_webhook() registers the webhook with Telegram internally via
@@ -1801,8 +1813,7 @@ async def _start_telegram_app() -> None:
             secret_token=config.telegram_webhook_secret or None,
             webhook_url=config.telegram_webhook_url,
             allowed_updates=_ALLOWED_UPDATES,
-            key=config.tls_key_file,
-            cert=config.tls_cert_file,
+            ssl_context=ssl_ctx,
         )
         logger.info(
             f"Telegram webhook HTTPS server listening on port {config.telegram_webhook_port} "
