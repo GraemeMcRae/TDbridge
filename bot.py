@@ -1791,29 +1791,22 @@ async def _start_telegram_app() -> None:
                 )
         logger.info(f"TLS certificate loaded: {config.tls_cert_file}")
 
-        await tg_app.bot.set_webhook(
-            url=config.telegram_webhook_url,
-            secret_token=config.telegram_webhook_secret or None,
-            allowed_updates=_ALLOWED_UPDATES,
-        )
-        logger.info(
-            f"Telegram webhook registered: {config.telegram_webhook_url} "
-            f"— allowed_updates={_ALLOWED_UPDATES}"
-        )
-
-        # In python-telegram-bot v21, ssl_context is no longer accepted by
-        # start_webhook().  Instead, pass the cert and key file paths directly;
-        # PTB builds its own SSLContext internally from these paths.
+        # start_webhook() registers the webhook with Telegram internally via
+        # its own bootstrap loop (including retry on rate-limit).  We do NOT
+        # call bot.set_webhook() separately — doing so would trigger two
+        # set_webhook calls in quick succession and cause a 429 flood error.
         await tg_app.updater.start_webhook(
             listen="0.0.0.0",
             port=config.telegram_webhook_port,
             secret_token=config.telegram_webhook_secret or None,
             webhook_url=config.telegram_webhook_url,
+            allowed_updates=_ALLOWED_UPDATES,
             key=config.tls_key_file,
             cert=config.tls_cert_file,
         )
         logger.info(
-            f"Telegram webhook HTTPS server listening on port {config.telegram_webhook_port}"
+            f"Telegram webhook HTTPS server listening on port {config.telegram_webhook_port} "
+            f"— allowed_updates={_ALLOWED_UPDATES}"
         )
 
     _tg_app = tg_app
@@ -1866,8 +1859,15 @@ async def _startup(discord_client: discord.Client) -> None:
 # Shutdown
 # ===========================================================================
 
+_shutdown_called = False  # guard against double-call from signal handler + finally
+
+
 async def _shutdown() -> None:
     """Graceful shutdown: stop background tasks, then Telegram app."""
+    global _shutdown_called
+    if _shutdown_called:
+        return
+    _shutdown_called = True
     logger.info("TDbridge shutting down…")
 
     for task in [_sheets_refresh_task, _db_purge_task, _discord_refresh_task]:
