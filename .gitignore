@@ -79,8 +79,12 @@ Work_Order*.csv
 # HCF_login_status.json - keeps track of logged in users across bot restarts
 *login_status*.json
 
+# SQLite database
+TDbridge*.db
+
 # Browser
 bm/
+tm/
 browser_data*/
 verbose*.png
 debug*.png

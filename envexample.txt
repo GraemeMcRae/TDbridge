@@ -18,6 +18,32 @@ TEST_TELEGRAM_BOT_NAME="TDbridge Test"
 TEST_TELEGRAM_BOT_USERNAME="TDbridgeTestBot"
 TEST_TELEGRAM_BOT_URL="https://t.me/TDbridgeTestBot"
 TEST_GOOGLE_SPREADSHEET_NAME="TDbridge Config Test"
+# Telegram webhook configuration (test)
+# Port 88 is one of Telegram's four allowed webhook ports (80, 88, 443, 8443).
+# It is used for the test instance so test and prod can run simultaneously on the same server.
+# The bot re-registers the webhook with Telegram on every startup.
+# NOTE: On the Windows platform, which is automatically detected, the following two WEBHOOK parameters are ignored. Polling is used instead.
+TEST_TELEGRAM_WEBHOOK_URL="https://hcf.squadrontrucking.com:88/tgwebhook"
+TEST_TELEGRAM_WEBHOOK_PORT=88
+# Optional: a random secret string Telegram sends in X-Telegram-Bot-Api-Secret-Token header.
+# Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
+TEST_TELEGRAM_WEBHOOK_SECRET="<random-secret>"
+# SQLite message store file (stores TG<->DC message ID mappings for reply routing)
+TEST_SQLITE_DB_FILE=TDbridge_test.db
+# Log file
+TEST_LOGFILENAME=TDbridge_test.log
+# How often to refresh the Google Sheets mapping cache (seconds); default 300
+TEST_SHEETS_REFRESH_INTERVAL=300
+# What to do when a Discord message is deleted: "delete" | "notify" | "ignore"
+TEST_DELETE_BEHAVIOR=delete
+# If deletion of the Telegram message fails, post a notification? true | false
+TEST_DELETE_FAIL_NOTIFY=true
+# What to do when a Discord message on an Active channel can't be routed to any Telegram group: "warn" | "ignore"
+TEST_UNROUTABLE_BEHAVIOR=warn
+# How to bridge reactions from Telegram to Discord: "react" | "reply" | "both" | "neither"
+TEST_REACTIONS_TTOD=both
+# How to bridge reactions from Discord to Telegram: "react" | "reply" | "both" | "neither"
+TEST_REACTIONS_DTOT=both
 # Emojis -- the following parameter isn't in use for TDbridge, but it is used in HCF to discern the sentiment driving the use of certain emojis
 TEST_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, ok_hand, white_check_mark, pray, sunglasses, muscle, 100, checkered_flag, raised_hands"
 
@@ -33,12 +59,48 @@ PROD_TELEGRAM_BOT_NAME=TDbridge
 PROD_TELEGRAM_BOT_USERNAME="TDbridgeProdBot"
 PROD_TELEGRAM_BOT_URL="https://t.me/TDbridgeProdBot"
 PROD_GOOGLE_SPREADSHEET_NAME="TDbridge Config"
+# Telegram webhook configuration (prod)
+# Port 8443 is one of Telegram's four allowed webhook ports (80, 88, 443, 8443).
+PROD_TELEGRAM_WEBHOOK_URL="https://hcf.squadrontrucking.com:8443/tgwebhook"
+PROD_TELEGRAM_WEBHOOK_PORT=8443
+# Optional: a random secret string Telegram will send in X-Telegram-Bot-Api-Secret-Token header
+# Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
+PROD_TELEGRAM_WEBHOOK_SECRET="<random-secret>"
+# SQLite message store file (stores TG<->DC message ID mappings for reply routing)
+PROD_SQLITE_DB_FILE=TDbridge_prod.db
+# Log file
+PROD_LOGFILENAME=TDbridge_prod.log
+# How often to refresh the Google Sheets mapping cache (seconds); default 300
+PROD_SHEETS_REFRESH_INTERVAL=300
+# What to do when a Discord message is deleted: "delete" | "notify" | "ignore"
+PROD_DELETE_BEHAVIOR=delete
+# If deletion of the Telegram message fails, post a notification? true | false
+PROD_DELETE_FAIL_NOTIFY=true
+# What to do when a Discord message on an Active channel can't be routed to any Telegram group: "warn" | "ignore"
+PROD_UNROUTABLE_BEHAVIOR=warn
+# How to bridge reactions from Telegram to Discord: "react" | "reply" | "both" | "neither"
+PROD_REACTIONS_TTOD=both
+# How to bridge reactions from Discord to Telegram: "react" | "reply" | "both" | "neither"
+PROD_REACTIONS_DTOT=both
 # Emojis -- the following parameter isn't in use for TDbridge, but it is used in HCF to discern the sentiment driving the use of certain emojis
 PROD_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, ok_hand, white_check_mark, pray, sunglasses, muscle, 100, checkered_flag, raised_hands"
 
 # Time Zone
 LOCAL_TIMEZONE="America/Los_Angeles"
 
-# Google Credentials for service account <serviceaccountname>@<botname>.iam.gserviceaccount.com
+# Google Credentials for service account <serviceaccountname>@<projectname>.iam.gserviceaccount.com
+# Google Credentials for service account tdbridge-service@tdbridge.iam.gserviceaccount.com
 # IMPORTANT: Make sure google_credentials.json is included in .gitignore
 GOOGLE_CREDENTIALS_FILE=google_credentials_TDbridge.json
+
+# TLS certificate for the Telegram webhook HTTPS server.
+# Both test and prod share the same certificate (no TEST_/PROD_ prefix)
+# because both instances run on the same server with the same domain name.
+# The Let's Encrypt cert is obtained via: sudo certbot certonly --manual --preferred-challenges dns -d hcf.squadrontrucking.com
+# Certificate expires every 90 days. Renewal procedure is documented in TDbridge_Project_Structure.md.
+# The graeme user must have read access to these files:
+#   sudo chgrp -R graeme /etc/letsencrypt/live /etc/letsencrypt/archive
+#   sudo chmod 750 /etc/letsencrypt/live /etc/letsencrypt/archive
+#   sudo chmod 750 /etc/letsencrypt/live/hcf.squadrontrucking.com /etc/letsencrypt/archive/hcf.squadrontrucking.com
+TLS_CERT_FILE=/etc/letsencrypt/live/hcf.squadrontrucking.com/fullchain.pem
+TLS_KEY_FILE=/etc/letsencrypt/live/hcf.squadrontrucking.com/privkey.pem
