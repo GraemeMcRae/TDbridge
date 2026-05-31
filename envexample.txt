@@ -19,12 +19,12 @@ TEST_TELEGRAM_BOT_USERNAME="TDbridgeTestBot"
 TEST_TELEGRAM_BOT_URL="https://t.me/TDbridgeTestBot"
 TEST_GOOGLE_SPREADSHEET_NAME="TDbridge Config Test"
 # Telegram webhook configuration (test)
-# Port 88 is one of Telegram's four allowed webhook ports (80, 88, 443, 8443).
+# Port 88 (redirected to 8088 internally) is one of Telegram's four allowed webhook ports (80, 88, 443, 8443).
 # It is used for the test instance so test and prod can run simultaneously on the same server.
 # The bot re-registers the webhook with Telegram on every startup.
 # NOTE: On the Windows platform, which is automatically detected, the following two WEBHOOK parameters are ignored. Polling is used instead.
 TEST_TELEGRAM_WEBHOOK_URL="https://hcf.squadrontrucking.com:88/tgwebhook"
-TEST_TELEGRAM_WEBHOOK_PORT=88
+TEST_TELEGRAM_WEBHOOK_PORT=8088
 # Optional: a random secret string Telegram sends in X-Telegram-Bot-Api-Secret-Token header.
 # Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
 TEST_TELEGRAM_WEBHOOK_SECRET="<random-secret>"
@@ -60,9 +60,9 @@ PROD_TELEGRAM_BOT_USERNAME="TDbridgeProdBot"
 PROD_TELEGRAM_BOT_URL="https://t.me/TDbridgeProdBot"
 PROD_GOOGLE_SPREADSHEET_NAME="TDbridge Config"
 # Telegram webhook configuration (prod)
-# Port 8443 is one of Telegram's four allowed webhook ports (80, 88, 443, 8443).
+# Port 8443 (redirected to 8444 internally) is one of Telegram's four allowed webhook ports (80, 88, 443, 8443).
 PROD_TELEGRAM_WEBHOOK_URL="https://hcf.squadrontrucking.com:8443/tgwebhook"
-PROD_TELEGRAM_WEBHOOK_PORT=8443
+PROD_TELEGRAM_WEBHOOK_PORT=8444
 # Optional: a random secret string Telegram will send in X-Telegram-Bot-Api-Secret-Token header
 # Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
 PROD_TELEGRAM_WEBHOOK_SECRET="<random-secret>"

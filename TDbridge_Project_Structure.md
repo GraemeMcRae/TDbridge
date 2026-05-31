@@ -375,13 +375,23 @@ tasks and stops the Telegram application cleanly before exiting.
 
 ### Production (Ubuntu VPS)
 
-The Telegram bot API delivers updates to `https://hcf.squadrontrucking.com:8443/tgwebhook`.  Port 8443 is one of Telegram's allowed webhook ports.  Open it in the firewall:
+TLS is terminated by **stunnel**, which listens on the public Telegram-allowed
+ports (88 for test, 8443 for prod), presents the full Let's Encrypt certificate
+chain, and forwards plain HTTP to the bot process on localhost.
 
-```bash
-sudo ufw allow 8443/tcp
+```
+Telegram → port 88   (test) → stunnel → 127.0.0.1:8088 → bot
+Telegram → port 8443 (prod) → stunnel → 127.0.0.1:8444 → bot
 ```
 
-The TDbridge process listens on `0.0.0.0:8443` internally (no nginx proxy required for webhook-only traffic on a non-standard port).
+This avoids the limitation in python-telegram-bot v22 where `start_webhook()`
+passes cert/key paths to tornado, which only loads the leaf certificate and
+causes `TLSV1_ALERT_UNKNOWN_CA` errors from Telegram's servers.
+
+stunnel config: `/etc/stunnel/tdbridge.conf`
+stunnel service: `sudo systemctl status stunnel4`
+
+See `TDbridge_Guide.md` § "Set up stunnel" for installation instructions.
 
 ### Development (Windows + ngrok)
 

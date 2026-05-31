@@ -173,7 +173,8 @@ cp /path/to/google_credentials_TDbridge.json .
 
 ### Obtain a TLS certificate (Linux server only)
 
-TDbridge's Telegram webhook server requires HTTPS.  Use Let's Encrypt:
+TDbridge uses **stunnel** to terminate TLS, which requires a valid certificate
+from a trusted CA.  Use Let's Encrypt:
 
 ```bash
 sudo apt install certbot
@@ -191,10 +192,70 @@ sudo chgrp -R youruser /etc/letsencrypt/live /etc/letsencrypt/archive
 sudo chmod 750 /etc/letsencrypt/live /etc/letsencrypt/archive
 sudo chmod 750 /etc/letsencrypt/live/your.domain.example.com
 sudo chmod 750 /etc/letsencrypt/archive/your.domain.example.com
+sudo chmod 640 /etc/letsencrypt/archive/your.domain.example.com/*.pem
 ```
 
 The certificate expires every 90 days.  To renew, repeat the `certbot certonly`
-command and add a new DNS TXT record when prompted.
+command, add the new DNS TXT record when prompted, then re-run the `chmod 640`
+line on the new archive files (certbot creates them as root-only).
+
+### Set up stunnel (Linux server only)
+
+stunnel terminates HTTPS from Telegram and forwards plain HTTP to the bot.
+This is required because python-telegram-bot v22's built-in webhook server
+only presents the leaf certificate to clients, causing Telegram to reject
+the connection.  stunnel correctly presents the full certificate chain.
+
+```bash
+sudo apt install -y stunnel4
+```
+
+Create `/etc/stunnel/tdbridge.conf`:
+
+```ini
+; TDbridge TLS terminator
+; Terminates HTTPS from Telegram and forwards plain HTTP to the bot.
+
+pid = /var/run/stunnel4/stunnel.pid
+
+cert = /etc/letsencrypt/live/your.domain.example.com/fullchain.pem
+key  = /etc/letsencrypt/live/your.domain.example.com/privkey.pem
+
+[tdbridge-test]
+; Telegram connects on port 88; bot listens on localhost:8088
+accept  = 88
+connect = 127.0.0.1:8088
+
+[tdbridge-prod]
+; Telegram connects on port 8443; bot listens on localhost:8444
+accept  = 8443
+connect = 127.0.0.1:8444
+```
+
+Enable and start stunnel:
+
+```bash
+sudo sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4
+sudo systemctl enable stunnel4
+sudo systemctl start stunnel4
+sudo systemctl status stunnel4
+```
+
+Set the internal webhook ports in `.env`:
+
+```
+TEST_TELEGRAM_WEBHOOK_PORT=8088
+PROD_TELEGRAM_WEBHOOK_PORT=8444
+```
+
+The public webhook URLs remain unchanged — Telegram always connects to
+ports 88 and 8443 on the public domain.
+
+**After certificate renewal**, restart stunnel so it picks up the new cert:
+
+```bash
+sudo systemctl restart stunnel4
+```
 
 ---
 

@@ -1773,8 +1773,11 @@ async def _start_telegram_app() -> None:
         )
     else:
         # ---- Linux: webhook mode ----
-        # Verify TLS cert files are readable before starting the server.
-        # Fail loudly here rather than with a cryptic SSL error later.
+        # Verify TLS cert files exist and are readable.
+        # These are used by stunnel (the TLS terminator), not by the bot
+        # process itself.  We check here so a missing/unreadable cert is
+        # caught at startup with a clear message rather than silently causing
+        # stunnel to fail to deliver webhook updates.
         for label, path in [("cert", config.tls_cert_file), ("key", config.tls_key_file)]:
             if not os.path.exists(path):
                 raise FileNotFoundError(
@@ -1789,34 +1792,33 @@ async def _start_telegram_app() -> None:
                     f"TLS {label} file exists but is not readable: {path}\n"
                     f"Run: sudo chmod 640 /etc/letsencrypt/archive/hcf.squadrontrucking.com/*.pem"
                 )
-        # Build ssl.SSLContext manually so the full certificate chain from
-        # fullchain.pem is presented to Telegram's servers.  When PTB's
-        # start_webhook() receives key=/cert= paths it passes them to tornado
-        # which only loads the leaf certificate, causing Telegram to reject
-        # the connection with TLSV1_ALERT_UNKNOWN_CA.  By building the context
-        # ourselves and passing it via ssl_context=, tornado uses the full chain.
-        import ssl
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_ctx.load_cert_chain(
-            certfile=config.tls_cert_file,   # fullchain.pem — leaf + intermediates
-            keyfile=config.tls_key_file,     # privkey.pem
+        # TLS is terminated by stunnel, which listens on the public port
+        # (88 for test, 8443 for prod), presents the full Let's Encrypt
+        # certificate chain to Telegram, and forwards plain HTTP to the
+        # bot on localhost:TELEGRAM_WEBHOOK_PORT.
+        #
+        # We therefore verify the cert files are readable (so stunnel's
+        # config is likely correct) but do NOT pass them to start_webhook —
+        # the bot listens on plain HTTP internally.
+        logger.info(
+            f"TLS termination handled by stunnel "
+            f"(cert: {config.tls_cert_file})"
         )
-        logger.info(f"TLS certificate loaded: {config.tls_cert_file}")
 
         # start_webhook() registers the webhook with Telegram internally via
         # its own bootstrap loop (including retry on rate-limit).  We do NOT
         # call bot.set_webhook() separately — doing so would trigger two
         # set_webhook calls in quick succession and cause a 429 flood error.
         await tg_app.updater.start_webhook(
-            listen="0.0.0.0",
+            listen="127.0.0.1",
             port=config.telegram_webhook_port,
             secret_token=config.telegram_webhook_secret or None,
             webhook_url=config.telegram_webhook_url,
             allowed_updates=_ALLOWED_UPDATES,
-            ssl_context=ssl_ctx,
         )
         logger.info(
-            f"Telegram webhook HTTPS server listening on port {config.telegram_webhook_port} "
+            f"Telegram webhook server listening on 127.0.0.1:{config.telegram_webhook_port} "
+            f"(plain HTTP — TLS handled by stunnel) "
             f"— allowed_updates={_ALLOWED_UPDATES}"
         )
 
