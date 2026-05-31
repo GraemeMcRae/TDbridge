@@ -1042,7 +1042,9 @@ class TDbridgeDiscordClient(discord.Client):
         logger.info(
             f"Discord bot ready: {self.user} (id={self.user.id})"
         )
-        bot_status.dc_connected = True
+        # Note: bot_status.dc_connected is set in _startup(), which is called
+        # from the @client.event on_ready in main().  The class on_ready is
+        # overridden by that decorator and never fires.
         # Set the bot's nickname in every guild it belongs to, as configured
         # in .env (e.g. TEST_DISCORD_BOT_NICKNAME="TDbridge TESTING").
         # Nickname is per-guild, so we loop over all guilds.
@@ -1863,6 +1865,11 @@ async def _start_telegram_app() -> None:
 async def _startup(discord_client: discord.Client) -> None:
     """Run all startup tasks after Discord is connected and ready."""
     global _sheets_refresh_task, _db_purge_task, _discord_refresh_task
+
+    # on_ready only fires once the Discord gateway is established.
+    # Set dc_connected here, before emit_startup(), so the first Status
+    # Report correctly shows dc=connected.
+    bot_status.dc_connected = True
 
     logger.info("=== TDbridge startup ===")
     logger.info(f"Environment : {config.env.upper()}")
