@@ -80,7 +80,7 @@ Work_Order*.csv
 *login_status*.json
 
 # SQLite database
-TDbridge*.db
+TDbridge*.db*
 
 # Browser
 bm/
