@@ -1039,28 +1039,12 @@ class TDbridgeDiscordClient(discord.Client):
     """Discord client with message and reaction event handlers."""
 
     async def on_ready(self) -> None:
+        # This method is overridden by the @client.event on_ready decorator
+        # in main() and therefore never fires.  All startup logic lives in
+        # _startup(), which is called from that decorator.
         logger.info(
             f"Discord bot ready: {self.user} (id={self.user.id})"
         )
-        # Note: bot_status.dc_connected is set in _startup(), which is called
-        # from the @client.event on_ready in main().  The class on_ready is
-        # overridden by that decorator and never fires.
-        # Set the bot's nickname in every guild it belongs to, as configured
-        # in .env (e.g. TEST_DISCORD_BOT_NICKNAME="TDbridge TESTING").
-        # Nickname is per-guild, so we loop over all guilds.
-        if config.discord_bot_nickname:
-            for guild in self.guilds:
-                try:
-                    await guild.me.edit(nick=config.discord_bot_nickname)
-                    logger.info(
-                        f"Set nickname to '{config.discord_bot_nickname}' in guild '{guild.name}'"
-                    )
-                except discord.Forbidden:
-                    logger.warning(
-                        f"No permission to set nickname in guild '{guild.name}'"
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not set nickname in '{guild.name}': {e}")
 
     async def on_message(self, message: discord.Message) -> None:
         """Route a Discord message to the appropriate Telegram group."""
@@ -1280,6 +1264,35 @@ class TDbridgeDiscordClient(discord.Client):
                     _dashboard_reporter.save_to_db()
                 except Exception:
                     pass
+
+                # ---- Detailed bridge log ----
+                # Escape newlines so the entire record fits on one log line.
+                _dc_content_esc = message.content.replace("\n", "\\n")
+                _tg_text_esc    = text.replace("\n", "\\n")
+                _attach_info    = (
+                    ", ".join(
+                        f"{a.filename}({a.content_type or '?'}, "
+                        f"{(a.size or 0) // 1024}KB)"
+                        for a in message.attachments
+                    ) if message.attachments else "none"
+                )
+                _reply_info = (
+                    f"reply_to_dc={message.reference.message_id}"
+                    if message.reference and message.reference.message_id
+                    else "not_a_reply"
+                )
+                logger.info(
+                    f"DC→TG bridged | "
+                    f"dc_msg={dc_msg_id} | "
+                    f"dc_user={message.author.id}({message.author.name}) | "
+                    f"dc_channel=#{message.channel.name}({dc_channel_id}) | "
+                    f"dc_text={_dc_content_esc!r} | "
+                    f"attachments=[{_attach_info}] | "
+                    f"{_reply_info} | "
+                    f"tg_group={tg_group_id} | "
+                    f"tg_msg={tg_msg_id} | "
+                    f"tg_text={_tg_text_esc!r}"
+                )
 
         except Exception as e:
             logger.error(f"Failed to send Discord message to Telegram group {tg_group_id}: {e}")
@@ -1877,6 +1890,31 @@ async def _startup(discord_client: discord.Client) -> None:
     logger.info(f"Telegram bot: {config.telegram_bot_name} (@{config.telegram_bot_username})")
     logger.info(f"Spreadsheet : {config.google_spreadsheet_name}")
     logger.info(f"SQLite DB   : {config.sqlite_db_file}")
+
+    # ---- Set bot nickname in all guilds ----
+    # Nickname is per-guild, so we loop.  Errors are logged at ERROR level
+    # because a missing nickname likely means a permissions problem that an
+    # administrator should be aware of.
+    if config.discord_bot_nickname:
+        for guild in discord_client.guilds:
+            try:
+                await guild.me.edit(nick=config.discord_bot_nickname)
+                logger.info(
+                    f"Set nickname to {config.discord_bot_nickname!r} "
+                    f"in guild '{guild.name}'"
+                )
+            except discord.Forbidden:
+                logger.error(
+                    f"Cannot set nickname in guild '{guild.name}' — "
+                    f"bot lacks 'Change Nickname' permission. "
+                    f"Grant this in Server Settings → Roles."
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to set nickname in guild '{guild.name}': {e}"
+                )
+    else:
+        logger.info("No DISCORD_BOT_NICKNAME configured — nickname not changed")
 
     # Initialise SQLite
     loop = asyncio.get_running_loop()
