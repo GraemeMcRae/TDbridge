@@ -1273,27 +1273,45 @@ class TDbridgeDiscordClient(discord.Client):
                     dc_channel=message.channel,
                     dc_msg_ref=dc_msg_ref,
                 )
+                # sent_ids contains ALL Telegram message IDs produced by this
+                # Discord message (one per photo/video in a media group, or one
+                # for a plain text/document message).  We must store a DB mapping
+                # for EVERY Telegram message ID — not just the first — so that
+                # if the Discord message is later deleted, ALL corresponding
+                # Telegram messages are deleted, not just the first one.
                 tg_msg_id = _tg_msg_id_str(sent_ids[0]) if sent_ids else None
+                tg_all_ids = [_tg_msg_id_str(i) for i in sent_ids] if sent_ids else []
             else:
                 sent = await tg_bot.send_message(
                     chat_id=int(tg_group_id),
                     text=text,
                     reply_to_message_id=reply_to_telegram_id,
                 )
-                tg_msg_id = _tg_msg_id_str(sent.message_id)
+                tg_msg_id  = _tg_msg_id_str(sent.message_id)
+                tg_all_ids = [tg_msg_id]
 
-            # Store mapping (only if we have a Telegram message ID to map to)
+            # Store mapping for every Telegram message ID produced.
+            # The first ID is the "canonical" one used for reply routing;
+            # subsequent IDs (additional media group items) map back to the
+            # same Discord message so deletion catches them all.
             if tg_msg_id:
-                await loop.run_in_executor(
-                    None,
-                    db.store_message,
-                    tg_group_id,
-                    tg_msg_id,
-                    dc_channel_id,
-                    dc_msg_id,
-                    root_tg_msg_id or tg_msg_id,
-                    str(message.author.id),
-                )
+                _root = root_tg_msg_id or tg_msg_id
+                for _tid in tg_all_ids:
+                    await loop.run_in_executor(
+                        None,
+                        db.store_message,
+                        tg_group_id,
+                        _tid,
+                        dc_channel_id,
+                        dc_msg_id,
+                        _root,
+                        str(message.author.id),
+                    )
+                if len(tg_all_ids) > 1:
+                    logger.info(
+                        f"DC→TG: stored {len(tg_all_ids)} TG message mappings "
+                        f"for DC msg {dc_msg_id}: {tg_all_ids}"
+                    )
                 bot_status.bridged_30m += 1
                 try:
                     _dashboard_reporter.save_to_db()
@@ -1319,6 +1337,10 @@ class TDbridgeDiscordClient(discord.Client):
                     f"tg_reply_to={reply_to_telegram_id}"
                     if reply_to_telegram_id else "tg_new_message"
                 )
+                _tg_all_ids_str = (
+                    f"tg_msgs={tg_all_ids}" if len(tg_all_ids) > 1
+                    else f"tg_msg={tg_msg_id}"
+                )
                 logger.info(
                     f"DC→TG bridged | "
                     f"dc_msg={dc_msg_id} | "
@@ -1328,7 +1350,7 @@ class TDbridgeDiscordClient(discord.Client):
                     f"attachments=[{_attach_info}] | "
                     f"{_reply_info} | "
                     f"tg_group={tg_group_id} | "
-                    f"tg_msg={tg_msg_id} | "
+                    f"{_tg_all_ids_str} | "
                     f"{_tg_reply_to_info} | "
                     f"tg_text={_tg_text_esc!r}"
                 )
@@ -1385,28 +1407,39 @@ class TDbridgeDiscordClient(discord.Client):
             logger.error(f"Failed to post edit fallback to Telegram: {e}")
 
     async def on_message_delete(self, message: discord.Message) -> None:
-        """Bridge a Discord message deletion to Telegram."""
+        """Bridge a Discord message deletion to Telegram.
+
+        A single Discord message may have produced multiple Telegram messages
+        (e.g. a media group with several photos).  We look up ALL of them and
+        act on each one, so that deleting the Discord message removes every
+        corresponding Telegram message.
+        """
         dc_channel_id = str(message.channel.id)
         dc_msg_id     = str(message.id)
 
         loop = asyncio.get_running_loop()
-        record = await loop.run_in_executor(None, db.find_by_dc, dc_channel_id, dc_msg_id)
-        if not record:
+        records = await loop.run_in_executor(
+            None, db.find_all_by_dc, dc_channel_id, dc_msg_id
+        )
+        if not records:
             return
 
-        tg_group_id = record["tg_group_id"]
-        tg_msg_id   = int(record["tg_message_id"])
         tg_bot: TelegramBot = _tg_app.bot
-
         behavior = os.getenv(
             config.env_prefix + "DELETE_BEHAVIOR",
             os.getenv("DELETE_BEHAVIOR", "delete"),
         ).lower()
 
+        # All records share the same tg_group_id (a Discord message only
+        # routes to one Telegram group).
+        tg_group_id  = records[0]["tg_group_id"]
+        tg_msg_ids   = [int(r["tg_message_id"]) for r in records]
+        tg_first_id  = tg_msg_ids[0]   # use first as the reply anchor for notices
+
         if behavior == "ignore":
             logger.info(
                 f"Discord delete ignored (DELETE_BEHAVIOR=ignore): "
-                f"dc_msg {dc_msg_id} → tg_msg {tg_msg_id}"
+                f"dc_msg {dc_msg_id} → tg_msgs {tg_msg_ids}"
             )
             return
 
@@ -1415,35 +1448,42 @@ class TDbridgeDiscordClient(discord.Client):
                 await tg_bot.send_message(
                     chat_id=int(tg_group_id),
                     text="[A Discord message was deleted]",
-                    reply_to_message_id=tg_msg_id,
+                    reply_to_message_id=tg_first_id,
                 )
             except Exception as e:
                 logger.warning(f"Failed to post delete notification to Telegram: {e}")
             return
 
-        # Default: attempt deletion
-        try:
-            await tg_bot.delete_message(
-                chat_id=int(tg_group_id),
-                message_id=tg_msg_id,
-            )
-            await loop.run_in_executor(None, db.delete_by_dc, dc_channel_id, dc_msg_id)
-            logger.info(f"Deleted TG message {tg_msg_id} (Discord message {dc_msg_id} deleted)")
-        except Exception as e:
-            logger.warning(f"Failed to delete TG message {tg_msg_id}: {e}")
-            # Case 4: deletion failed for another reason — try notify
-            notify_on_fail = os.getenv(
-                config.env_prefix + "DELETE_FAIL_NOTIFY", "true"
-            ).lower() == "true"
-            if notify_on_fail:
-                try:
-                    await tg_bot.send_message(
-                        chat_id=int(tg_group_id),
-                        text="[Discord message was deleted — Telegram deletion failed]",
-                        reply_to_message_id=tg_msg_id,
-                    )
-                except Exception:
-                    pass
+        # Default: attempt to delete every Telegram message produced by this
+        # Discord message.
+        notify_on_fail = os.getenv(
+            config.env_prefix + "DELETE_FAIL_NOTIFY", "true"
+        ).lower() == "true"
+
+        for tg_msg_id in tg_msg_ids:
+            try:
+                await tg_bot.delete_message(
+                    chat_id=int(tg_group_id),
+                    message_id=tg_msg_id,
+                )
+                logger.info(
+                    f"Deleted TG message {tg_msg_id} "
+                    f"(Discord message {dc_msg_id} deleted)"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to delete TG message {tg_msg_id}: {e}")
+                if notify_on_fail:
+                    try:
+                        await tg_bot.send_message(
+                            chat_id=int(tg_group_id),
+                            text="[Discord message was deleted — Telegram deletion failed]",
+                            reply_to_message_id=tg_msg_id,
+                        )
+                    except Exception:
+                        pass
+
+        # Remove all DB records for this Discord message after attempting deletion
+        await loop.run_in_executor(None, db.delete_by_dc, dc_channel_id, dc_msg_id)
 
     async def on_reaction_add(
         self, reaction: discord.Reaction, user: discord.User

@@ -75,8 +75,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tg
     ON message_map (tg_group_id, tg_message_id);
 """
 
+# Note: the DC index is NOT unique — a single Discord message can produce
+# multiple Telegram messages (e.g. a photo album), so multiple rows may share
+# the same (dc_channel_id, dc_message_id) pair.
 _CREATE_INDEX_DC_SQL = """
-CREATE UNIQUE INDEX IF NOT EXISTS idx_dc
+CREATE INDEX IF NOT EXISTS idx_dc
     ON message_map (dc_channel_id, dc_message_id);
 """
 
@@ -110,6 +113,10 @@ def init_db() -> None:
     with _connect() as conn:
         conn.execute(_CREATE_TABLE_SQL)
         conn.execute(_CREATE_INDEX_TG_SQL)
+        # Drop the old UNIQUE index on (dc_channel_id, dc_message_id) if it
+        # exists, because a single Discord message can now produce multiple
+        # Telegram messages (photo albums), so the DC index must be non-unique.
+        conn.execute("DROP INDEX IF EXISTS idx_dc")
         conn.execute(_CREATE_INDEX_DC_SQL)
         conn.execute(_CREATE_BOT_STATUS_TABLE_SQL)
     logger.info(f"SQLite message store initialised: {_DB_PATH}")
@@ -196,6 +203,29 @@ def find_by_dc(
     return dict(row) if row else None
 
 
+def find_all_by_dc(
+    dc_channel_id: str,
+    dc_message_id: str,
+) -> list[dict]:
+    """Look up ALL records mapped to a given Discord channel + message ID.
+
+    A single Discord message can produce multiple Telegram messages (e.g. a
+    media group with several photos).  This returns all of them so that
+    deletion of the Discord message can delete every corresponding Telegram
+    message, not just the first one.
+
+    Returns a list of dicts (may be empty if not found).
+    """
+    sql = """
+        SELECT * FROM message_map
+        WHERE dc_channel_id = ? AND dc_message_id = ?
+        ORDER BY id
+    """
+    with _connect() as conn:
+        rows = conn.execute(sql, (str(dc_channel_id), str(dc_message_id))).fetchall()
+    return [dict(r) for r in rows]
+
+
 def find_root_by_tg(
     tg_group_id: str,
     tg_message_id: str,
@@ -231,18 +261,22 @@ def delete_by_tg(tg_group_id: str, tg_message_id: str) -> bool:
     return deleted
 
 
-def delete_by_dc(dc_channel_id: str, dc_message_id: str) -> bool:
-    """Delete the record for a given Discord message.
+def delete_by_dc(dc_channel_id: str, dc_message_id: str) -> int:
+    """Delete ALL records for a given Discord message.
 
-    Returns True if a row was deleted, False if it was not found.
+    A single Discord message may have produced multiple Telegram messages
+    (e.g. a photo album), so multiple rows can share the same dc_message_id.
+    This deletes all of them.
+
+    Returns the number of rows deleted (0 if not found).
     """
     sql = "DELETE FROM message_map WHERE dc_channel_id = ? AND dc_message_id = ?"
     with _connect() as conn:
         cursor = conn.execute(sql, (str(dc_channel_id), str(dc_message_id)))
-    deleted = cursor.rowcount > 0
-    if deleted:
-        logger.debug(f"DB delete: dc({dc_channel_id},{dc_message_id})")
-    return deleted
+    count = cursor.rowcount
+    if count:
+        logger.debug(f"DB delete: dc({dc_channel_id},{dc_message_id}) — {count} row(s)")
+    return count
 
 
 def set_status_value(key: str, value: str) -> None:
