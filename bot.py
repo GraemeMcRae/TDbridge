@@ -854,9 +854,44 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         root_tg_msg_id,
         dc_user_id,
     )
+    # Detailed TG→DC bridge log — all key fields on one line for easy grep/research
+    _tg_raw_text = (msg.text or msg.caption or "").replace("\n", "\\n")
+    _dc_text_esc = content.replace("\n", "\\n")
+    _tg_attach = "none"
+    if msg.photo:
+        _tg_attach = f"photo(largest={msg.photo[-1].file_size or '?'}B)"
+    elif msg.video:
+        _tg_attach = f"video({msg.video.file_name or 'video.mp4'},{msg.video.file_size or '?'}B)"
+    elif msg.voice:
+        _tg_attach = f"voice({msg.voice.file_size or '?'}B)"
+    elif msg.audio:
+        _tg_attach = f"audio({msg.audio.file_name or 'audio'},{msg.audio.file_size or '?'}B)"
+    elif msg.document:
+        _tg_attach = f"document({msg.document.file_name or 'file'},{msg.document.file_size or '?'}B)"
+    elif msg.sticker:
+        _tg_attach = f"sticker({msg.sticker.emoji or '?'},animated={msg.sticker.is_animated})"
+    elif msg.poll:
+        _tg_attach = f"poll({msg.poll.question!r})"
+    _tg_reply_info = (
+        f"reply_to_tg={msg.reply_to_message.message_id}"
+        if msg.reply_to_message else "not_a_reply"
+    )
+    _dc_reply_info = (
+        f"reply_to_dc={discord_reply_to_id}"
+        if discord_reply_to_id else "new_message"
+    )
     logger.info(
-        f"TG→DC: bridged TG msg {tg_msg_id} → DC msg {dc_msg_id} "
-        f"in #{channel.name}"
+        f"TG→DC bridged | "
+        f"tg_msg={tg_msg_id} | "
+        f"tg_group={tg_group_id}('{tg_chat.title}') | "
+        f"tg_sender={sender_name!r} | "
+        f"tg_text={_tg_raw_text!r} | "
+        f"tg_attach={_tg_attach} | "
+        f"{_tg_reply_info} | "
+        f"dc_msg={dc_msg_id} | "
+        f"dc_channel=#{channel.name}({dc_channel_id}) | "
+        f"dc_text={_dc_text_esc!r} | "
+        f"{_dc_reply_info}"
     )
     bot_status.bridged_30m += 1
     try:
@@ -1271,8 +1306,7 @@ class TDbridgeDiscordClient(discord.Client):
                 _tg_text_esc    = text.replace("\n", "\\n")
                 _attach_info    = (
                     ", ".join(
-                        f"{a.filename}({a.content_type or '?'}, "
-                        f"{(a.size or 0) // 1024}KB)"
+                        f"{a.filename}({a.content_type or '?'},{(a.size or 0) // 1024}KB)"
                         for a in message.attachments
                     ) if message.attachments else "none"
                 )
@@ -1280,6 +1314,10 @@ class TDbridgeDiscordClient(discord.Client):
                     f"reply_to_dc={message.reference.message_id}"
                     if message.reference and message.reference.message_id
                     else "not_a_reply"
+                )
+                _tg_reply_to_info = (
+                    f"tg_reply_to={reply_to_telegram_id}"
+                    if reply_to_telegram_id else "tg_new_message"
                 )
                 logger.info(
                     f"DC→TG bridged | "
@@ -1291,6 +1329,7 @@ class TDbridgeDiscordClient(discord.Client):
                     f"{_reply_info} | "
                     f"tg_group={tg_group_id} | "
                     f"tg_msg={tg_msg_id} | "
+                    f"{_tg_reply_to_info} | "
                     f"tg_text={_tg_text_esc!r}"
                 )
 
