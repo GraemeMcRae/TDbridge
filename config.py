@@ -372,8 +372,23 @@ class Config:
 
         fmt = LocalTimeFormatter()  # format string is set dynamically in format()
 
+        # Filter out PTB's spurious CRITICAL log during clean shutdown.
+        # When the asyncio update-fetcher task is cancelled (the normal shutdown
+        # mechanism), PTB catches the CancelledError and logs it at CRITICAL
+        # level with the message "Fetching updates was aborted due to
+        # CancelledError".  It immediately suppresses the exception and
+        # completes gracefully, so this is not a real error.
+        class _SuppressPTBShutdownCritical(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                return not (
+                    record.levelno == logging.CRITICAL
+                    and "CancelledError" in record.getMessage()
+                    and record.name.startswith("telegram.ext")
+                )
+
         root = logging.getLogger()
         root.setLevel(logging.INFO)
+        root.addFilter(_SuppressPTBShutdownCritical())
 
         # Rotating file handler: 5 MiB × 5 backups.
         # At rotation, Python's RotatingFileHandler renames:
