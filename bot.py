@@ -1039,31 +1039,50 @@ async def route_tg_reaction_to_discord(update: Update, context: ContextTypes.DEF
 
     behavior = config.reactions_ttod
     if behavior == "neither":
-        logger.info(f"TG→DC reaction ignored (REACTIONS_TTOD=neither)")
+        logger.info(
+            f"TG→DC reaction | tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
+            f"actor={actor_name!r} | emoji={emoji_str} | "
+            f"result=IGNORED | reason=REACTIONS_TTOD=neither"
+        )
         return
 
     try:
         ref_msg   = await channel.fetch_message(dc_msg_id)
         reference = ref_msg.to_reference(fail_if_not_exists=False)
 
+        native_ok = False
         if behavior in ("react", "both"):
-            # Add the emoji as a native Discord reaction on the original message.
-            # Only standard Unicode emoji and custom Discord emoji are supported
-            # by the add_reaction API; if the emoji is unsupported it raises
-            # HTTPException which we catch gracefully.
             try:
                 await ref_msg.add_reaction(emoji_str)
+                native_ok = True
             except Exception as e:
-                logger.warning(f"TG→DC: could not add native reaction {emoji_str!r}: {e}")
+                logger.warning(
+                    f"TG→DC reaction | tg_msg={tg_msg_id} | dc_msg={dc_msg_id} | "
+                    f"emoji={emoji_str} | result=NATIVE_FAILED | reason={e}"
+                )
 
+        reply_ok = False
         if behavior in ("reply", "both"):
             await channel.send(
                 content=f"{emoji_str} **{actor_name}** reacted to this message",
                 reference=reference,
                 mention_author=False,
             )
+            reply_ok = True
+
+        logger.info(
+            f"TG→DC reaction | "
+            f"tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
+            f"actor={actor_name!r} | emoji={emoji_str} | "
+            f"dc_msg={dc_msg_id} | dc_channel={dc_channel_id} | "
+            f"behavior={behavior} | native={'ok' if native_ok else 'skipped/failed'} | "
+            f"reply={'ok' if reply_ok else 'skipped'}"
+        )
     except Exception as e:
-        logger.warning(f"Failed to bridge TG reaction to Discord: {e}")
+        logger.warning(
+            f"TG→DC reaction | tg_msg={tg_msg_id} | dc_msg={dc_msg_id} | "
+            f"emoji={emoji_str} | result=FAILED | reason={e}"
+        )
 
 
 # ===========================================================================
@@ -1460,18 +1479,22 @@ class TDbridgeDiscordClient(discord.Client):
             config.env_prefix + "DELETE_FAIL_NOTIFY", "true"
         ).lower() == "true"
 
+        deleted_tg = []
+        failed_tg  = []
         for tg_msg_id in tg_msg_ids:
             try:
                 await tg_bot.delete_message(
                     chat_id=int(tg_group_id),
                     message_id=tg_msg_id,
                 )
-                logger.info(
-                    f"Deleted TG message {tg_msg_id} "
-                    f"(Discord message {dc_msg_id} deleted)"
-                )
+                deleted_tg.append(tg_msg_id)
             except Exception as e:
-                logger.warning(f"Failed to delete TG message {tg_msg_id}: {e}")
+                failed_tg.append((tg_msg_id, str(e)))
+                logger.warning(
+                    f"DC→TG delete | dc_msg={dc_msg_id} | "
+                    f"tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
+                    f"result=FAILED | reason={e}"
+                )
                 if notify_on_fail:
                     try:
                         await tg_bot.send_message(
@@ -1482,8 +1505,22 @@ class TDbridgeDiscordClient(discord.Client):
                     except Exception:
                         pass
 
+        logger.info(
+            f"DC→TG delete | "
+            f"dc_msg={dc_msg_id} | "
+            f"dc_channel=#{message.channel.name}({dc_channel_id}) | "
+            f"tg_group={tg_group_id} | "
+            f"tg_msgs_deleted={deleted_tg} | "
+            f"tg_msgs_failed={[t for t, _ in failed_tg]}"
+        )
+
         # Remove all DB records for this Discord message after attempting deletion
-        await loop.run_in_executor(None, db.delete_by_dc, dc_channel_id, dc_msg_id)
+        rows_removed = await loop.run_in_executor(
+            None, db.delete_by_dc, dc_channel_id, dc_msg_id
+        )
+        logger.info(
+            f"DC→TG delete | db_rows_removed={rows_removed} for dc_msg={dc_msg_id}"
+        )
 
     async def on_reaction_add(
         self, reaction: discord.Reaction, user: discord.User
@@ -1511,16 +1548,18 @@ class TDbridgeDiscordClient(discord.Client):
 
         behavior = config.reactions_dtot
         if behavior == "neither":
-            logger.info(f"DC→TG reaction ignored (REACTIONS_DTOT=neither)")
+            logger.info(
+                f"DC→TG reaction | dc_msg={dc_msg_id} | dc_channel={dc_channel_id} | "
+                f"user={user_name!r} | emoji={emoji_str} | "
+                f"result=IGNORED | reason=REACTIONS_DTOT=neither"
+            )
             return
 
         tg_bot: TelegramBot = _tg_app.bot
+        native_ok = False
+        reply_ok  = False
 
         if behavior in ("react", "both"):
-            # Telegram's sendReaction API requires a ReactionTypeEmoji object.
-            # Only a limited set of emoji are allowed by Telegram; unsupported
-            # emoji fall back gracefully to the reply method if "both" is set,
-            # or log a warning if "react" only.
             from telegram import ReactionTypeEmoji
             try:
                 await tg_bot.set_message_reaction(
@@ -1528,10 +1567,19 @@ class TDbridgeDiscordClient(discord.Client):
                     message_id=tg_msg_id,
                     reaction=[ReactionTypeEmoji(emoji=emoji_str)],
                 )
+                native_ok = True
             except Exception as e:
-                logger.warning(f"DC→TG: could not add native reaction {emoji_str!r}: {e}")
+                logger.warning(
+                    f"DC→TG reaction | dc_msg={dc_msg_id} | tg_msg={tg_msg_id} | "
+                    f"emoji={emoji_str} | result=NATIVE_FAILED | reason={e}"
+                )
                 if behavior == "react":
-                    return  # don't fall through to reply if react-only was requested
+                    logger.info(
+                        f"DC→TG reaction | dc_msg={dc_msg_id} | tg_msg={tg_msg_id} | "
+                        f"emoji={emoji_str} | result=NOT_BRIDGED | "
+                        f"reason=react-only and native failed"
+                    )
+                    return
 
         if behavior in ("reply", "both"):
             try:
@@ -1540,8 +1588,22 @@ class TDbridgeDiscordClient(discord.Client):
                     text=f"{emoji_str} {user_name} (Discord) reacted to this message",
                     reply_to_message_id=tg_msg_id,
                 )
+                reply_ok = True
             except Exception as e:
-                logger.warning(f"Failed to bridge Discord reaction to Telegram: {e}")
+                logger.warning(
+                    f"DC→TG reaction | dc_msg={dc_msg_id} | tg_msg={tg_msg_id} | "
+                    f"emoji={emoji_str} | result=REPLY_FAILED | reason={e}"
+                )
+
+        logger.info(
+            f"DC→TG reaction | "
+            f"dc_msg={dc_msg_id} | dc_channel={dc_channel_id} | "
+            f"user={user_name!r}({str(user.id)}) | emoji={emoji_str} | "
+            f"tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
+            f"behavior={behavior} | "
+            f"native={'ok' if native_ok else 'skipped/failed'} | "
+            f"reply={'ok' if reply_ok else 'skipped'}"
+        )
 
 
 # ===========================================================================
@@ -1801,9 +1863,21 @@ async def _start_telegram_app() -> None:
     """
     global _tg_app
 
+    # Configure generous HTTP timeouts.
+    # PTB's defaults (5s connect, 5s read) are too short for large media uploads
+    # such as a 10-photo album.  media_write_timeout covers the actual upload.
+    from telegram.request import HTTPXRequest
+    _tg_request = HTTPXRequest(
+        connect_timeout=10.0,
+        read_timeout=60.0,
+        write_timeout=120.0,
+        media_write_timeout=180.0,
+    )
+
     tg_app = (
         ApplicationBuilder()
         .token(config.telegram_bot_token)
+        .request(_tg_request)
         .build()
     )
 

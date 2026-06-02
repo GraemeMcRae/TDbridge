@@ -487,6 +487,32 @@ to send the message.  Behaviour is controlled by `UNROUTABLE_BEHAVIOR` in `.env`
 | Message in a channel not listed as Active in D_Channel_Sheet | Silently ignored — TDbridge does not monitor that channel |
 
 
+### Attachment and media bridging notes
+
+**Telegram → Discord:** Telegram allows one media item per message internally,
+even when the app displays multiple photos as a "collage".  A 20-photo Telegram
+collage is actually 20 separate Telegram messages (each with one photo), so
+TDbridge bridges them as 20 individual Discord messages.  Each TG message is
+independently tracked in the database, so replies, reactions, and deletions on
+either side work correctly at the individual photo level.
+
+**Discord → Telegram:** Discord allows up to 10 attachments per message.
+TDbridge sends photos and videos as a Telegram media group (native album/collage)
+of up to 10 items per group, so a 20-photo Discord message becomes two Telegram
+collages.  Documents are sent individually after the photo group.  All resulting
+Telegram message IDs are stored in the database, so deletions from Discord
+remove every corresponding Telegram message.
+
+**Reactions on collages:** When you react to a Telegram collage, Telegram
+associates the reaction with the first message in the collage.  TDbridge bridges
+this as a reaction (or reply, depending on `REACTIONS_TTOD`) to the first
+corresponding Discord message in that group.
+
+**Attachment size limits:** Discord has a 25 MB per-file limit (free tier) and
+Telegram has a 50 MB limit.  Files exceeding the target platform's limit are
+skipped with a warning posted on both platforms indicating the filename, type,
+and reason.
+
 ### User-locking a table
 
 If any column name in a sheet begins with `lock` (case-insensitive), TDbridge
