@@ -243,6 +243,16 @@ class Config:
             "/etc/letsencrypt/live/hcf.squadrontrucking.com/privkey.pem"
         )
 
+        # ------------------------------------------------------------------ #
+        # Helper: expand leading ! to ⚠️ in user-facing message strings.     #
+        # Applied to all ERRMSG and DC_MSG_DELETE_BEHAVIOR values.           #
+        # ------------------------------------------------------------------ #
+        def _errmsg(suffix: str, default: str = "") -> str:
+            raw = os.getenv(self.env_prefix + suffix, default)
+            if raw.startswith("!"):
+                raw = "⚠️" + raw[1:]
+            return raw
+
         # How to bridge emoji reactions:
         #   "react"   — add the emoji as a native reaction on the target message
         #   "reply"   — post a short reply message describing the reaction
@@ -254,6 +264,17 @@ class Config:
         self.reactions_dtot: str = os.getenv(
             self.env_prefix + "REACTIONS_DTOT", "reply"
         ).lower()
+
+        # Message posted in Discord when a DC message on an Active channel
+        # can't be routed to any Telegram group.  Empty = silent (INFO log only).
+        self.unroutable_dtot_errmsg: str = _errmsg("UNROUTABLE_DTOT_ERRMSG", "")
+
+        # Message posted in Telegram when a TG message can't be routed to any
+        # Discord channel/user.  Empty = silent (INFO log only).
+        # Note: the message is still forwarded to the first Active Discord channel
+        # as a fallback; this ERRMSG alerts the Telegram sender that routing
+        # was not fully resolved.
+        self.unroutable_ttod_errmsg: str = _errmsg("UNROUTABLE_TTOD_ERRMSG", "")
 
         # What to do in Telegram when a Discord message is deleted.
         # "delete" — attempt to delete the Telegram message
