@@ -262,58 +262,136 @@ sudo systemctl restart stunnel4
 ## Step 5 — Configure `.env`
 
 Copy `envexample.txt` to `.env` and fill in the values.  Never commit `.env`
-to git — it contains secrets.
+to git — it contains secrets.  The file has two sets of parameters: `TEST_`
+prefix for the test bot and `PROD_` prefix for the production bot.  Parameters
+with no prefix (timezone, credentials, TLS) are shared by both.
 
-### Key parameters
+### The `!` shorthand in message strings
+
+Any parameter whose name ends in `_ERRMSG`, or `DC_MSG_DELETE_BEHAVIOR`, may
+use `!` as the first character of its value as a shorthand for `⚠️` (the warning
+emoji).  This lets you keep the `.env` file in plain ASCII while still
+producing a friendly emoji in Telegram or Discord messages.
+
+```
+TEST_UNROUTABLE_DTOT_ERRMSG="! Unable to route this message to Telegram."
+# stored internally as: "⚠️ Unable to route this message to Telegram."
+```
+
+### Credentials and identity
 
 | Parameter | Description |
 |---|---|
-| `TEST_DISCORD_BOT_TOKEN` | Discord bot token from the Developer Portal |
+| `TEST_DISCORD_BOT_TOKEN` | Discord bot token (from Discord Developer Portal → Bot → Reset Token) |
+| `TEST_DISCORD_BOT_NAME` | Bot username (no spaces; matches the bot's Discord account name) |
+| `TEST_DISCORD_BOT_NICKNAME` | Display name shown in your server (may contain spaces) |
+| `TEST_DISCORD_BOT_APPLICATION_ID` | From Developer Portal → General Information |
 | `TEST_TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather |
-| `TEST_TELEGRAM_WEBHOOK_URL` | Public HTTPS URL Telegram will POST updates to |
-| `TEST_TELEGRAM_WEBHOOK_PORT` | Port the bot listens on (88 for test, 8443 for prod) |
-| `TEST_TELEGRAM_WEBHOOK_SECRET` | Random secret for webhook authentication |
-| `TEST_GOOGLE_SPREADSHEET_NAME` | Exact name of the Google Sheet |
-| `TLS_CERT_FILE` | Path to the Let's Encrypt fullchain.pem |
-| `TLS_KEY_FILE` | Path to the Let's Encrypt privkey.pem |
-| `LOCAL_TIMEZONE` | Your timezone (e.g. `America/Los_Angeles`) |
-| `GOOGLE_CREDENTIALS_FILE` | Path to the Google service account JSON file |
+| `TEST_TELEGRAM_BOT_NAME` | Human-readable bot name |
+| `TEST_TELEGRAM_BOT_USERNAME` | Bot username on Telegram (e.g. `TDbridgeTestBot`) |
+| `TEST_TELEGRAM_BOT_URL` | `https://t.me/<username>` |
+| `TEST_GOOGLE_SPREADSHEET_NAME` | Exact name of the Google Sheet (must match precisely) |
+| `GOOGLE_CREDENTIALS_FILE` | Path to the Google service account JSON key file |
+| `LOCAL_TIMEZONE` | IANA timezone name (e.g. `America/Los_Angeles`) |
 
-### Generate webhook secrets
+### Webhook configuration (Linux server only)
 
+On Windows, polling mode is used automatically and these are ignored.
+
+| Parameter | Description |
+|---|---|
+| `TEST_TELEGRAM_WEBHOOK_URL` | Public HTTPS URL Telegram POSTs updates to |
+| `TEST_TELEGRAM_WEBHOOK_PORT` | Internal port the bot listens on (stunnel forwards to this) |
+| `TEST_TELEGRAM_WEBHOOK_SECRET` | Random secret for authenticating Telegram POST requests |
+| `TLS_CERT_FILE` | Path to Let’s Encrypt `fullchain.pem` (shared by test and prod) |
+| `TLS_KEY_FILE` | Path to Let’s Encrypt `privkey.pem` (shared by test and prod) |
+
+Generate webhook secrets:
 ```bash
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-Run this twice and put the outputs in `TEST_TELEGRAM_WEBHOOK_SECRET` and
-`PROD_TELEGRAM_WEBHOOK_SECRET`.
+### Database and logging
 
-### Behavioural parameters
+| Parameter | Default | Description |
+|---|---|---|
+| `TEST_SQLITE_DB_FILE` | `TDbridge_test.db` | SQLite file storing TG↔DC message ID mappings |
+| `TEST_LOGFILENAME` | `TDbridge_test.log` | Rotating log file (5 MB × 5 backups) |
+| `TEST_SHEETS_REFRESH_INTERVAL` | `300` | Seconds between Google Sheets cache refreshes |
+
+### Message routing behavior
+
+#### Unroutable messages
+
+A message is “unroutable” when TDbridge cannot determine a destination.
+Each parameter is a message string (empty = silent; `!` at start = `⚠️`).
+
+| Parameter | When posted | Where |
+|---|---|---|
+| `TEST_UNROUTABLE_DTOT_ERRMSG` | A Discord message on an Active channel has no matching Active TG group | In Discord as a reply to the unroutable message |
+| `TEST_UNROUTABLE_TTOD_ERRMSG` | A Telegram message arrives from an untracked or Inactive group | In Telegram as a reply to the unroutable message |
+
+**Note:** An unroutable TG message is still forwarded to the first Active Discord
+channel as a fallback.  The `UNROUTABLE_TTOD_ERRMSG` alerts the Telegram sender
+that full routing was not resolved.
+
+#### Discord message deletion
+
+When a Discord message is deleted, `DC_MSG_DELETE_BEHAVIOR` controls what
+happens on the Telegram side:
+
+| Value | Behavior |
+|---|---|
+| `delete` | Attempt to delete the corresponding Telegram message(s) |
+| `ignore` | Do nothing (log only) |
+| Any other string | Post that string as a Telegram reply (use `!` for `⚠️`) |
+
+If deletion of a Telegram message fails, `DELETE_FAIL_ERRMSG` is posted on
+Telegram (empty = silent):
+
+```
+TEST_DC_MSG_DELETE_BEHAVIOR=delete
+TEST_DELETE_FAIL_ERRMSG="! Telegram deletion failed."
+```
+
+#### Telegram-initiated deletion
+
+Users can delete TG messages (and their Discord counterparts) by replying with
+a message matching `TG_MSG_DELETE_REGEX`.  The regex is applied with
+`re.fullmatch` so it covers the entire reply text.  Use `\s*` to allow trailing
+whitespace (common on iPhone autocomplete).
+
+```
+TEST_TG_MSG_DELETE_REGEX="(?i)delete\s*"
+TEST_TG_MSG_DELETE_ERRMSG="! Delete failed."
+```
+
+Empty `TG_MSG_DELETE_REGEX` disables the feature entirely.
+
+**How it works:**
+1. Reply "delete" (or your chosen word) to any TG message
+2. If the parent message is tracked in the DB, TDbridge deletes it from Telegram
+3. If other TG messages share the same Discord message, only the replied-to TG message is removed (disassociated) — the Discord message stays
+4. If this was the only TG message for that Discord message, the Discord message is also deleted
+5. The "delete" reply is removed from Telegram on success
+
+#### Reaction bridging
 
 | Parameter | Values | Description |
 |---|---|---|
-| `TEST_UNROUTABLE_BEHAVIOR` | `warn` / `ignore` | What to do when a Discord message can't be routed |
-| `TEST_DELETE_BEHAVIOR` | `delete` / `notify` / `ignore` | What to do when a Discord message is deleted |
-| `TEST_DELETE_FAIL_NOTIFY` | `true` / `false` | Post a notice if Telegram deletion fails |
 | `TEST_REACTIONS_TTOD` | `react` / `reply` / `both` / `neither` | How to bridge Telegram reactions to Discord |
 | `TEST_REACTIONS_DTOT` | `react` / `reply` / `both` / `neither` | How to bridge Discord reactions to Telegram |
-| `TEST_SHEETS_REFRESH_INTERVAL` | seconds | How often to re-read the mapping tables (default 300) |
 
-All behavioural parameters have `PROD_` equivalents.
+| Mode | Effect |
+|---|---|
+| `react` | Adds the emoji as a native reaction on the target platform |
+| `reply` | Posts a short reply message (e.g. `❤️ Alice reacted to this message`) |
+| `both` | Does both; if native reaction fails, the reply still posts |
+| `neither` | Reactions are not bridged |
 
-#### Reaction bridging modes
+**Note:** Telegram native reactions only support a limited set of emoji.
+Unsupported emoji fall back gracefully when `both` is set.
 
-| Mode | Telegram→Discord | Discord→Telegram |
-|---|---|---|
-| `react` | Adds the emoji as a native Discord reaction on the message | Adds the emoji as a native Telegram reaction (limited emoji set) |
-| `reply` | Posts a reply: `❤️ Alice reacted to this message` | Posts a Telegram reply with the same text |
-| `both` | Does both | Does both; if native reaction fails, reply still posts |
-| `neither` | Does nothing | Does nothing |
-
-Note: Telegram only supports a limited set of emoji for native reactions.
-`react` or `both` will log a warning and fall back gracefully for unsupported emoji.
-
----
 
 ## Step 6 — Populate the mapping tables
 

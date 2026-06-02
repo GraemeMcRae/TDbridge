@@ -602,6 +602,174 @@ async def _send_attachments_to_telegram(
 # Routing: Telegram → Discord
 # ===========================================================================
 
+async def _handle_tg_delete_command(
+    tg_bot,
+    tg_group_id: str,
+    tg_cmd_msg_id: str,
+    tg_parent_msg_id: str,
+) -> None:
+    """Process a Telegram delete command reply.
+
+    Called when a TG reply matches TG_MSG_DELETE_REGEX.  Performs the
+    following steps (stopping on failure where noted):
+
+    1. Look up the parent TG message in the DB.
+       → If not found: leave the command reply as an untracked TG message.
+    2. Delete the parent TG message.
+       → If delete fails: post TG_MSG_DELETE_ERRMSG (if configured) and stop.
+    3. Check how many TG messages are associated with the same Discord message.
+       a. If more than one: remove only this TG message's DB row (disassociate).
+          The Discord message and other TG messages remain.
+       b. If this is the only one: delete the Discord message.
+          → "Message not found" on Discord is treated as success (already gone).
+          → Any other Discord error: post TG_MSG_DELETE_ERRMSG and stop.
+    4. Remove this TG message's DB row.
+    5. Delete the command reply from TG (so it doesn't linger as untracked).
+
+    The command reply is NEVER bridged to Discord regardless of outcome.
+    """
+    loop = asyncio.get_running_loop()
+    chat_id = int(tg_group_id)
+
+    # ── Step 1: look up parent TG message in DB ───────────────────────────────
+    record = await loop.run_in_executor(
+        None, db.find_by_tg, tg_group_id, tg_parent_msg_id
+    )
+    if not record:
+        logger.info(
+            f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+            f"parent_tg_msg={tg_parent_msg_id} | tg_group={tg_group_id} | "
+            f"result=NO_ACTION | reason=parent not in message map "
+            f"(untracked message — leaving command reply on TG)"
+        )
+        return
+
+    dc_channel_id = record["dc_channel_id"]
+    dc_msg_id     = record["dc_message_id"]
+
+    # ── Step 2: delete parent TG message ─────────────────────────────────────
+    try:
+        await tg_bot.delete_message(chat_id=chat_id, message_id=int(tg_parent_msg_id))
+        logger.info(
+            f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+            f"parent_tg_msg={tg_parent_msg_id} | tg_group={tg_group_id} | "
+            f"step=TG_DELETE | result=ok"
+        )
+    except Exception as e:
+        logger.warning(
+            f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+            f"parent_tg_msg={tg_parent_msg_id} | tg_group={tg_group_id} | "
+            f"step=TG_DELETE | result=FAILED | reason={e}"
+        )
+        if config.tg_msg_delete_errmsg:
+            try:
+                await tg_bot.send_message(
+                    chat_id=chat_id,
+                    text=config.tg_msg_delete_errmsg,
+                    reply_to_message_id=int(tg_cmd_msg_id),
+                )
+            except Exception:
+                pass
+        return
+
+    # ── Step 3: check how many TG messages share this Discord message ─────────
+    all_records = await loop.run_in_executor(
+        None, db.find_all_by_dc, dc_channel_id, dc_msg_id
+    )
+    tg_siblings = [r for r in all_records if r["tg_message_id"] != tg_parent_msg_id]
+
+    if tg_siblings:
+        # Other TG messages still exist for this Discord message — disassociate only
+        await loop.run_in_executor(
+            None, db.delete_by_tg, tg_group_id, tg_parent_msg_id
+        )
+        logger.info(
+            f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+            f"parent_tg_msg={tg_parent_msg_id} | dc_msg={dc_msg_id} | "
+            f"step=DB_DISASSOCIATE | result=ok | "
+            f"remaining_tg_siblings={[r['tg_message_id'] for r in tg_siblings]}"
+        )
+    else:
+        # ── Step 3b: sole TG message — delete the Discord message too ─────────
+        dc_channel = await _get_discord_channel(dc_channel_id)
+        discord_deleted = False
+        if dc_channel:
+            try:
+                dc_msg_obj = await dc_channel.fetch_message(int(dc_msg_id))
+                await dc_msg_obj.delete()
+                discord_deleted = True
+                logger.info(
+                    f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+                    f"parent_tg_msg={tg_parent_msg_id} | dc_msg={dc_msg_id} | "
+                    f"step=DC_DELETE | result=ok"
+                )
+            except discord.NotFound:
+                # Already gone — treat as success
+                discord_deleted = True
+                logger.info(
+                    f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+                    f"dc_msg={dc_msg_id} | step=DC_DELETE | result=already_gone"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+                    f"dc_msg={dc_msg_id} | step=DC_DELETE | result=FAILED | reason={e}"
+                )
+                if config.tg_msg_delete_errmsg:
+                    try:
+                        await tg_bot.send_message(
+                            chat_id=chat_id,
+                            text=config.tg_msg_delete_errmsg,
+                            reply_to_message_id=int(tg_cmd_msg_id),
+                        )
+                    except Exception:
+                        pass
+                return  # leave DB row and command reply intact
+        else:
+            logger.warning(
+                f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+                f"dc_msg={dc_msg_id} | step=DC_DELETE | result=FAILED | "
+                f"reason=Discord channel {dc_channel_id} not found"
+            )
+            if config.tg_msg_delete_errmsg:
+                try:
+                    await tg_bot.send_message(
+                        chat_id=chat_id,
+                        text=config.tg_msg_delete_errmsg,
+                        reply_to_message_id=int(tg_cmd_msg_id),
+                    )
+                except Exception:
+                    pass
+            return
+
+        if not discord_deleted:
+            return  # already handled above
+
+        # ── Step 4: remove DB row ─────────────────────────────────────────────
+        await loop.run_in_executor(
+            None, db.delete_by_tg, tg_group_id, tg_parent_msg_id
+        )
+        logger.info(
+            f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+            f"parent_tg_msg={tg_parent_msg_id} | dc_msg={dc_msg_id} | "
+            f"step=DB_DELETE | result=ok"
+        )
+
+    # ── Step 5: delete the command reply itself ───────────────────────────────
+    try:
+        await tg_bot.delete_message(chat_id=chat_id, message_id=int(tg_cmd_msg_id))
+        logger.info(
+            f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+            f"step=CMD_DELETE | result=ok"
+        )
+    except Exception as e:
+        logger.warning(
+            f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
+            f"step=CMD_DELETE | result=FAILED | reason={e} | "
+            f"(command reply left as untracked TG message)"
+        )
+
+
 async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle an incoming Telegram message and mirror it to Discord.
 
@@ -630,6 +798,30 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         _dashboard_reporter.save_to_db()
     except Exception:
         pass
+
+    # ---- Telegram-side delete command ----
+    # If TG_MSG_DELETE_REGEX is configured and this message is a reply whose
+    # trimmed text matches the regex (full-string, case-sensitive by default),
+    # treat it as a delete command rather than a bridged message.
+    if config.tg_msg_delete_regex and msg.reply_to_message:
+        import re as _re
+        _msg_text = (msg.text or msg.caption or "")
+        try:
+            _delete_match = bool(_re.fullmatch(config.tg_msg_delete_regex, _msg_text))
+        except _re.error as _e:
+            logger.error(
+                f"TG_MSG_DELETE_REGEX is invalid: {config.tg_msg_delete_regex!r} — {_e}"
+            )
+            _delete_match = False
+
+        if _delete_match:
+            await _handle_tg_delete_command(
+                tg_bot=context.bot,
+                tg_group_id=tg_group_id,
+                tg_cmd_msg_id=tg_msg_id,
+                tg_parent_msg_id=_tg_msg_id_str(msg.reply_to_message.message_id),
+            )
+            return  # never bridge the delete command to Discord
 
     # ---- Upsert T_Group info and check admin status ----
     asyncio.ensure_future(sheets_manager.upsert_t_group(
@@ -664,7 +856,9 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"TG→DC: mapped to DC channel {dc_channel_id!r}, user {dc_user_id!r}"
         )
     else:
-        # No mapping found — fall back to any Active Discord channel, or warn
+        # No mapping found — fall back to first Active Discord channel.
+        # Post UNROUTABLE_TTOD_ERRMSG on Telegram (if configured) to alert
+        # the sender that their message wasn't fully routed.
         active_channels = sheets_manager.get_active_channels()
         logger.info(
             f"TG→DC: no user mapping for TG group {tg_group_id}; "
@@ -672,14 +866,32 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         if active_channels:
             dc_channel_id = active_channels[0]["D_ChannelID"]
+            if config.unroutable_ttod_errmsg:
+                try:
+                    await context.bot.send_message(
+                        chat_id=tg_chat.id,
+                        text=config.unroutable_ttod_errmsg,
+                        reply_to_message_id=int(tg_msg_id),
+                    )
+                except Exception as _e:
+                    logger.warning(f"Could not post UNROUTABLE_TTOD_ERRMSG: {_e}")
         else:
             logger.warning(
                 f"TG→DC: no active Discord channels found — cannot bridge message "
                 f"from TG group {tg_group_id} ({tg_chat.title})"
             )
+            if config.unroutable_ttod_errmsg:
+                try:
+                    await context.bot.send_message(
+                        chat_id=tg_chat.id,
+                        text=config.unroutable_ttod_errmsg,
+                        reply_to_message_id=int(tg_msg_id),
+                    )
+                except Exception as _e:
+                    logger.warning(f"Could not post UNROUTABLE_TTOD_ERRMSG: {_e}")
             return
-        dc_user_id  = ""
-        user_tag  = f"@ {tg_chat.title}"  # space prevents accidental Discord mention
+        dc_user_id = ""
+        user_tag   = f"@ {tg_chat.title}"  # space prevents accidental Discord mention
 
     if not dc_channel_id:
         logger.warning(
@@ -964,11 +1176,9 @@ async def route_tg_edit_to_discord(update: Update, context: ContextTypes.DEFAULT
 async def route_tg_delete_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a Telegram message deletion and mirror it to Discord.
 
-    Behavior is controlled by the env var TDBRIDGE_DELETE_BEHAVIOR
-    (or its TEST_/PROD_ variant in .env):
-        "delete"  — attempt to delete the Discord message (default)
-        "notify"  — post a reply noting the deletion
-        "ignore"  — do nothing (log only)
+    Telegram's Bot API does not deliver message deletion events to bots,
+    so this handler is a placeholder only.  TG-initiated deletions can be
+    performed using the TG_MSG_DELETE_REGEX reply command instead.
     """
     # python-telegram-bot does not deliver a delete event directly.
     # Deletions are detected indirectly via message_id gaps or by the
@@ -1231,21 +1441,20 @@ class TDbridgeDiscordClient(discord.Client):
                     )
 
         # Unroutable — channel is Active but no Telegram group could be found.
-        # Behavior is controlled by UNROUTABLE_BEHAVIOR in .env:
-        #   "warn"   — log WARNING + post a notice in Discord
-        #   "ignore" — log INFO only, no Discord message
+        # If UNROUTABLE_DTOT_ERRMSG is non-empty, post it in Discord and log
+        # at WARNING.  If empty, log at INFO only with no Discord message.
         if not tg_group_id:
             unroutable_msg = (
                 f"DC→TG: unroutable message in #{message.channel.name} "
                 f"from {str(message.author.id)} — "
                 f"no active TG group found for sender or tagged users"
             )
-            if config.unroutable_behavior == "warn":
+            if config.unroutable_dtot_errmsg:
                 logger.warning(unroutable_msg)
                 try:
                     reference = message.to_reference(fail_if_not_exists=False)
                     await message.channel.send(
-                        "⚠️ Could not route this message to Telegram.",
+                        config.unroutable_dtot_errmsg,
                         reference=reference,
                         mention_author=False,
                     )
@@ -1444,10 +1653,9 @@ class TDbridgeDiscordClient(discord.Client):
             return
 
         tg_bot: TelegramBot = _tg_app.bot
-        behavior = os.getenv(
-            config.env_prefix + "DELETE_BEHAVIOR",
-            os.getenv("DELETE_BEHAVIOR", "delete"),
-        ).lower()
+        # dc_msg_delete_behavior: "delete" | "ignore" | "<any other string>"
+        # Any string other than "delete" or "ignore" is posted as a TG reply.
+        behavior = config.dc_msg_delete_behavior
 
         # All records share the same tg_group_id (a Discord message only
         # routes to one Telegram group).
@@ -1457,27 +1665,25 @@ class TDbridgeDiscordClient(discord.Client):
 
         if behavior == "ignore":
             logger.info(
-                f"Discord delete ignored (DELETE_BEHAVIOR=ignore): "
+                f"DC→TG delete ignored (DC_MSG_DELETE_BEHAVIOR=ignore): "
                 f"dc_msg {dc_msg_id} → tg_msgs {tg_msg_ids}"
             )
             return
 
-        if behavior == "notify":
+        if behavior != "delete":
+            # Any value other than "delete" or "ignore" is posted as a TG reply
             try:
                 await tg_bot.send_message(
                     chat_id=int(tg_group_id),
-                    text="[A Discord message was deleted]",
+                    text=behavior,
                     reply_to_message_id=tg_first_id,
                 )
             except Exception as e:
                 logger.warning(f"Failed to post delete notification to Telegram: {e}")
             return
 
-        # Default: attempt to delete every Telegram message produced by this
+        # "delete": attempt to delete every Telegram message produced by this
         # Discord message.
-        notify_on_fail = os.getenv(
-            config.env_prefix + "DELETE_FAIL_NOTIFY", "true"
-        ).lower() == "true"
 
         deleted_tg = []
         failed_tg  = []
@@ -1495,11 +1701,11 @@ class TDbridgeDiscordClient(discord.Client):
                     f"tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
                     f"result=FAILED | reason={e}"
                 )
-                if notify_on_fail:
+                if config.delete_fail_errmsg:
                     try:
                         await tg_bot.send_message(
                             chat_id=int(tg_group_id),
-                            text="[Discord message was deleted — Telegram deletion failed]",
+                            text=config.delete_fail_errmsg,
                             reply_to_message_id=tg_msg_id,
                         )
                     except Exception:

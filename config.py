@@ -243,14 +243,6 @@ class Config:
             "/etc/letsencrypt/live/hcf.squadrontrucking.com/privkey.pem"
         )
 
-        # What to do when a Discord message on an Active channel cannot be
-        # routed to any Telegram group (no matching Active user found):
-        #   "warn"   — log at WARNING level and post a warning in Discord
-        #   "ignore" — log at INFO level and do nothing in Discord
-        self.unroutable_behavior: str = os.getenv(
-            self.env_prefix + "UNROUTABLE_BEHAVIOR", "warn"
-        ).lower()
-
         # How to bridge emoji reactions:
         #   "react"   — add the emoji as a native reaction on the target message
         #   "reply"   — post a short reply message describing the reaction
@@ -262,6 +254,34 @@ class Config:
         self.reactions_dtot: str = os.getenv(
             self.env_prefix + "REACTIONS_DTOT", "reply"
         ).lower()
+
+        # What to do in Telegram when a Discord message is deleted.
+        # "delete" — attempt to delete the Telegram message
+        # "ignore" — do nothing (log only)
+        # Any other non-empty string — post that string as a Telegram reply
+        #   (leading ! is converted to ⚠️)
+        _raw_dc_delete = os.getenv(self.env_prefix + "DC_MSG_DELETE_BEHAVIOR", "delete")
+        if _raw_dc_delete.startswith("!"):
+            _raw_dc_delete = "⚠️" + _raw_dc_delete[1:]
+        self.dc_msg_delete_behavior: str = _raw_dc_delete
+
+        # Message posted on Telegram when TG deletion fails. Empty = silent.
+        self.delete_fail_errmsg: str = _errmsg("DELETE_FAIL_ERRMSG", "")
+
+        # Telegram-side delete command.
+        # If non-empty, a Telegram reply whose full text matches this regex
+        # (re.fullmatch — implicitly anchored to the entire message text)
+        # triggers deletion of the parent TG message and its corresponding
+        # Discord message.  Include \s* in the pattern to allow leading/trailing
+        # whitespace, e.g. "(?i)delete\s*" to handle autocomplete trailing spaces.
+        # Default "" disables the feature entirely.
+        self.tg_msg_delete_regex: str = os.getenv(
+            self.env_prefix + "TG_MSG_DELETE_REGEX", ""
+        )
+
+        # Message posted on Telegram when a TG delete command fails.
+        # Empty string (the default) means no error message is posted.
+        self.tg_msg_delete_errmsg: str = _errmsg("TG_MSG_DELETE_ERRMSG", "")
 
         # Convenience alias so table_manager.py can call config.bot_name
         self.bot_name: str = self.discord_bot_name

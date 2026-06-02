@@ -5,6 +5,7 @@
 # Discord Tokens are found using https://discord.com/developers/applications then click Bot > Reset Token
 #    WARNING! Resetting the token of an existing bot will cause it to fail immediately!
 # Discord Channel IDs are found by right-clicking channel in Discord with Developer Mode on to copy ID
+# ! at the start of an ERRMSG or DC_MSG_DELETE_BEHAVIOR string will be treated as ⚠️
 
 # Test Bot configuration - Discord
 TEST_DISCORD_BOT_TOKEN="<bot-token>"
@@ -34,16 +35,23 @@ TEST_SQLITE_DB_FILE=TDbridge_test.db
 TEST_LOGFILENAME=TDbridge_test.log
 # How often to refresh the Google Sheets mapping cache (seconds); default 300
 TEST_SHEETS_REFRESH_INTERVAL=300
-# What to do when a Discord message is deleted: "delete" | "notify" | "ignore"
-TEST_DELETE_BEHAVIOR=delete
-# If deletion of the Telegram message fails, post a notification? true | false
-TEST_DELETE_FAIL_NOTIFY=true
-# What to do when a Discord message on an Active channel can't be routed to any Telegram group: "warn" | "ignore"
-TEST_UNROUTABLE_BEHAVIOR=warn
+# What to do in Telegram when a Discord message is deleted: "delete" | "<message to user>" | "ignore"
+TEST_DC_MSG_DELETE_BEHAVIOR=delete
+# Message to post on Telegram if deletion of the Telegram message fails, or empty string for no message
+TEST_DELETE_FAIL_ERRMSG="! Telegram deletion failed."
+# Message to issue when a Telegram message in an Active group can't be routed to any Discord channel/user, or empty string to issue no message
+TEST_UNROUTABLE_TTOD_ERRMSG="! Unable to route this message to Discord."
+# Message to issue when a Discord message on an Active channel can't be routed to any Telegram group, or empty string to issue no message
+TEST_UNROUTABLE_DTOT_ERRMSG="! Unable to route this message to Telegram."
 # How to bridge reactions from Telegram to Discord: "react" | "reply" | "both" | "neither"
 TEST_REACTIONS_TTOD=both
 # How to bridge reactions from Discord to Telegram: "react" | "reply" | "both" | "neither"
 TEST_REACTIONS_DTOT=both
+# On Telegram, reply to a message you want to delete with a message matching this regex (using re.fullmatch)
+# Use \s* to match whitespace, e.g. "(?i)delete\s*". Use the empty string to disable this feature entirely.
+TEST_TG_MSG_DELETE_REGEX="(?i)delete\s*"
+# Error message posted on Telegram when a delete command fails. Empty string (the default) means no error message is posted.
+TEST_TG_MSG_DELETE_ERRMSG="! Delete failed."
 # Emojis -- the following parameter isn't in use for TDbridge, but it is used in HCF to discern the sentiment driving the use of certain emojis
 TEST_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, ok_hand, white_check_mark, pray, sunglasses, muscle, 100, checkered_flag, raised_hands"
 
@@ -72,16 +80,23 @@ PROD_SQLITE_DB_FILE=TDbridge_prod.db
 PROD_LOGFILENAME=TDbridge_prod.log
 # How often to refresh the Google Sheets mapping cache (seconds); default 300
 PROD_SHEETS_REFRESH_INTERVAL=300
-# What to do when a Discord message is deleted: "delete" | "notify" | "ignore"
-PROD_DELETE_BEHAVIOR=delete
-# If deletion of the Telegram message fails, post a notification? true | false
-PROD_DELETE_FAIL_NOTIFY=true
-# What to do when a Discord message on an Active channel can't be routed to any Telegram group: "warn" | "ignore"
-PROD_UNROUTABLE_BEHAVIOR=ignore
+# What to do in Telegram when a Discord message is deleted: "delete" | "<message to user>" | "ignore"
+PROD_DC_MSG_DELETE_BEHAVIOR=delete
+# Message to post on Telegram if deletion of the Telegram message fails, or empty string for no message
+PROD_DELETE_FAIL_ERRMSG="! Telegram deletion failed."
+# Message to issue when a Telegram message in an Active group can't be routed to any Discord channel/user, or empty string to issue no message
+PROD_UNROUTABLE_TTOD_ERRMSG="! Unable to route this message to Discord."
+# Message to issue when a Discord message on an Active channel can't be routed to any Telegram group, or empty string to issue no message
+PROD_UNROUTABLE_DTOT_ERRMSG=""
 # How to bridge reactions from Telegram to Discord: "react" | "reply" | "both" | "neither"
 PROD_REACTIONS_TTOD=both
 # How to bridge reactions from Discord to Telegram: "react" | "reply" | "both" | "neither"
 PROD_REACTIONS_DTOT=both
+# On Telegram, reply to a message you want to delete with a message matching this regex (using re.fullmatch)
+# Use \s* to match whitespace, e.g. "(?i)delete\s*". Use the empty string to disable this feature entirely.
+PROD_TG_MSG_DELETE_REGEX="(?i)delete\s*"
+# Error message posted on Telegram when a delete command fails. Empty string (the default) means no error message is posted.
+PROD_TG_MSG_DELETE_ERRMSG="! Delete failed."
 # Emojis -- the following parameter isn't in use for TDbridge, but it is used in HCF to discern the sentiment driving the use of certain emojis
 PROD_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, ok_hand, white_check_mark, pray, sunglasses, muscle, 100, checkered_flag, raised_hands"
 
