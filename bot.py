@@ -102,6 +102,7 @@ _sheets_refresh_task: Optional[asyncio.Task] = None
 _db_purge_task: Optional[asyncio.Task] = None
 _discord_refresh_task: Optional[asyncio.Task] = None
 _dashboard_task: Optional[asyncio.Task] = None
+_t_group_flush_task: Optional[asyncio.Task] = None
 
 # Dashboard reporter — emits Status Report log lines every 30 minutes
 _dashboard_reporter = DashboardReporter(config, bot_status)
@@ -823,10 +824,12 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return  # never bridge the delete command to Discord
 
-    # ---- Upsert T_Group info and check admin status ----
-    asyncio.ensure_future(sheets_manager.upsert_t_group(
+    # ---- Queue T_Group info for buffered write to Sheets ----
+    # upsert_t_group now adds to a write-behind buffer; the actual Sheets
+    # write happens in the background flush loop (every 60 seconds).
+    sheets_manager.upsert_t_group_buffered(
         tg_group_id, tg_chat.title or "", tg_chat.type or "group"
-    ))
+    )
     # Check admin status the first time we see a group (not on every message).
     # The T_Group cache tells us if this is a known group; if it's new, check.
     if not sheets_manager.get_tg_group(tg_group_id):
@@ -2283,6 +2286,9 @@ async def _startup(discord_client: discord.Client) -> None:
     # restart shows accurate tg_idle_min and bridged_30m rather than 9999/0.
     _dashboard_reporter.load_from_db()
 
+    # Restore any T_Group writes that were pending when the bot last stopped.
+    sheets_manager._load_pending_t_group_from_db()
+
     # Initial Sheets load — read T_Group only.
     # D_User and D_Channel are intentionally skipped here because
     # _refresh_discord_to_sheets() performs a full read-modify-write on
@@ -2307,6 +2313,7 @@ async def _startup(discord_client: discord.Client) -> None:
     _sheets_refresh_task   = asyncio.create_task(_sheets_refresh_loop())
     _db_purge_task         = asyncio.create_task(_db_purge_loop())
     _discord_refresh_task  = asyncio.create_task(_discord_refresh_loop(discord_client))
+    _t_group_flush_task    = asyncio.create_task(sheets_manager.t_group_flush_loop())
 
     # Emit startup Status Report and start the 30-minute reporting loop
     _dashboard_reporter.emit_startup()
@@ -2336,7 +2343,15 @@ async def _shutdown() -> None:
 
     bot_status.dc_connected = False
 
-    for task in [_sheets_refresh_task, _db_purge_task, _discord_refresh_task, _dashboard_task]:
+    # Flush any pending T_Group writes before the event loop stops
+    try:
+        await sheets_manager.flush_t_group_buffer()
+        logger.info("T_Group buffer: flushed on shutdown")
+    except Exception as e:
+        logger.warning(f"T_Group buffer: shutdown flush failed: {e}")
+
+    for task in [_sheets_refresh_task, _db_purge_task, _discord_refresh_task,
+                 _dashboard_task, _t_group_flush_task]:
         if task:
             task.cancel()
             try:

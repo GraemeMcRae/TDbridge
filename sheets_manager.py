@@ -580,41 +580,197 @@ async def batch_upsert_d_channels(channels: list[dict]) -> None:
     await loop.run_in_executor(None, batch_upsert_d_channels_sync, channels)
 
 
-def _upsert_t_group_sync(
+# ---------------------------------------------------------------------------
+# T_Group write-behind buffer
+#
+# Rather than writing to Sheets on every incoming Telegram message, we
+# accumulate pending T_Group upserts in memory and flush them in a single
+# batch after T_GROUP_FLUSH_INTERVAL seconds (default 60) or when the bot
+# shuts down gracefully.
+#
+# Buffer structure:
+#   _t_group_pending: dict[tg_group_id, {"title": str, "type": str, "ts": float}]
+#
+# The buffer is also persisted to SQLite so pending writes survive a restart.
+# Keyed by T_GroupID; duplicate arrivals from the same group overwrite the
+# earlier entry so only one Sheets API call is needed per group per flush cycle.
+# ---------------------------------------------------------------------------
+
+import json as _json
+import time as _time
+
+T_GROUP_FLUSH_INTERVAL = 60   # seconds between flush cycles
+
+_t_group_pending: dict[str, dict] = {}
+_t_group_pending_lock = threading.Lock()
+
+
+def _load_pending_t_group_from_db() -> None:
+    """Restore any pending T_Group writes that survived a restart."""
+    import db as _db
+    raw = _db.get_status_value("t_group_pending_buffer", "")
+    if not raw:
+        return
+    try:
+        data = _json.loads(raw)
+        with _t_group_pending_lock:
+            _t_group_pending.update(data)
+        logger.info(
+            f"T_Group buffer: restored {len(data)} pending write(s) from DB"
+        )
+    except Exception as e:
+        logger.warning(f"T_Group buffer: could not restore pending writes: {e}")
+
+
+def _save_pending_t_group_to_db() -> None:
+    """Persist the pending T_Group buffer to SQLite."""
+    import db as _db
+    with _t_group_pending_lock:
+        snapshot = dict(_t_group_pending)
+    try:
+        _db.set_status_value("t_group_pending_buffer", _json.dumps(snapshot))
+    except Exception as e:
+        logger.warning(f"T_Group buffer: could not persist pending writes: {e}")
+
+
+def _flush_t_group_buffer_sync() -> None:
+    """Write all pending T_Group updates to Sheets in a single batch.
+
+    This is the blocking implementation — always call via run_in_executor.
+
+    Strategy:
+      1. Snapshot and clear the buffer atomically so new arrivals during
+         the flush don't get lost.
+      2. Read the T_Group sheet once.
+      3. Compute updates (existing rows) and inserts (new groups) in one pass.
+      4. Write updates in one batch_update_rows call.
+      5. Insert all new rows at once, then write their data in one batch.
+    """
+    with _t_group_pending_lock:
+        if not _t_group_pending:
+            return
+        snapshot = dict(_t_group_pending)
+        _t_group_pending.clear()
+
+    # Clear the persisted buffer now that we have a local snapshot
+    _save_pending_t_group_to_db()
+
+    now_serial = datetime_to_serial(localnow())
+    logger.info(
+        f"T_Group buffer: flushing {len(snapshot)} pending write(s) to Sheets"
+    )
+
+    try:
+        _t_group_tm.refresh_table()
+        _update_lock_status("T_Group", _t_group_tm.actual_columns)
+
+        group_ids = list(snapshot.keys())
+        existing = _t_group_tm.find_rows_in_cache("T_GroupID", group_ids)
+
+        updates: list[tuple[int, dict]] = []
+        inserts: list[tuple[str, dict]] = []   # (tg_group_id, data_dict)
+
+        for tg_group_id, info in snapshot.items():
+            row_data = {
+                "T_Title":     info["title"],
+                "T_Type":      info["type"],
+                "T_LastFound": now_serial,
+            }
+            if tg_group_id in existing:
+                row_num, _ = existing[tg_group_id]
+                updates.append((row_num, row_data))
+            else:
+                inserts.append((tg_group_id, row_data))
+
+        if updates:
+            _t_group_tm.batch_update_rows(updates)
+            _mark_sheets_ok(True)
+            logger.info(f"T_Group buffer: updated {len(updates)} existing row(s)")
+
+        if inserts:
+            n = len(inserts)
+            _t_group_tm.insert_rows_at_top([], n)
+            new_rows_data = []
+            for i, (tg_group_id, row_data) in enumerate(inserts):
+                full_row = {"T_GroupID": tg_group_id, **row_data}
+                new_rows_data.append((2 + i, full_row))
+                logger.info(
+                    f"T_Group buffer: inserting new group {tg_group_id} "
+                    f"({row_data['T_Title']!r})"
+                )
+            _t_group_tm.batch_update_rows(new_rows_data)
+            _mark_sheets_ok(True)
+            logger.info(f"T_Group buffer: inserted {n} new row(s)")
+
+    except Exception as e:
+        _mark_sheets_ok(False)
+        logger.error(f"T_Group buffer: flush failed: {e}", exc_info=True)
+        # Put the snapshot back so the next flush retries it, merged with any
+        # new arrivals that came in during the failed flush.
+        with _t_group_pending_lock:
+            for gid, info in snapshot.items():
+                # Don't overwrite a newer entry that arrived during the flush
+                if gid not in _t_group_pending:
+                    _t_group_pending[gid] = info
+        _save_pending_t_group_to_db()
+
+
+async def flush_t_group_buffer() -> None:
+    """Async wrapper: flush the T_Group write buffer without blocking the loop."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _flush_t_group_buffer_sync)
+
+
+async def t_group_flush_loop() -> None:
+    """Background task: flush the T_Group buffer every T_GROUP_FLUSH_INTERVAL seconds.
+
+    Started by bot.py alongside the other background tasks.
+    """
+    while True:
+        await asyncio.sleep(T_GROUP_FLUSH_INTERVAL)
+        if _t_group_pending:
+            logger.info(
+                f"T_Group buffer: scheduled flush "
+                f"({len(_t_group_pending)} pending)"
+            )
+            await flush_t_group_buffer()
+
+
+def upsert_t_group_buffered(
     tg_group_id: str,
     title: str,
     group_type: str,
 ) -> None:
-    """Insert or update a T_Group row.  Blocking — run in executor from async."""
-    now_serial = datetime_to_serial(localnow())
+    """Add a T_Group upsert to the write-behind buffer.
 
-    _t_group_tm.refresh_table()
-    existing = _t_group_tm.find_rows_in_cache("T_GroupID", [tg_group_id])
-
-    if existing:
-        row_num, _ = existing[str(tg_group_id)]
-        _t_group_tm.batch_update_rows([(row_num, {
-            "T_Title":     title,
-            "T_Type":      group_type,
-            "T_LastFound": now_serial,
-        })])
-        logger.info(f"Updated T_Group row for group {tg_group_id} ({title})")
-    else:
-        _t_group_tm.insert_rows_at_top([], 1)
-        _t_group_tm.batch_update_rows([(2, {
-            "T_GroupID":   tg_group_id,
-            "T_Title":     title,
-            "T_Type":      group_type,
-            "T_LastFound": now_serial,
-            # T_Status left empty for user to set
-        })])
-        logger.info(f"Inserted new T_Group row for {tg_group_id} ({title})")
+    Does not touch Sheets — the actual write happens at the next flush.
+    Thread-safe and synchronous (no await needed).
+    Duplicate arrivals for the same group overwrite the earlier entry so
+    each group produces at most one Sheets API call per flush cycle.
+    """
+    with _t_group_pending_lock:
+        _t_group_pending[tg_group_id] = {
+            "title": title,
+            "type":  group_type,
+            "ts":    _time.time(),
+        }
+    logger.debug(
+        f"T_Group buffer: queued {tg_group_id} ({title!r}), "
+        f"buffer size={len(_t_group_pending)}"
+    )
+    # Persist the buffer after every addition so it survives a crash
+    _save_pending_t_group_to_db()
 
 
 async def upsert_t_group(tg_group_id: str, title: str, group_type: str) -> None:
-    """Async wrapper for _upsert_t_group_sync."""
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _upsert_t_group_sync, tg_group_id, title, group_type)
+    """Queue a T_Group upsert in the write-behind buffer.
+
+    Replaces the old immediate-write implementation.  The actual Sheets
+    write happens in the next flush cycle (within T_GROUP_FLUSH_INTERVAL
+    seconds) or at shutdown.  Multiple calls for the same group within one
+    flush window are coalesced into a single Sheets API call.
+    """
+    upsert_t_group_buffered(tg_group_id, title, group_type)
 
 
 # ---------------------------------------------------------------------------
