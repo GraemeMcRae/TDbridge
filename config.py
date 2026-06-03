@@ -270,11 +270,13 @@ class Config:
         self.unroutable_dtot_errmsg: str = _errmsg("UNROUTABLE_DTOT_ERRMSG", "")
 
         # Message posted in Telegram when a TG message can't be routed to any
-        # Discord channel/user.  Empty = silent (INFO log only).
-        # Note: the message is still forwarded to the first Active Discord channel
-        # as a fallback; this ERRMSG alerts the Telegram sender that routing
-        # was not fully resolved.
+        # Active OR Inactive Discord user/role (pure fallback to first Active channel).
+        # Empty = silent (INFO log only).
         self.unroutable_ttod_errmsg: str = _errmsg("UNROUTABLE_TTOD_ERRMSG", "")
+
+        # Message posted in Telegram when a TG message was routed via an Inactive
+        # D_User row (Case 2 routing).  Empty = silent (INFO log only).
+        self.routed_inactive_ttod_errmsg: str = _errmsg("ROUTED_INACTIVE_TTOD_ERRMSG", "")
 
         # What to do in Telegram when a Discord message is deleted.
         # "delete" — attempt to delete the Telegram message

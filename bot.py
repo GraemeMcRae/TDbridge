@@ -868,19 +868,35 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"TG→DC: cache lookup — tg_group_id={tg_group_id!r} → {_lookup_result}"
     )
 
-    async def _post_errmsg_on_telegram() -> None:
-        if config.unroutable_ttod_errmsg:
+    async def _post_tg_errmsg(errmsg: str) -> None:
+        """Post an ERRMSG reply on Telegram if the string is non-empty."""
+        if errmsg:
             try:
                 await context.bot.send_message(
                     chat_id=tg_chat.id,
-                    text=config.unroutable_ttod_errmsg,
+                    text=errmsg,
                     reply_to_message_id=int(tg_msg_id),
                 )
             except Exception as _e:
-                logger.warning(f"Could not post UNROUTABLE_TTOD_ERRMSG: {_e}")
+                logger.warning(f"Could not post TG errmsg: {_e}")
+
+    def _tg_unroutable_log(case: str, errmsg: str, extra: str = "") -> None:
+        """Log a TG→DC routing event at WARNING or INFO depending on errmsg."""
+        tg_raw = (msg.text or msg.caption or "").replace("\n", "\\n")
+        log_msg = (
+            f"TG→DC unroutable | case={case} | "
+            f"tg_msg={tg_msg_id} | tg_group={tg_group_id}('{tg_chat.title}') | "
+            f"tg_sender={sender_name!r} | tg_text={tg_raw!r} | "
+            f"errmsg_sent={'yes' if errmsg else 'no'}"
+            + (f" | {extra}" if extra else "")
+        )
+        if errmsg:
+            logger.warning(log_msg)
+        else:
+            logger.info(log_msg)
 
     if user_row:
-        # Case 1: Active row
+        # Case 1: Active row — normal routing, no ERRMSG needed
         dc_channel_id = str(user_row.get("D_ChannelID", "")).strip()
         dc_user_id    = str(user_row.get("D_ID", "")).strip()
         user_tag      = f"<@{dc_user_id}>" if dc_user_id else ""
@@ -889,34 +905,36 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"user/role {dc_user_id!r}"
         )
     elif _inactive_row:
-        # Case 2: Inactive row — route to its channel, tag user/role normally.
-        # Discord renders unknown/departed user mentions as @DeletedUser.
+        # Case 2: Inactive row — route to its channel and tag normally.
+        # Discord renders mentions of departed users as @DeletedUser.
         dc_channel_id = str(_inactive_row.get("D_ChannelID", "")).strip()
         dc_user_id    = str(_inactive_row.get("D_ID", "")).strip()
         user_tag      = f"<@{dc_user_id}>" if dc_user_id else ""
-        logger.info(
-            f"TG→DC: Case 2 (Inactive) — channel {dc_channel_id!r}, "
-            f"user/role {dc_user_id!r}"
+        errmsg2 = config.routed_inactive_ttod_errmsg
+        _tg_unroutable_log(
+            "2-inactive",
+            errmsg2,
+            f"dc_channel={dc_channel_id!r} dc_user_id={dc_user_id!r}"
         )
-        await _post_errmsg_on_telegram()
+        await _post_tg_errmsg(errmsg2)
     else:
         # Case 3: No row at all — first Active Discord channel + pseudo-tag
         active_channels = sheets_manager.get_active_channels()
         if not active_channels:
-            logger.warning(
-                f"TG→DC: no active Discord channels found — cannot bridge "
-                f"message from TG group {tg_group_id} ({tg_chat.title})"
-            )
-            await _post_errmsg_on_telegram()
+            errmsg3 = config.unroutable_ttod_errmsg
+            _tg_unroutable_log("3-no-channels", errmsg3)
+            await _post_tg_errmsg(errmsg3)
             return
         dc_channel_id = active_channels[0]["D_ChannelID"]
         dc_user_id    = ""
         user_tag      = f"@ {tg_chat.title}"  # space prevents Discord mention
-        logger.info(
-            f"TG→DC: Case 3 (fallback) — channel {dc_channel_id!r}, "
-            f"pseudo-tag for group '{tg_chat.title}'"
+        errmsg3 = config.unroutable_ttod_errmsg
+        _tg_unroutable_log(
+            "3-fallback",
+            errmsg3,
+            f"fallback_channel={dc_channel_id!r}"
         )
-        await _post_errmsg_on_telegram()
+        await _post_tg_errmsg(errmsg3)
 
     logger.info(f"TG→DC: fetching Discord channel object for {dc_channel_id}")
     channel = await _get_discord_channel(dc_channel_id)
@@ -1489,10 +1507,32 @@ class TDbridgeDiscordClient(discord.Client):
         # If UNROUTABLE_DTOT_ERRMSG is non-empty, post it in Discord and log
         # at WARNING.  If empty, log at INFO only with no Discord message.
         if not tg_group_id:
+            _dc_unroutable_text = message.content.replace("\n", "\\n")
+            _dc_attach_info = (
+                ", ".join(
+                    f"{a.filename}({a.content_type or '?'},{(a.size or 0)//1024}KB)"
+                    for a in message.attachments
+                ) if message.attachments else "none"
+            )
+            _dc_reply_info = (
+                f"reply_to_dc={message.reference.message_id}"
+                if message.reference and message.reference.message_id
+                else "not_a_reply"
+            )
+            _dc_mentions = ", ".join(
+                f"{a}{b}" for a, b in
+                __import__("re").findall(r"<@!?(&?)(\d+)>", message.content)
+            ) or "none"
             unroutable_msg = (
-                f"DC→TG: unroutable message in #{message.channel.name} "
-                f"from {str(message.author.id)} — "
-                f"no active TG group found for sender or tagged users"
+                f"DC→TG unroutable | "
+                f"dc_msg={dc_msg_id} | "
+                f"dc_user={message.author.id}({message.author.name}) | "
+                f"dc_channel=#{message.channel.name}({dc_channel_id}) | "
+                f"dc_text={_dc_unroutable_text!r} | "
+                f"attachments=[{_dc_attach_info}] | "
+                f"{_dc_reply_info} | "
+                f"mentions=[{_dc_mentions}] | "
+                f"reason=no active TG group found for sender or tagged users/roles"
             )
             if config.unroutable_dtot_errmsg:
                 logger.warning(unroutable_msg)

@@ -34,13 +34,15 @@ TEST_SQLITE_DB_FILE=TDbridge_test.db
 # Log file
 TEST_LOGFILENAME=TDbridge_test.log
 # How often to refresh the Google Sheets mapping cache (seconds); default 300
-TEST_SHEETS_REFRESH_INTERVAL=300
+TEST_SHEETS_REFRESH_INTERVAL=120
 # What to do in Telegram when a Discord message is deleted: "delete" | "<message to user>" | "ignore"
 TEST_DC_MSG_DELETE_BEHAVIOR=delete
 # Message to post on Telegram if deletion of the Telegram message fails, or empty string for no message
 TEST_DELETE_FAIL_ERRMSG="! Telegram deletion failed."
-# Message to issue when a Telegram message in an Active group can't be routed to any Discord channel/user, or empty string to issue no message
+# Message to issue when a Telegram message in an Active group can't be routed to any Discord channel/user/role, or empty string to issue no message
 TEST_UNROUTABLE_TTOD_ERRMSG="! Unable to route this message to Discord."
+# Message to issue when a Telegram message was routed to an inactive Discord user/role, or empty string to issue no message
+TEST_ROUTED_INACTIVE_TTOD_ERRMSG="! Message routed to inactive Discord user."
 # Message to issue when a Discord message on an Active channel can't be routed to any Telegram group, or empty string to issue no message
 TEST_UNROUTABLE_DTOT_ERRMSG="! Unable to route this message to Telegram."
 # How to bridge reactions from Telegram to Discord: "react" | "reply" | "both" | "neither"
@@ -84,8 +86,10 @@ PROD_SHEETS_REFRESH_INTERVAL=300
 PROD_DC_MSG_DELETE_BEHAVIOR=delete
 # Message to post on Telegram if deletion of the Telegram message fails, or empty string for no message
 PROD_DELETE_FAIL_ERRMSG="! Telegram deletion failed."
-# Message to issue when a Telegram message in an Active group can't be routed to any Discord channel/user, or empty string to issue no message
-PROD_UNROUTABLE_TTOD_ERRMSG="! Unable to route this message to Discord."
+# Message to issue when a Telegram message in an Active group can't be routed to any Discord channel/user/role, or empty string to issue no message
+#PROD_UNROUTABLE_TTOD_ERRMSG="! Unable to route this message to Discord."
+# Message to issue when a Telegram message was routed to an inactive Discord user/role, or empty string to issue no message
+#PROD_ROUTED_INACTIVE_TTOD_ERRMSG="! Message routed to inactive Discord user."
 # Message to issue when a Discord message on an Active channel can't be routed to any Telegram group, or empty string to issue no message
 PROD_UNROUTABLE_DTOT_ERRMSG=""
 # How to bridge reactions from Telegram to Discord: "react" | "reply" | "both" | "neither"
