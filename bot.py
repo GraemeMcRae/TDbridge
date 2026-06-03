@@ -150,6 +150,7 @@ def _resolve_discord_mentions(text: str) -> str:
     Discord encodes mentions as:
         <@discord_user_id>    — user mention
         <@!discord_user_id>   — user mention (legacy nickname variant)
+        <@&role_id>           — role mention
         <#discord_channel_id> — channel mention
 
     On the Telegram side these raw snowflake IDs are meaningless.  This
@@ -188,6 +189,17 @@ def _resolve_discord_mentions(text: str) -> str:
         # Space after # prevents Telegram from treating this as a channel link
         return f"# {name}"
 
+    def _resolve_role(match: re.Match) -> str:
+        # Role mentions are <@&role_id>; D_ID is stored as "&role_id"
+        rid = f"&{match.group(1)}"
+        row = sheets_manager.get_user_by_discord_id(rid)
+        if not row:
+            return match.group(0)  # leave unchanged if not found
+        name = str(row.get("D_Nickname", "")).strip() or match.group(1)
+        return f"@ {name}"
+
+    # <@&id> — role mentions (must be checked before <@!?id> to avoid partial match)
+    text = re.sub(r"<@&(\d+)>", _resolve_role, text)
     # <@!id> (legacy) and <@id> (current) — user mentions
     text = re.sub(r"<@!?(\d+)>", _resolve_user, text)
     # <#id> — channel mentions
@@ -838,69 +850,73 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
     # ---- Determine target Discord channel ----
+    # TG→DC routing — three cases in priority order:
+    #   Case 1: Active D_User row matching T_GroupID → normal user/role tag
+    #   Case 2: Inactive D_User row matching T_GroupID → normal tag + ERRMSG
+    #   Case 3: No row at all → first Active channel + pseudo-tag + ERRMSG
     user_row = sheets_manager.get_user_by_tg_group(tg_group_id)
-    # Log the raw chat.id type so we can confirm it arrives as a string
-    # after _tg_group_id_str() conversion, and see exactly what value is
-    # used for the cache lookup.
+    _inactive_row: Optional[dict] = None
+    if not user_row:
+        _inactive_row = sheets_manager.get_user_by_tg_group_inactive(tg_group_id)
+
     _lookup_result = (
-        f"found user row D_ID={user_row.get('D_ID')!r}"
-        if user_row else "NOT FOUND in user_by_tg_group_id"
+        f"Case 1 Active D_ID={user_row.get('D_ID')!r}" if user_row
+        else f"Case 2 Inactive D_ID={_inactive_row.get('D_ID')!r}" if _inactive_row
+        else "Case 3 fallback (no row)"
     )
     logger.info(
-        f"TG→DC: cache lookup — "
-        f"tg_group_id={tg_group_id!r} (type={type(tg_group_id).__name__}) → {_lookup_result}"
+        f"TG→DC: cache lookup — tg_group_id={tg_group_id!r} → {_lookup_result}"
     )
+
+    async def _post_errmsg_on_telegram() -> None:
+        if config.unroutable_ttod_errmsg:
+            try:
+                await context.bot.send_message(
+                    chat_id=tg_chat.id,
+                    text=config.unroutable_ttod_errmsg,
+                    reply_to_message_id=int(tg_msg_id),
+                )
+            except Exception as _e:
+                logger.warning(f"Could not post UNROUTABLE_TTOD_ERRMSG: {_e}")
+
     if user_row:
+        # Case 1: Active row
         dc_channel_id = str(user_row.get("D_ChannelID", "")).strip()
         dc_user_id    = str(user_row.get("D_ID", "")).strip()
-        # Build @mention tag if we have a valid Discord user ID
-        user_tag = f"<@{dc_user_id}>" if dc_user_id else ""
+        user_tag      = f"<@{dc_user_id}>" if dc_user_id else ""
         logger.info(
-            f"TG→DC: mapped to DC channel {dc_channel_id!r}, user {dc_user_id!r}"
+            f"TG→DC: Case 1 (Active) — channel {dc_channel_id!r}, "
+            f"user/role {dc_user_id!r}"
         )
+    elif _inactive_row:
+        # Case 2: Inactive row — route to its channel, tag user/role normally.
+        # Discord renders unknown/departed user mentions as @DeletedUser.
+        dc_channel_id = str(_inactive_row.get("D_ChannelID", "")).strip()
+        dc_user_id    = str(_inactive_row.get("D_ID", "")).strip()
+        user_tag      = f"<@{dc_user_id}>" if dc_user_id else ""
+        logger.info(
+            f"TG→DC: Case 2 (Inactive) — channel {dc_channel_id!r}, "
+            f"user/role {dc_user_id!r}"
+        )
+        await _post_errmsg_on_telegram()
     else:
-        # No mapping found — fall back to first Active Discord channel.
-        # Post UNROUTABLE_TTOD_ERRMSG on Telegram (if configured) to alert
-        # the sender that their message wasn't fully routed.
+        # Case 3: No row at all — first Active Discord channel + pseudo-tag
         active_channels = sheets_manager.get_active_channels()
-        logger.info(
-            f"TG→DC: no user mapping for TG group {tg_group_id}; "
-            f"active channels available: {[c.get('D_ChannelID') for c in active_channels]}"
-        )
-        if active_channels:
-            dc_channel_id = active_channels[0]["D_ChannelID"]
-            if config.unroutable_ttod_errmsg:
-                try:
-                    await context.bot.send_message(
-                        chat_id=tg_chat.id,
-                        text=config.unroutable_ttod_errmsg,
-                        reply_to_message_id=int(tg_msg_id),
-                    )
-                except Exception as _e:
-                    logger.warning(f"Could not post UNROUTABLE_TTOD_ERRMSG: {_e}")
-        else:
+        if not active_channels:
             logger.warning(
-                f"TG→DC: no active Discord channels found — cannot bridge message "
-                f"from TG group {tg_group_id} ({tg_chat.title})"
+                f"TG→DC: no active Discord channels found — cannot bridge "
+                f"message from TG group {tg_group_id} ({tg_chat.title})"
             )
-            if config.unroutable_ttod_errmsg:
-                try:
-                    await context.bot.send_message(
-                        chat_id=tg_chat.id,
-                        text=config.unroutable_ttod_errmsg,
-                        reply_to_message_id=int(tg_msg_id),
-                    )
-                except Exception as _e:
-                    logger.warning(f"Could not post UNROUTABLE_TTOD_ERRMSG: {_e}")
+            await _post_errmsg_on_telegram()
             return
-        dc_user_id = ""
-        user_tag   = f"@ {tg_chat.title}"  # space prevents accidental Discord mention
-
-    if not dc_channel_id:
-        logger.warning(
-            f"TG→DC: D_ChannelID is empty for TG group {tg_group_id}; skipping bridge"
+        dc_channel_id = active_channels[0]["D_ChannelID"]
+        dc_user_id    = ""
+        user_tag      = f"@ {tg_chat.title}"  # space prevents Discord mention
+        logger.info(
+            f"TG→DC: Case 3 (fallback) — channel {dc_channel_id!r}, "
+            f"pseudo-tag for group '{tg_chat.title}'"
         )
-        return
+        await _post_errmsg_on_telegram()
 
     logger.info(f"TG→DC: fetching Discord channel object for {dc_channel_id}")
     channel = await _get_discord_channel(dc_channel_id)
@@ -1361,59 +1377,58 @@ class TDbridgeDiscordClient(discord.Client):
                 tg_group_id    = parent_record["tg_group_id"]
                 root_tg_msg_id = parent_record["root_tg_msg_id"]
 
-        # Case 2: New message — find the first tagged user (in the order they
-        # appear in the message text) who is Active and has a T_GroupID.
+        # Case 2: First tagged user OR role (left-to-right in message text)
+        # that is Active, has a T_GroupID, and has a D_ChannelID matching
+        # the incoming channel.
         #
-        # IMPORTANT: message.mentions is an UNORDERED collection — Discord does
-        # not guarantee it matches the left-to-right order of @mentions in the
-        # text.  To respect the order the sender wrote them, we scan
-        # message.content for <@id> tokens using a regex and look each one up
-        # in turn.  This ensures "@Angel @Boont" routes to Angel, not Boont.
-        if not tg_group_id and message.mentions:
+        # Scans message.content for <@id>, <@!id>, and <@&role_id> tokens in
+        # order.  role IDs are looked up with the "&" prefix matching D_ID.
+        # message.mentions is unordered and role-unaware, so we parse the text.
+        if not tg_group_id:
             import re as _re
-            # Extract mention IDs in the order they appear in the message text.
-            # Both <@id> and <@!id> (legacy nickname variant) are matched.
-            mention_ids_in_order = _re.findall(r"<@!?(\d+)>", message.content)
-            # Deduplicate while preserving order (same user mentioned twice)
-            seen_uids: set[str] = set()
-            ordered_uids = []
-            for uid in mention_ids_in_order:
-                if uid not in seen_uids:
-                    seen_uids.add(uid)
-                    ordered_uids.append(uid)
+            # Extract all mention tokens in left-to-right order.
+            # Capture (optional &)(digits) so we can reconstruct the lookup key.
+            raw_mentions = _re.findall(r"<@!?(&?)(\d+)>", message.content)
+            seen_mention_keys: set[str] = set()
+            ordered_keys: list[str] = []
+            for amp, digits in raw_mentions:
+                key = f"{amp}{digits}"   # "&12345" for roles, "12345" for users
+                if key not in seen_mention_keys:
+                    seen_mention_keys.add(key)
+                    ordered_keys.append(key)
 
-            for uid in ordered_uids:
-                user_row = sheets_manager.get_user_by_discord_id(uid)
-                if not user_row:
-                    logger.info(f"DC→TG routing: tagged user {uid} not in Sheets cache, skipping")
+            for key in ordered_keys:
+                row = sheets_manager.get_user_by_discord_id(key)
+                if not row:
+                    logger.info(f"DC→TG routing: tagged {key!r} not in Sheets cache, skipping")
                     continue
-                status = user_row.get("D_UserStatus", "")
-                tgid = str(user_row.get("T_GroupID", "")).strip()
-                user_channel = str(user_row.get("D_ChannelID", "")).strip()
+                status = row.get("D_UserStatus", "")
+                tgid = str(row.get("T_GroupID", "")).strip()
+                row_channel = str(row.get("D_ChannelID", "")).strip()
                 if not tgid:
-                    logger.info(f"DC→TG routing: tagged user {uid} has no T_GroupID, skipping")
+                    logger.info(f"DC→TG routing: tagged {key!r} has no T_GroupID, skipping")
                     continue
                 if not sheets_manager._is_active(status):
                     logger.info(
-                        f"DC→TG routing: tagged user {uid} is not Active "
+                        f"DC→TG routing: tagged {key!r} is not Active "
                         f"(D_UserStatus={status!r}), skipping"
                     )
                     continue
-                if user_channel and user_channel != incoming_channel_id:
+                if row_channel and row_channel != incoming_channel_id:
                     logger.info(
-                        f"DC→TG routing: tagged user {uid} D_ChannelID={user_channel!r} "
+                        f"DC→TG routing: tagged {key!r} D_ChannelID={row_channel!r} "
                         f"does not match incoming channel {incoming_channel_id!r}, skipping"
                     )
                     continue
                 tg_group_id = tgid
                 logger.info(
-                    f"DC→TG routing: routing to tagged user {uid} "
-                    f"→ TG group {tg_group_id} via channel {incoming_channel_id}"
+                    f"DC→TG routing: routing to tagged {'role' if key.startswith('&') else 'user'} "
+                    f"{key!r} → TG group {tg_group_id} via channel {incoming_channel_id}"
                 )
                 break
 
-        # Case 3: Sender is a mapped Active user with their own group,
-        # and the message was sent from their assigned D_ChannelID.
+        # Case 3: Sender's user ID matches an Active D_User row with a
+        # T_GroupID and a D_ChannelID matching the incoming channel.
         if not tg_group_id:
             sender_uid = str(message.author.id)
             sender_row = sheets_manager.get_user_by_discord_id(sender_uid)
@@ -1438,10 +1453,37 @@ class TDbridgeDiscordClient(discord.Client):
                 else:
                     tg_group_id = tgid
                     logger.info(
-                        f"DC→TG routing: no active tagged user found; "
-                        f"routing to sender {sender_uid} → TG group {tg_group_id} "
-                        f"via channel {incoming_channel_id}"
+                        f"DC→TG routing: routing to sender user {sender_uid} "
+                        f"→ TG group {tg_group_id} via channel {incoming_channel_id}"
                     )
+
+        # Case 4: Sender's Discord roles, searched in D_User table row order.
+        # If the sender belongs to a role that has an Active D_User row with
+        # a T_GroupID and a D_ChannelID matching the incoming channel, use it.
+        # Table row order determines priority when the sender has multiple roles.
+        if not tg_group_id:
+            sender_role_ids = {f"&{r.id}" for r in message.author.roles}
+            for row in sheets_manager.get_all_user_rows_in_table_order():
+                did = str(row.get("D_ID", "")).strip()
+                if not did.startswith("&"):
+                    continue   # user row, not a role row
+                if did not in sender_role_ids:
+                    continue
+                status = row.get("D_UserStatus", "")
+                tgid = str(row.get("T_GroupID", "")).strip()
+                row_channel = str(row.get("D_ChannelID", "")).strip()
+                if not tgid:
+                    continue
+                if not sheets_manager._is_active(status):
+                    continue
+                if row_channel and row_channel != incoming_channel_id:
+                    continue
+                tg_group_id = tgid
+                logger.info(
+                    f"DC→TG routing: routing via sender role {did!r} "
+                    f"→ TG group {tg_group_id} via channel {incoming_channel_id}"
+                )
+                break
 
         # Unroutable — channel is Active but no Telegram group could be found.
         # If UNROUTABLE_DTOT_ERRMSG is non-empty, post it in Discord and log
@@ -1885,6 +1927,24 @@ async def _refresh_discord_to_sheets(discord_client: discord.Client) -> None:
         except Exception as e:
             logger.error(f"Error fetching members in guild '{guild.name}': {e}")
 
+        # Roles — stored with D_ID = "&<role_id>" to distinguish from users.
+        # D_Nickname holds the role name (server-specific, like a nickname).
+        # D_UserName and D_DisplayName are left empty (user-account properties).
+        # The @everyone role (id == guild.id) is skipped — it's not useful for routing.
+        for role in guild.roles:
+            if role.id == guild.id:
+                continue  # skip @everyone
+            rid = f"&{role.id}"
+            if rid in seen_user_ids:
+                continue
+            seen_user_ids.add(rid)
+            all_users.append({
+                "discord_id":   rid,
+                "username":     "",           # not applicable for roles
+                "nickname":     role.name,    # role name is server-specific
+                "display_name": "",           # not applicable for roles
+            })
+
         # Text channels the bot can read
         for channel in guild.text_channels:
             cid = str(channel.id)
@@ -1899,9 +1959,12 @@ async def _refresh_discord_to_sheets(discord_client: discord.Client) -> None:
                 "channel_name": channel.name,
             })
 
+    # Separate counts for logging clarity
+    n_users = sum(1 for u in all_users if not u["discord_id"].startswith("&"))
+    n_roles = sum(1 for u in all_users if u["discord_id"].startswith("&"))
     logger.info(
-        f"Discord scan complete: {len(all_users)} unique users, "
-        f"{len(all_channels)} readable channels"
+        f"Discord scan complete: {n_users} unique users, "
+        f"{n_roles} roles, {len(all_channels)} readable channels"
     )
 
     # ── Write phase: one batched read-modify-write per table ─────────────────
@@ -1913,7 +1976,7 @@ async def _refresh_discord_to_sheets(discord_client: discord.Client) -> None:
 
     logger.info(
         f"Discord → Sheets refresh complete: "
-        f"{len(all_users)} users, {len(all_channels)} channels written"
+        f"{n_users} users, {n_roles} roles, {len(all_channels)} channels written"
     )
     # The batch_upsert functions keep the TableManager .records current, so
     # we can rebuild the routing cache from in-memory data without any further

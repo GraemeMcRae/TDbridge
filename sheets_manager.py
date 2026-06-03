@@ -145,6 +145,35 @@ def get_tg_group(tg_group_id: str) -> Optional[dict]:
         return group_by_id.get(_normalise_id(tg_group_id))
 
 
+def get_user_by_tg_group_inactive(tg_group_id: str) -> Optional[dict]:
+    """Return the first Inactive D_User row whose T_GroupID matches.
+
+    Used as a secondary TG→DC routing fallback: if the group is known but
+    its user/role is Inactive, we can still route to the right channel and
+    tag the right user (Discord renders unknown/left users as @DeletedUser).
+    Returns None if no matching row exists at all.
+    """
+    key = _normalise_id(tg_group_id)
+    with _lock:
+        for row in user_by_discord_id.values():
+            tgid = _normalise_id(row.get("T_GroupID", ""))
+            if tgid == key and not _is_active(row.get("D_UserStatus", "")):
+                return row
+    return None
+
+
+def get_all_user_rows_in_table_order() -> list[dict]:
+    """Return all D_User rows in the order they appear in the table.
+
+    Used for Case 3 DC→TG routing: scan the sender's Discord roles against
+    D_User rows in table order so the table's row arrangement controls priority.
+    user_by_discord_id preserves insertion order (Python 3.7+) which matches
+    the order rows were loaded from the sheet.
+    """
+    with _lock:
+        return list(user_by_discord_id.values())
+
+
 def get_active_channels() -> list[dict]:
     """Return all D_Channel rows with D_ChannelStatus == 'Active'."""
     with _lock:
