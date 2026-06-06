@@ -166,12 +166,25 @@ class Config:
         # 4. Platform detection                                                #
         # ------------------------------------------------------------------ #
         # "Linux" on the Ubuntu VPS (production and test-on-server).
-        # "Windows" on the developer workstation.
+        # "Windows" on the developer workstation (native or WSL2).
         # Used to select webhook vs. polling mode for Telegram, and to choose
         # the correct OS-level shutdown signal handling strategy.
-        # Stored as the raw platform.system() string ("Linux" or "Windows")
-        # so it matches the HCF project convention.
-        self.platform: str = _platform_module.system()  # "Linux" or "Windows"
+        #
+        # WSL2 reports "Linux" from platform.system() but is a developer
+        # environment running behind NAT on a laptop — webhook mode would fail.
+        # We detect WSL2 by checking /proc/version for the "microsoft" or "WSL"
+        # strings that the WSL2 kernel places there, and override the platform
+        # to "Windows" so that polling mode is used instead.
+        _raw_platform = _platform_module.system()
+        if _raw_platform == "Linux":
+            try:
+                with open("/proc/version", "r") as _pv:
+                    _proc_version = _pv.read().lower()
+                if "microsoft" in _proc_version or "wsl" in _proc_version:
+                    _raw_platform = "Windows"  # treat WSL as Windows for polling
+            except OSError:
+                pass  # /proc/version not readable — leave platform as Linux
+        self.platform: str = _raw_platform  # "Linux" or "Windows"
 
         # ------------------------------------------------------------------ #
         # 5. Shared (un-prefixed) parameters                                  #

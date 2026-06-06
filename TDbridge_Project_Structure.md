@@ -350,13 +350,21 @@ Key parameter groups:
 
 ## Platform Differences
 
-| Aspect | Linux (server) | Windows (dev) |
+| Aspect | Linux (server) | Windows or WSL2 (dev) |
 |---|---|---|
 | Telegram transport | Webhook (stunnel → bot on localhost) | Polling (getUpdates every 10s) |
 | Shutdown signal | SIGTERM / SIGINT via asyncio signal handlers | KeyboardInterrupt |
 | Port binding | Bot binds to 127.0.0.1:8088 / 8444 | Not applicable |
 
-Platform is detected automatically via `platform.system()` — no env var needed.
+Platform is detected automatically — no env var needed.
+
+**WSL2 detection:** WSL2 reports `"Linux"` from `platform.system()` but is a
+developer environment running behind NAT on a laptop.  Webhook mode would fail
+because there is no stable public IP.  TDbridge detects WSL2 by reading
+`/proc/version` and checking for the strings `"microsoft"` or `"wsl"` that the
+WSL2 kernel places there.  If detected, `config.platform` is overridden to
+`"Windows"` so polling mode is used.  The startup log reports `"WSL2 development
+mode"` to make this visible.
 
 ---
 

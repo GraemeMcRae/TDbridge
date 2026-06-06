@@ -2275,8 +2275,13 @@ async def _start_telegram_app() -> None:
             allowed_updates=_ALLOWED_UPDATES,
             drop_pending_updates=False,
         )
+        _wsl = (
+            __import__("platform").system() == "Linux"
+            and config.platform == "Windows"
+        )
         logger.info(
-            f"Telegram polling started (Windows development mode) "
+            f"Telegram polling started "
+            f"({'WSL2' if _wsl else 'Windows'} development mode) "
             f"— allowed_updates={_ALLOWED_UPDATES}"
         )
     else:
