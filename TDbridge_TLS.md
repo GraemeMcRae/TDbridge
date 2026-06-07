@@ -212,12 +212,18 @@ Each run:
 
 1. **Checks port 80** — logs an error and exits if anything is listening there
 2. **Reads the certificate expiry date** using `openssl x509 -noout -enddate`
-3. **If more than 30 days until expiry:** performs a certbot dry run using the
+3. **If 30 or more days until expiry:** performs a certbot dry run using the
    `--standalone` challenge (certbot temporarily listens on port 80 itself).
    The dry run contacts Let's Encrypt's **staging servers** — not production —
    so it can be run daily without hitting rate limits.
-4. **If 30 days or fewer until expiry:** performs the real renewal, fixes
+4. **If fewer than 30 days until expiry:** performs the real renewal, fixes
    certificate file permissions (`chmod 640`), and restarts stunnel4.
+
+   The threshold uses `days_remaining >= 30` because `days_remaining` is
+   computed by integer division which rounds down. A certificate expiring
+   in 30.9 days gives `days_remaining = 30` — still a full day of margin —
+   so a dry run is appropriate. The next day it will be 29.9 days, giving
+   `days_remaining = 29`, which triggers the real renewal.
 
 ### Log file
 

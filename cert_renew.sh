@@ -88,9 +88,9 @@ log_info "Certificate expires: ${expiry_date} (${days_remaining} days from now)"
 # ---------------------------------------------------------------------------
 # Step 3: Dry run or real renewal depending on days remaining
 # ---------------------------------------------------------------------------
-if (( days_remaining > 30 )); then
+if (( days_remaining >= 30 )); then
     # --- Dry run only ---
-    log_info "More than 30 days until expiry — performing dry run"
+    log_info "${days_remaining} days until expiry — performing dry run (renewal not yet needed)"
 
     dry_run_output=$(certbot certonly \
         --standalone \
@@ -112,7 +112,7 @@ if (( days_remaining > 30 )); then
 
 else
     # --- Real renewal ---
-    log_info "30 days or fewer until expiry — performing real renewal"
+    log_info "${days_remaining} days until expiry (<30) — performing real renewal"
 
     renew_output=$(certbot certonly \
         --standalone \
