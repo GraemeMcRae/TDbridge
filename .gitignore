@@ -1,6 +1,7 @@
 # OS
 .DS_Store
 Thumbs.db
+*:Zone.Identifier
 
 # Editor and IDE settings (VSCode, PyCharm, etc.)
 .vscode/
