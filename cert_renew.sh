@@ -32,7 +32,7 @@ log() {
     shift
     local message="$*"
     local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    timestamp=$(TZ="America/Los_Angeles" date '+%Y-%m-%d %H:%M:%S %Z')
 
     # Rotate if log has reached the size limit
     if [[ -f "$LOG_FILE" ]]; then
