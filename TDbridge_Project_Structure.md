@@ -106,12 +106,15 @@ TDbridge/
 ├── dashboard_reporter.py           # 30-minute health Status Report logger
 ├── google_sheets_connection.py     # gspread connection (shared with HCF pattern)
 ├── table_manager.py                # Generic Sheets table engine (shared with HCF)
+├── cert_renew.sh                   # Daily certificate health check and renewal script
 ├── requirements.txt
 ├── .env                            # NOT committed; copy manually to each env
 ├── envexample.txt                  # Template with all parameter names and comments
 ├── google_credentials_TDbridge.json  # NOT committed
+├── TDbridge_icon.png               # Bot icon (512×512) for Discord and Telegram
 ├── .gitignore
 ├── TDbridge_Guide.md               # User-facing setup and usage guide
+├── TDbridge_TLS.md                 # TLS, stunnel, and certificate management
 └── TDbridge_Project_Structure.md   # This file
 ```
 
