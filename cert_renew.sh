@@ -89,6 +89,29 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Step 1b: Verify httpd.service is still stopped and disabled
+#
+# Webuzo's watchdog may attempt to re-enable and start httpd.service via
+# systemd.  If it has, stop and disable it again now while we have the chance.
+# ---------------------------------------------------------------------------
+httpd_active=$(systemctl is-active httpd.service 2>/dev/null)
+httpd_enabled=$(systemctl is-enabled httpd.service 2>/dev/null)
+
+if [[ "$httpd_active" == "active" ]]; then
+    log_warning "httpd.service is active — Webuzo watchdog may have restarted it. Stopping it now."
+    systemctl stop httpd.service 2>/dev/null && log_info "httpd.service stopped" || log_warning "Could not stop httpd.service"
+else
+    log_info "httpd.service is ${httpd_active} (expected: inactive) — OK"
+fi
+
+if [[ "$httpd_enabled" == "enabled" ]]; then
+    log_warning "httpd.service is enabled — Webuzo watchdog may have re-enabled it. Disabling it now."
+    systemctl disable httpd.service 2>/dev/null && log_info "httpd.service disabled" || log_warning "Could not disable httpd.service"
+else
+    log_info "httpd.service is ${httpd_enabled} (expected: disabled) — OK"
+fi
+
+# ---------------------------------------------------------------------------
 # Step 2: Determine days until certificate expiry
 # ---------------------------------------------------------------------------
 if [[ ! -f "$CERT_FILE" ]]; then
