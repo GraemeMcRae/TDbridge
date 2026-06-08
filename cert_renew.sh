@@ -52,18 +52,41 @@ log_warning() { log "WARNING" "$@"; }
 log_error()   { log "ERROR"   "$@"; }
 
 # ---------------------------------------------------------------------------
-# Step 1: Check port 80 availability
+# Step 1: Ensure port 80 is free
+#
+# Webuzo runs a watchdog that restarts httpd independently of systemd.
+# Rather than fighting the watchdog, we kill any httpd process holding
+# port 80 right before certbot needs it.  certbot only needs port 80 for
+# a few seconds; the watchdog will bring httpd back afterward on its own.
 # ---------------------------------------------------------------------------
 log_info "=== Certificate check starting for ${DOMAIN} ==="
 
 if ss -tlnp 2>/dev/null | grep -q ':80\b'; then
-    # Something is listening on port 80 — find out what
+    # Find the process name for logging
     port80_process=$(ss -tlnp | grep ':80\b' | grep -oP 'users:\(\("\K[^"]+' | head -1)
-    log_error "Port 80 is in use (process: ${port80_process:-unknown}). certbot cannot run. Check whether Webuzo httpd restarted unexpectedly."
-    exit 1
-fi
+    log_info "Port 80 is in use (process: ${port80_process:-unknown}) — killing it to free port for certbot"
 
-log_info "Port 80 is free — certbot HTTP challenge will work"
+    # Kill all processes listening on port 80
+    port80_pids=$(ss -tlnp | grep ':80\b' | grep -oP 'pid=\K[0-9]+' | sort -u)
+    if [[ -n "$port80_pids" ]]; then
+        for pid in $port80_pids; do
+            sudo kill "$pid" 2>/dev/null && log_info "Killed pid ${pid}" || log_warning "Could not kill pid ${pid}"
+        done
+        # Give the OS a moment to release the port
+        sleep 2
+    fi
+
+    # Verify port 80 is now free
+    if ss -tlnp 2>/dev/null | grep -q ':80\b'; then
+        port80_process=$(ss -tlnp | grep ':80\b' | grep -oP 'users:\(\("\K[^"]+' | head -1)
+        log_error "Port 80 is still in use (process: ${port80_process:-unknown}) after kill attempt. certbot cannot run."
+        exit 1
+    fi
+
+    log_info "Port 80 freed successfully — certbot HTTP challenge will work"
+else
+    log_info "Port 80 is free — certbot HTTP challenge will work"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 2: Determine days until certificate expiry
