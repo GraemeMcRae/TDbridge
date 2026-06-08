@@ -70,7 +70,12 @@ if ss -tlnp 2>/dev/null | grep -q ':80\b'; then
     port80_pids=$(ss -tlnp | grep ':80\b' | grep -oP 'pid=\K[0-9]+' | sort -u)
     if [[ -n "$port80_pids" ]]; then
         for pid in $port80_pids; do
-            sudo kill "$pid" 2>/dev/null && log_info "Killed pid ${pid}" || log_warning "Could not kill pid ${pid}"
+            if ! kill -0 "$pid" 2>/dev/null; then
+                # Process already gone (e.g. child exited when parent was killed)
+                log_info "pid ${pid} already gone (child of a previously killed parent)"
+            else
+                sudo kill "$pid" 2>/dev/null                     && log_info "Killed pid ${pid}"                     || log_warning "Could not kill pid ${pid} (permission denied or other error)"
+            fi
         done
         # Give the OS a moment to release the port
         sleep 2
