@@ -143,10 +143,20 @@ if (( days_remaining >= 30 )); then
     # --- Dry run only ---
     log_info "${days_remaining} days until expiry — performing dry run (renewal not yet needed)"
 
+    # Delete the staging account cache before each dry run.
+    # certbot 2.9.0 has a bug: when a valid staging authorization exists from
+    # a previous run, certbot deactivates it to force a fresh challenge, but
+    # the staging server returns the same deactivated authorization, causing
+    # "authorization must be pending".  Deleting the cache ensures certbot
+    # registers a fresh staging account with no existing authorizations.
+    # This only affects the staging server — the production account cache
+    # (used by the real renewal path) is completely separate and untouched.
+    rm -rf /etc/letsencrypt/accounts/acme-staging-v02.api.letsencrypt.org 2>/dev/null
+    log_info "Cleared staging account cache for clean dry run"
+
     dry_run_output=$(certbot certonly \
         --standalone \
         --dry-run \
-        --force-renewal \
         --non-interactive \
         --agree-tos \
         -d "$DOMAIN" 2>&1)
@@ -168,7 +178,6 @@ else
 
     renew_output=$(certbot certonly \
         --standalone \
-        --force-renewal \
         --non-interactive \
         --agree-tos \
         -d "$DOMAIN" 2>&1)
