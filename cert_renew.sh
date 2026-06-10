@@ -146,6 +146,7 @@ if (( days_remaining >= 30 )); then
     dry_run_output=$(certbot certonly \
         --standalone \
         --dry-run \
+        --force-renewal \
         --non-interactive \
         --agree-tos \
         -d "$DOMAIN" 2>&1)
@@ -167,6 +168,7 @@ else
 
     renew_output=$(certbot certonly \
         --standalone \
+        --force-renewal \
         --non-interactive \
         --agree-tos \
         -d "$DOMAIN" 2>&1)
