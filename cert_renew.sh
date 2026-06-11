@@ -62,53 +62,15 @@ log_warning() { log "WARNING" "$@"; }
 log_error()   { log "ERROR"   "$@"; }
 
 # ---------------------------------------------------------------------------
-# Step 1: Ensure port 80 is free
+# Step 1: Stop and disable Webuzo's httpd.service
 #
-# Webuzo runs a watchdog that restarts httpd independently of systemd.
-# Rather than fighting the watchdog, we kill any httpd process holding
-# port 80 right before certbot needs it.  certbot only needs port 80 for
-# a few seconds; the watchdog will bring httpd back afterward on its own.
+# Webuzo runs a watchdog that may re-enable and restart httpd.service via
+# systemd.  We stop and disable it FIRST (before freeing port 80), because
+# the act of disabling can otherwise race with the watchdog and let httpd
+# grab port 80 again after we've freed it.
 # ---------------------------------------------------------------------------
 log_info "=== Certificate check starting for ${DOMAIN} ==="
 
-if ss -tlnp 2>/dev/null | grep -q ':80\b'; then
-    # Find the process name for logging
-    port80_process=$(ss -tlnp | grep ':80\b' | grep -oP 'users:\(\("\K[^"]+' | head -1)
-    log_info "Port 80 is in use (process: ${port80_process:-unknown}) — killing it to free port for certbot"
-
-    # Kill all processes listening on port 80
-    port80_pids=$(ss -tlnp | grep ':80\b' | grep -oP 'pid=\K[0-9]+' | sort -u)
-    if [[ -n "$port80_pids" ]]; then
-        for pid in $port80_pids; do
-            if ! kill -0 "$pid" 2>/dev/null; then
-                # Process already gone (e.g. child exited when parent was killed)
-                log_info "pid ${pid} already gone (child of a previously killed parent)"
-            else
-                sudo kill "$pid" 2>/dev/null                     && log_info "Killed pid ${pid}"                     || log_warning "Could not kill pid ${pid} (permission denied or other error)"
-            fi
-        done
-        # Give the OS a moment to release the port
-        sleep 2
-    fi
-
-    # Verify port 80 is now free
-    if ss -tlnp 2>/dev/null | grep -q ':80\b'; then
-        port80_process=$(ss -tlnp | grep ':80\b' | grep -oP 'users:\(\("\K[^"]+' | head -1)
-        log_error "Port 80 is still in use (process: ${port80_process:-unknown}) after kill attempt. certbot cannot run."
-        exit 1
-    fi
-
-    log_info "Port 80 freed successfully — certbot HTTP challenge will work"
-else
-    log_info "Port 80 is free — certbot HTTP challenge will work"
-fi
-
-# ---------------------------------------------------------------------------
-# Step 1b: Verify httpd.service is still stopped and disabled
-#
-# Webuzo's watchdog may attempt to re-enable and start httpd.service via
-# systemd.  If it has, stop and disable it again now while we have the chance.
-# ---------------------------------------------------------------------------
 httpd_active=$(systemctl is-active httpd.service 2>/dev/null)
 httpd_enabled=$(systemctl is-enabled httpd.service 2>/dev/null)
 
@@ -124,6 +86,58 @@ if [[ "$httpd_enabled" == "enabled" ]]; then
     systemctl disable httpd.service 2>/dev/null && log_info "httpd.service disabled" || log_warning "Could not disable httpd.service"
 else
     log_info "httpd.service is ${httpd_enabled} (expected: disabled) — OK"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 1b: Free port 80
+#
+# After httpd.service is stopped and disabled, kill any process still holding
+# port 80 (Webuzo's watchdog may have launched httpd directly, bypassing
+# systemd).  We retry a few times because the watchdog can relaunch httpd
+# between our kill and certbot's bind.  certbot only needs port 80 for a few
+# seconds, so once we get a clean window we proceed immediately.
+# ---------------------------------------------------------------------------
+free_port_80() {
+    # Returns 0 if port 80 is free, 1 if still occupied after kill attempt.
+    if ! ss -tlnp 2>/dev/null | grep -q ':80\b'; then
+        return 0   # already free
+    fi
+    local proc
+    proc=$(ss -tlnp | grep ':80\b' | grep -oP 'users:\(\("\K[^"]+' | head -1)
+    log_info "Port 80 is in use (process: ${proc:-unknown}) — killing it"
+    local pids
+    pids=$(ss -tlnp | grep ':80\b' | grep -oP 'pid=\K[0-9]+' | sort -u)
+    for pid in $pids; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_info "pid ${pid} already gone (child of a previously killed parent)"
+        else
+            sudo kill "$pid" 2>/dev/null \
+                && log_info "Killed pid ${pid}" \
+                || log_warning "Could not kill pid ${pid} (permission denied or other error)"
+        fi
+    done
+    sleep 2
+    if ss -tlnp 2>/dev/null | grep -q ':80\b'; then
+        return 1   # still occupied
+    fi
+    return 0
+}
+
+port80_freed=0
+for attempt in 1 2 3; do
+    if free_port_80; then
+        port80_freed=1
+        log_info "Port 80 freed successfully (attempt ${attempt}) — certbot HTTP challenge will work"
+        break
+    else
+        log_warning "Port 80 still in use after attempt ${attempt} — Webuzo watchdog may have relaunched httpd. Retrying."
+    fi
+done
+
+if (( port80_freed == 0 )); then
+    port80_process=$(ss -tlnp | grep ':80\b' | grep -oP 'users:\(\("\K[^"]+' | head -1)
+    log_error "Port 80 is still in use (process: ${port80_process:-unknown}) after 3 attempts. certbot cannot run."
+    exit 1
 fi
 
 # ---------------------------------------------------------------------------
