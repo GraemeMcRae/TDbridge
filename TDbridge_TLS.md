@@ -207,48 +207,85 @@ script will detect this and log an error.
 
 ### How it works
 
-The renewal script `~/TDbridge/cert_renew.sh` runs daily at 3 AM via cron.
+The renewal script `~/TDbridge/cert_renew.sh` runs daily via cron.
 Each run:
 
-1. **Checks port 80** — logs an error and exits if anything is listening there
+1. **Frees port 80** — kills any process (typically Webuzo's httpd watchdog)
+   holding port 80, then verifies it is free.  Also checks that
+   `httpd.service` is still stopped and disabled, re-stopping/disabling it
+   if Webuzo's watchdog has re-enabled it.
 2. **Reads the certificate expiry date** using `openssl x509 -noout -enddate`
-3. **If 30 or more days until expiry:** performs a certbot dry run using the
-   `--standalone` challenge (certbot temporarily listens on port 80 itself).
-   The dry run contacts Let's Encrypt's **staging servers** — not production —
-   so it can be run daily without hitting rate limits.
-4. **If fewer than 30 days until expiry:** performs the real renewal, fixes
-   certificate file permissions (`chmod 640`), and restarts stunnel4.
+3. **If 30 or more days until expiry** (`days_remaining >= 30`): deletes the
+   staging account cache and performs a certbot dry run using the
+   `--standalone` challenge.  The dry run contacts Let's Encrypt's
+   **staging servers** — not production — so it can run daily without
+   hitting rate limits.
+4. **If fewer than 30 days until expiry** (`days_remaining < 30`): performs
+   the real renewal against the production ACME server, fixes certificate
+   file permissions (`chmod 640`), and restarts stunnel4.
 
-   The threshold uses `days_remaining >= 30` because `days_remaining` is
-   computed by integer division which rounds down. A certificate expiring
-   in 30.9 days gives `days_remaining = 30` — still a full day of margin —
-   so a dry run is appropriate. The next day it will be 29.9 days, giving
-   `days_remaining = 29`, which triggers the real renewal.
+The threshold uses `days_remaining >= 30` (not `> 30`) because `days_remaining`
+is computed by integer division which rounds down.  A certificate expiring in
+30.9 days gives `days_remaining = 30` — still a full day of margin — so a dry
+run is appropriate.  The next day it gives `days_remaining = 29`, which
+triggers the real renewal.
 
-### Log file
+### The staging account cache
 
-All output is written to `~/TDbridge/TDbridge_utility.log` with one backup
-file (`TDbridge_utility.log.1`).  Log rotation occurs when the log reaches 5 MB.
+certbot 2.9.0 has a bug specific to the staging environment: when a valid
+staging authorization exists from a previous dry run, certbot deactivates it
+to force a fresh challenge, but the staging server returns the same deactivated
+authorization on the new order.  certbot then tries to answer a challenge on a
+deactivated authorization, which Let's Encrypt rejects with:
 
-Log line format:
 ```
-2026-06-05 03:00:01 PDT - INFO    - cert_renew: Port 80 is free — certbot HTTP challenge will work
-2026-06-05 03:00:02 PDT - INFO    - cert_renew: Certificate expires: Jul 15 12:34:56 2026 GMT (40 days from now)
-2026-06-05 03:00:02 PDT - INFO    - cert_renew: More than 30 days until expiry — performing dry run
-2026-06-05 03:00:05 PDT - SUCCESS - cert_renew: Dry run succeeded — certificate renewal process is healthy. 40 days until expiry.
-2026-06-05 03:00:05 PDT - INFO    - cert_renew: === Certificate check complete ===
-```
-
-When renewal actually fires:
-```
-2026-07-14 03:00:01 PDT - INFO    - cert_renew: 1 days or fewer until expiry — performing real renewal
-2026-07-14 03:00:18 PDT - SUCCESS - cert_renew: Certificate renewed successfully. New expiry: Oct 12 12:34:56 2026 GMT (90 days from now). stunnel4 restarted.
+Unable to update challenge :: authorization must be pending
 ```
 
-On failure:
+The fix is to delete the staging account cache before each dry run:
+
+```bash
+rm -rf /etc/letsencrypt/accounts/acme-staging-v02.api.letsencrypt.org
 ```
-2026-07-14 03:00:01 PDT - ERROR   - cert_renew: Port 80 is in use (process: httpd). certbot cannot run.
+
+This forces certbot to register a fresh staging account with no existing
+authorizations.  The production account cache (at
+`/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org`) is a completely
+separate directory and is never touched by this deletion.  The real renewal
+path is unaffected.
+
+### The Ubuntu certbot.timer — why we ignore it
+
+Ubuntu's certbot package installs a systemd timer (`certbot.timer`) that runs
+`certbot renew` twice daily.  You can see it in the letsencrypt log as entries
+like:
+
 ```
+certbot._internal.display.obj: The following certificates are not due for
+renewal yet:
+  /etc/letsencrypt/live/hcf.squadrontrucking.com/fullchain.pem expires on
+  2026-08-28 (skipped)
+```
+
+This timer is intentionally left **unable to renew** for this domain.  The
+renewal configuration file
+`/etc/letsencrypt/renewal/hcf.squadrontrucking.com.conf` specifies:
+
+```ini
+authenticator = manual
+pref_challs = dns-01,
+```
+
+The manual DNS-01 authenticator requires a human to add a TXT record to the
+domain's DNS — it cannot run unattended.  When the certificate eventually
+becomes due, the timer will fail or skip rather than actually renewing.
+
+**Do not change this to use the standalone authenticator.**  If you did, the
+systemd timer would gain the ability to renew on its own schedule without:
+killing Webuzo's httpd first, logging to `TDbridge_utility.log`, reporting
+to the Manager Dashboard, or performing any of the other checks in
+`cert_renew.sh`.  The cron job owns all renewal responsibility.
+
 
 ### Installing the cron job
 

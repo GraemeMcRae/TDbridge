@@ -13,6 +13,16 @@
 #
 # Cron entry (runs daily at 3 AM):
 #   0 3 * * * /home/graeme/TDbridge/cert_renew.sh
+#
+# NOTE: Ubuntu's certbot package installs a systemd timer (certbot.timer) that
+# runs "certbot renew" twice daily.  This is intentionally left alone.
+# The renewal conf file (/etc/letsencrypt/renewal/hcf.squadrontrucking.com.conf)
+# specifies "authenticator = manual" and "pref_challs = dns-01", which requires
+# a human to add a DNS TXT record.  The systemd timer therefore cannot actually
+# renew the certificate and does nothing useful for this domain.  This script
+# owns all renewal responsibility.  Do NOT change the conf file to use the
+# standalone authenticator, as that would allow the systemd timer to attempt
+# renewal without the port 80 checks and logging this script provides.
 
 # ---------------------------------------------------------------------------
 # Configuration
