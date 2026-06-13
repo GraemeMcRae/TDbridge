@@ -62,6 +62,26 @@ log_warning() { log "WARNING" "$@"; }
 log_error()   { log "ERROR"   "$@"; }
 
 # ---------------------------------------------------------------------------
+# Step 0: Sleep to avoid colliding with Webuzo's per-minute watchdog cron
+#
+# Webuzo's crons.php (cron entry "* * * * *") runs every minute and acts as a
+# watchdog: it relaunches httpd and reclaims port 80, killing certbot with
+# SIGKILL (exit 137) if certbot is holding the port at that moment.
+#
+# We don't touch Webuzo's cron files (fighting the watchdog on its own turf
+# risks unpredictable escalation).  Instead we sleep 20 seconds so that this
+# minute's crons.php has finished and gotten out of the way.  certbot then
+# runs in the ~40-second gap before the next minute's crons.php fires.
+#
+# The cron job is also scheduled at 9:02 UTC to avoid the */5 (:00,:05,...)
+# and hourly (:01) Webuzo cron jobs, leaving only the every-minute crons.php
+# to dodge — which this sleep handles.
+# ---------------------------------------------------------------------------
+log_info "=== Certificate check starting for ${DOMAIN} ==="
+log_info "Sleeping 20 seconds to avoid colliding with Webuzo's per-minute watchdog cron"
+sleep 20
+
+# ---------------------------------------------------------------------------
 # Step 1: Stop and disable Webuzo's httpd.service
 #
 # Webuzo runs a watchdog that may re-enable and restart httpd.service via
@@ -69,8 +89,6 @@ log_error()   { log "ERROR"   "$@"; }
 # the act of disabling can otherwise race with the watchdog and let httpd
 # grab port 80 again after we've freed it.
 # ---------------------------------------------------------------------------
-log_info "=== Certificate check starting for ${DOMAIN} ==="
-
 httpd_active=$(systemctl is-active httpd.service 2>/dev/null)
 httpd_enabled=$(systemctl is-enabled httpd.service 2>/dev/null)
 
