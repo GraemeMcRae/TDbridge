@@ -64,7 +64,7 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
-junk*
+[Jj]unk*
 Versioning*
 _file_dates_snapshot.json
 
