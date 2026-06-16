@@ -29,6 +29,8 @@ TEST_TELEGRAM_WEBHOOK_PORT=8088
 # Optional: a random secret string Telegram sends in X-Telegram-Bot-Api-Secret-Token header.
 # Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
 TEST_TELEGRAM_WEBHOOK_SECRET="<random-secret>"
+# Force polling mode instead of webhook mode (true/false; default is false on VPS Linux, default is true on Windows Gitbash or Windows WSL2).
+TEST_TELEGRAM_USE_POLLING=true
 # SQLite message store file (stores TG<->DC message ID mappings for reply routing)
 TEST_SQLITE_DB_FILE=TDbridge_test.db
 # Log file
@@ -76,6 +78,8 @@ PROD_TELEGRAM_WEBHOOK_PORT=8444
 # Optional: a random secret string Telegram will send in X-Telegram-Bot-Api-Secret-Token header
 # Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
 PROD_TELEGRAM_WEBHOOK_SECRET="<random-secret>"
+# Force polling mode instead of webhook mode (true/false; default is false on VPS Linux, default is true on Windows Gitbash or Windows WSL2).
+PROD_TELEGRAM_USE_POLLING=true
 # SQLite message store file (stores TG<->DC message ID mappings for reply routing)
 PROD_SQLITE_DB_FILE=TDbridge_prod.db
 # Log file

@@ -209,12 +209,33 @@ class Config:
         self.telegram_bot_username: str = get("TELEGRAM_BOT_USERNAME")
         self.telegram_bot_url: str      = get("TELEGRAM_BOT_URL", required=False)
 
+        # Force Telegram polling mode, overriding the platform default.
+        # Platform default: polling on Windows/WSL, webhook on Linux.
+        # If TELEGRAM_USE_POLLING is set, it wins over the platform default:
+        #   true  → force polling (e.g. Linux host with bad inbound network)
+        #   false → force webhook (e.g. Windows host with a real public URL)
+        # If unset/blank, the platform default applies.
+        # Polling only needs the OUTBOUND connection to Telegram.
+        _raw_use_polling = os.getenv(
+            self.env_prefix + "TELEGRAM_USE_POLLING", ""
+        ).strip().lower()
+        if _raw_use_polling in ("true", "1", "yes"):
+            self.telegram_use_polling: bool = True
+        elif _raw_use_polling in ("false", "0", "no"):
+            self.telegram_use_polling = False
+        else:
+            # Unset/blank → platform default (polling on Windows/WSL)
+            self.telegram_use_polling = (self.platform == "Windows")
+
         # Telegram webhook
         # TELEGRAM_WEBHOOK_URL must be a publicly reachable HTTPS URL whose
         # path Telegram will POST updates to.
         # Example: https://myserver.example.com:8443/tgwebhook
         # On Windows dev with ngrok: https://<ngrok-id>.ngrok.io/tgwebhook
-        self.telegram_webhook_url: str  = get("TELEGRAM_WEBHOOK_URL")
+        # Not required when polling mode is active (no inbound URL needed).
+        self.telegram_webhook_url: str  = get(
+            "TELEGRAM_WEBHOOK_URL", required=not self.telegram_use_polling
+        )
         self.telegram_webhook_port: int = int(
             os.getenv(self.env_prefix + "TELEGRAM_WEBHOOK_PORT", "8443")
         )

@@ -64,7 +64,11 @@ from dashboard_reporter import DashboardReporter, status as bot_status
 # the bot periodically asks Telegram for new updates.  Polling is functionally
 # identical for testing purposes; the only difference is the transport layer.
 # See TDbridge_Project_Structure.md § "Platform differences" for full details.
-_USE_POLLING = config.platform == "Windows"
+#
+# config.telegram_use_polling already encodes the full decision: the platform
+# default (polling on Windows/WSL, webhook on Linux) plus any explicit
+# TELEGRAM_USE_POLLING override from .env.
+_USE_POLLING = config.telegram_use_polling
 
 # Explicit list of update types TDbridge needs.
 # We do NOT use Update.ALL_TYPES here because:
@@ -2275,13 +2279,17 @@ async def _start_telegram_app() -> None:
             allowed_updates=_ALLOWED_UPDATES,
             drop_pending_updates=False,
         )
-        _wsl = (
-            __import__("platform").system() == "Linux"
-            and config.platform == "Windows"
-        )
+        _real_platform = __import__("platform").system()
+        _is_wsl = (_real_platform == "Linux" and config.platform == "Windows")
+        if config.platform == "Linux":
+            _mode_desc = "Linux, forced by TELEGRAM_USE_POLLING"
+        elif _is_wsl:
+            _mode_desc = "WSL2"
+        else:
+            _mode_desc = "Windows"
         logger.info(
             f"Telegram polling started "
-            f"({'WSL2' if _wsl else 'Windows'} development mode) "
+            f"({_mode_desc}) "
             f"— allowed_updates={_ALLOWED_UPDATES}"
         )
     else:
