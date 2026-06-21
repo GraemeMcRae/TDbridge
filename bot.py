@@ -28,6 +28,7 @@ Mapping lookups use the in-memory cache maintained by sheets_manager.py.
 import asyncio
 import io
 import logging
+import mimetypes
 import os
 import sys
 from typing import Optional
@@ -89,6 +90,117 @@ _ALLOWED_UPDATES = [
 logger = logging.getLogger(config.bot_name)
 
 # ---------------------------------------------------------------------------
+# Telegram poll counting
+# ---------------------------------------------------------------------------
+# httpx's per-request INFO logging is silenced in config (raised to WARNING) so
+# routine "getUpdates ... 200 OK" lines don't flood the log. Instead we count
+# poll results directly in our own HTTPXRequest subclass, which sees the real
+# HTTP status code. On a non-200 getUpdates result we log a summary of the
+# successes since the last anomaly, then log the anomaly itself. The interval
+# counters feed the Manager Dashboard polling-health check via
+# config.take_poll_counts().
+from telegram.request import HTTPXRequest
+
+
+class _PollCounters:
+    """Holds getUpdates poll counts. interval_* are read+reset by the dashboard
+    each cycle; run_ok / since track the current run for the summary line."""
+    def __init__(self) -> None:
+        self.interval_ok: int = 0
+        self.interval_err: int = 0
+        self.run_ok: int = 0
+        self.since: str = localnow().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    def take_interval_counts(self) -> tuple:
+        ok, err = self.interval_ok, self.interval_err
+        self.interval_ok = 0
+        self.interval_err = 0
+        return ok, err
+
+
+class PollCountingRequest(HTTPXRequest):
+    """HTTPXRequest that counts getUpdates poll results.
+
+    Routine successful polls are counted silently. On a non-200 getUpdates
+    result (or a request that raises), it logs a one-line summary of the
+    successful polls since the last anomaly, then logs the anomaly. This
+    replaces the old log-filter approach: we have the real status code here, so
+    there's no log-text parsing or logger-propagation subtlety.
+    """
+    def __init__(self, *args, counters: "_PollCounters", **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._counters = counters
+
+    def _note_success(self) -> None:
+        c = self._counters
+        c.interval_ok += 1
+        c.run_ok += 1
+
+    def _note_error(self, detail: str) -> None:
+        c = self._counters
+        c.interval_err += 1
+        if c.run_ok > 0:
+            logger.info(
+                "getUpdates: %d successful poll(s) since %s "
+                "(summarised; individual 200s not logged)",
+                c.run_ok, c.since,
+            )
+        logger.warning("getUpdates non-success: %s", detail)
+        c.run_ok = 0
+        c.since = localnow().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    @staticmethod
+    def _endpoint(url: str) -> str:
+        """Extract the Telegram API method name (e.g. 'editMessageText') from a
+        request URL, for concise log messages. Falls back to the full URL."""
+        # URLs look like https://api.telegram.org/bot<token>/<method>
+        tail = url.rsplit("/", 1)[-1]
+        return tail or url
+
+    async def do_request(self, url, method, *args, **kwargs):
+        is_getupdates = "getUpdates" in url
+        try:
+            result = await super().do_request(url, method, *args, **kwargs)
+        except Exception as e:
+            if is_getupdates:
+                self._note_error(f"{type(e).__name__}: {e}")
+            # Non-getUpdates exceptions propagate to the call site, which is
+            # responsible for contextual logging; we don't double-log here.
+            raise
+        # result is (status_code, payload)
+        try:
+            status_code = result[0]
+        except Exception:
+            status_code = None
+        if is_getupdates:
+            if status_code == 200:
+                self._note_success()
+            else:
+                self._note_error(f"HTTP {status_code}")
+        elif status_code != 200:
+            # Catch-all backstop: httpx's own per-request logging is silenced,
+            # so without this a failed API call (e.g. editMessageText 400) would
+            # be invisible at the transport layer. Log any non-200 at WARNING so
+            # no API failure is ever silent, even if a call site lacks its own
+            # error handling. (200s stay silent — that's the whole point.)
+            logger.warning(
+                "Telegram API non-200: %s → HTTP %s",
+                self._endpoint(url), status_code,
+            )
+        return result
+
+
+def log_poll_summary(counters: "_PollCounters", reason: str = "shutdown") -> None:
+    """Emit a final summary of successful getUpdates polls (e.g. at shutdown)."""
+    if counters.run_ok > 0:
+        logger.info(
+            "getUpdates: %d successful poll(s) since %s (polling stopped: %s)",
+            counters.run_ok, counters.since, reason,
+        )
+        counters.run_ok = 0
+
+
+# ---------------------------------------------------------------------------
 # Discord intents
 # ---------------------------------------------------------------------------
 _intents = discord.Intents.default()
@@ -102,6 +214,7 @@ _intents.guilds = True
 # ---------------------------------------------------------------------------
 _discord_client: Optional[discord.Client] = None
 _tg_app: Optional[Application] = None
+_poll_counters: Optional["_PollCounters"] = None
 _sheets_refresh_task: Optional[asyncio.Task] = None
 _db_purge_task: Optional[asyncio.Task] = None
 _discord_refresh_task: Optional[asyncio.Task] = None
@@ -146,6 +259,71 @@ async def _download_tg_file(bot: TelegramBot, file_id: str) -> bytes:
     await tg_file.download_to_memory(buf)
     buf.seek(0)
     return buf.read()
+
+
+# MIME types where Python's mimetypes.guess_extension() returns a less common
+# or undesirable extension; we override these for friendlier, widely-recognised
+# extensions that Discord and mobile OSes render/play correctly.
+_MIME_EXT_OVERRIDES = {
+    "image/jpeg": ".jpg",      # guess_extension gives ".jpe"
+    "image/jpg": ".jpg",
+    "video/quicktime": ".mov",
+    "video/mp4": ".mp4",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/ogg": ".ogg",
+    "image/webp": ".webp",
+}
+
+
+def _ext_from_mime(mime_type: str) -> str:
+    """Return a leading-dot file extension for a MIME type, or "" if unknown.
+    Generic/empty MIME types (e.g. application/octet-stream) yield ""."""
+    if not mime_type:
+        return ""
+    mime_type = mime_type.split(";", 1)[0].strip().lower()
+    if mime_type in ("application/octet-stream", "binary/octet-stream"):
+        return ""
+    if mime_type in _MIME_EXT_OVERRIDES:
+        return _MIME_EXT_OVERRIDES[mime_type]
+    ext = mimetypes.guess_extension(mime_type) or ""
+    return ext
+
+
+def _ensure_filename(
+    raw_name: str,
+    mime_type: str,
+    default_stem: str,
+    default_ext: str,
+) -> str:
+    """Build a Discord-friendly filename that always has a sensible extension.
+
+    Telegram does not always supply a file_name (notably for forwarded videos,
+    which often arrive as a Document with no name and a generic MIME type). A
+    filename without an extension makes Discord store the file as
+    'application.octet-stream', which won't render or play. This derives a name
+    with a real extension using, in order of preference:
+      1. the provided file_name, IF it already has an extension;
+      2. the file_name's stem plus an extension inferred from the MIME type;
+      3. the MIME-inferred extension on the default stem;
+      4. the type-based default extension on the default stem.
+    """
+    raw_name = (raw_name or "").strip()
+    stem, existing_ext = os.path.splitext(raw_name)
+
+    if raw_name and existing_ext:
+        # Already has a usable extension — keep as-is.
+        return raw_name
+
+    mime_ext = _ext_from_mime(mime_type)
+
+    if raw_name and not existing_ext:
+        # Have a name but no extension — append the best extension we can find.
+        return raw_name + (mime_ext or default_ext)
+
+    # No name at all — use MIME-inferred extension if available, else the
+    # type-based default, on the default stem.
+    return default_stem + (mime_ext or default_ext)
 
 
 def _resolve_discord_mentions(text: str) -> str:
@@ -382,7 +560,10 @@ async def _collect_tg_attachments(
 
         elif msg.video:
             data = await _download_tg_file(tg_bot, msg.video.file_id)
-            fname = msg.video.file_name or "video.mp4"
+            fname = _ensure_filename(
+                msg.video.file_name, msg.video.mime_type,
+                default_stem="video", default_ext=".mp4",
+            )
             dc_files.append(discord.File(io.BytesIO(data), filename=fname))
 
         elif msg.voice:
@@ -391,11 +572,20 @@ async def _collect_tg_attachments(
 
         elif msg.audio:
             data = await _download_tg_file(tg_bot, msg.audio.file_id)
-            fname = msg.audio.file_name or "audio.mp3"
+            fname = _ensure_filename(
+                msg.audio.file_name, msg.audio.mime_type,
+                default_stem="audio", default_ext=".mp3",
+            )
             dc_files.append(discord.File(io.BytesIO(data), filename=fname))
 
         elif msg.document:
-            fname = msg.document.file_name or "file"
+            # Forwarded videos frequently arrive as a Document with no
+            # file_name and a generic MIME type; derive a proper name+extension
+            # so Discord doesn't store it as 'application.octet-stream'.
+            fname = _ensure_filename(
+                msg.document.file_name, msg.document.mime_type,
+                default_stem="file", default_ext="",
+            )
             fsize = msg.document.file_size or 0
             if fsize > DC_MAX_BYTES:
                 skip_notices.append(
@@ -514,21 +704,27 @@ async def _send_attachments_to_telegram(
             chunk_caption = text if chunk_start == 0 else None
 
             if len(chunk_pv) == 1:
-                # Single item — use the regular send method, not send_media_group
+                # Single item — use the regular send method, not send_media_group.
+                # Wrap bytes in InputFile WITH the Discord filename so Telegram
+                # stores a proper name+extension. Passing raw bytes alone makes
+                # Telegram fall back to naming the file after its MIME type
+                # (e.g. "application.octet-stream"), which then surfaces as a
+                # broken filename when the message is forwarded or bridged back.
                 raw, att = chunk_pv[0]
                 ctype_att = att.content_type or ""
+                _fname = att.filename or "attachment"
                 try:
                     if ctype_att.startswith("video/"):
                         sent = await tg_bot.send_video(
                             chat_id=chat_id,
-                            video=raw,
+                            video=InputFile(io.BytesIO(raw), filename=_fname),
                             caption=chunk_caption or None,
                             reply_to_message_id=reply_to_telegram_id,
                         )
                     else:
                         sent = await tg_bot.send_photo(
                             chat_id=chat_id,
-                            photo=raw,
+                            photo=InputFile(io.BytesIO(raw), filename=_fname),
                             caption=chunk_caption or None,
                             reply_to_message_id=reply_to_telegram_id,
                         )
@@ -544,15 +740,23 @@ async def _send_attachments_to_telegram(
                         dc_channel=dc_channel, dc_msg_ref=dc_msg_ref,
                     )
             else:
-                # Multiple items — build InputMedia list with raw bytes
+                # Multiple items — build InputMedia list with raw bytes.
+                # Pass filename= so Telegram stores a proper name+extension for
+                # each album item (otherwise it names them after the MIME type,
+                # e.g. "application.octet-stream").
                 media_list = []
                 for i, (raw, att) in enumerate(chunk_pv):
                     ctype_att = att.content_type or ""
                     caption = chunk_caption if i == 0 else None
+                    _fname = att.filename or "attachment"
                     if ctype_att.startswith("video/"):
-                        media_list.append(InputMediaVideo(media=raw, caption=caption))
+                        media_list.append(
+                            InputMediaVideo(media=raw, caption=caption, filename=_fname)
+                        )
                     else:
-                        media_list.append(InputMediaPhoto(media=raw, caption=caption))
+                        media_list.append(
+                            InputMediaPhoto(media=raw, caption=caption, filename=_fname)
+                        )
                 try:
                     sent_list = await tg_bot.send_media_group(
                         chat_id=chat_id,
@@ -2177,13 +2381,17 @@ async def _start_telegram_app() -> None:
     All handler functions (route_tg_to_discord, etc.) are identical in both
     modes — only the transport layer differs.
     """
-    global _tg_app
+    global _tg_app, _poll_counters
 
     # Configure generous HTTP timeouts.
     # PTB's defaults (5s connect, 5s read) are too short for large media uploads
     # such as a 10-photo album.  media_write_timeout covers the actual upload.
-    from telegram.request import HTTPXRequest
-    _tg_request = HTTPXRequest(
+    # PollCountingRequest also counts getUpdates poll results for the dashboard
+    # polling-health check and the summarised poll logging.
+    _poll_counters = _PollCounters()
+    config.set_poll_counters(_poll_counters)
+    _tg_request = PollCountingRequest(
+        counters=_poll_counters,
         connect_timeout=10.0,
         read_timeout=60.0,
         write_timeout=120.0,
@@ -2478,6 +2686,10 @@ async def _shutdown() -> None:
     if _tg_app:
         try:
             await _tg_app.updater.stop()
+            # Polling has now stopped; record how many routine 200 polls
+            # occurred in the final window (counted but not individually logged).
+            if _poll_counters is not None:
+                log_poll_summary(_poll_counters, reason="shutdown")
             await _tg_app.stop()
             await _tg_app.shutdown()
         except Exception as e:

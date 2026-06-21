@@ -31,6 +31,14 @@ TEST_TELEGRAM_WEBHOOK_PORT=8088
 TEST_TELEGRAM_WEBHOOK_SECRET="<random-secret>"
 # Force polling mode instead of webhook mode (true/false; default is false on VPS Linux, default is true on Windows Gitbash or Windows WSL2).
 TEST_TELEGRAM_USE_POLLING=true
+# Name of the gateway this instance owns (acts as server for); empty = client-only. See TDbridge_Gateway_Protocol.md
+TEST_OWN_GATEWAY=""
+# Internal localhost port the gateway server binds (behind stunnel); external 8089 maps here. Server-side only.
+TEST_GATEWAY_LISTEN_PORT=8090
+# Dashboard polling-health: flag ERROR when polling active AND non-200 errors >= this count AND errors exceed the max rate below
+TEST_POLL_ERR_MIN_COUNT=9
+# Max fraction of polls that may be errors before ERROR (0.05 = 5%, i.e. success rate must be >= 95%)
+TEST_POLL_ERR_MAX_RATE=0.05
 # SQLite message store file (stores TG<->DC message ID mappings for reply routing)
 TEST_SQLITE_DB_FILE=TDbridge_test.db
 # Log file
@@ -80,6 +88,14 @@ PROD_TELEGRAM_WEBHOOK_PORT=8444
 PROD_TELEGRAM_WEBHOOK_SECRET="<random-secret>"
 # Force polling mode instead of webhook mode (true/false; default is false on VPS Linux, default is true on Windows Gitbash or Windows WSL2).
 PROD_TELEGRAM_USE_POLLING=true
+# Name of the gateway this instance owns (acts as server for); empty = client-only. See TDbridge_Gateway_Protocol.md
+PROD_OWN_GATEWAY="TDbridge_gw"
+# Internal localhost port the gateway server binds (behind stunnel); external 8445 maps here. Server-side only.
+PROD_GATEWAY_LISTEN_PORT=8446
+# Dashboard polling-health: flag ERROR when polling active AND non-200 errors >= this count AND errors exceed the max rate below
+PROD_POLL_ERR_MIN_COUNT=9
+# Max fraction of polls that may be errors before ERROR (0.05 = 5%, i.e. success rate must be >= 95%)
+PROD_POLL_ERR_MAX_RATE=0.05
 # SQLite message store file (stores TG<->DC message ID mappings for reply routing)
 PROD_SQLITE_DB_FILE=TDbridge_prod.db
 # Log file
@@ -110,6 +126,9 @@ PROD_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, 
 
 # Time Zone
 LOCAL_TIMEZONE="America/Los_Angeles"
+
+# Gateway definitions JSON file (shared by test and prod). See TDbridge_Gateway_Protocol.md. Keep real secrets out of git.
+TELEGRAM_GATEWAYS=telegram_gateways.json
 
 # Google Credentials for service account <serviceaccountname>@<projectname>.iam.gserviceaccount.com
 # Google Credentials for service account tdbridge-service@tdbridge.iam.gserviceaccount.com

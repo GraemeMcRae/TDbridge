@@ -24,9 +24,10 @@ summary         Free-form human-readable summary, chosen to be meaningful at a g
 
 Status derivation
 -----------------
-OK    — dc connected, sheets ok, locked_min == 0
+OK    — dc connected, sheets ok, locked_min == 0, polling healthy
 WARN  — sheets had a transient error, OR any table locked (locked_min > 0)
-ERROR — dc disconnected
+ERROR — dc disconnected, OR polling unhealthy (polling active AND non-200
+        errors >= POLL_ERR_MIN_COUNT AND error rate > POLL_ERR_MAX_RATE)
 
 (tg_idle_min is reported raw; the dashboard decides the threshold.)
 
@@ -319,20 +320,31 @@ class DashboardReporter:
         delta = datetime.now(tz=timezone.utc) - self._status.tg_last_update
         return max(0, int(delta.total_seconds() // 60))
 
-    def _compute_status(self, locked_min: int) -> str:
+    def _compute_status(self, locked_min: int, poll_unhealthy: bool = False) -> str:
         """Derive OK / WARN / ERROR from current status."""
         s = self._status
         if not s.dc_connected:
+            return "ERROR"
+        if poll_unhealthy:
             return "ERROR"
         if not s.sheets_last_ok or locked_min > 0:
             return "WARN"
         return "OK"
 
-    def _build_summary(self, overall_status: str, locked_min: int) -> str:
+    def _build_summary(self, overall_status: str, locked_min: int,
+                       poll_unhealthy: bool = False,
+                       poll_ok: int = 0, poll_err: int = 0) -> str:
         """Build a concise human-readable summary."""
         s = self._status
         if not s.dc_connected:
             return "Discord disconnected"
+        if poll_unhealthy:
+            total = poll_ok + poll_err
+            pct = (100.0 * poll_err / total) if total else 0.0
+            return (
+                f"Telegram polling errors: {poll_err}/{total} polls failed "
+                f"({pct:.1f}%) — possible duplicate poller; consider restart"
+            )
         if not s.sheets_last_ok:
             return "Google Sheets error"
         if locked_min > 0:
@@ -349,11 +361,35 @@ class DashboardReporter:
         s           = self._status
         locked_min  = self._locked_minutes()
         tg_idle_min = self._tg_idle_minutes()
-        overall     = override_status or self._compute_status(locked_min)
-        summary     = override_summary or self._build_summary(overall, locked_min)
+
+        # Polling health. Read the interval poll counts ONLY on a real periodic
+        # emit (reset_counters=True); the read resets them, so startup/shutdown
+        # emits (which pass reset_counters=False) must not consume them. The
+        # check applies only when polling is active.
+        poll_ok = poll_err = 0
+        poll_unhealthy = False
+        polling_active = getattr(self._config, "telegram_use_polling", False)
+        if reset_counters and polling_active:
+            poll_ok, poll_err = self._config.take_poll_counts()
+            total = poll_ok + poll_err
+            if (
+                total > 0
+                and poll_err >= self._config.poll_err_min_count
+                and (poll_err / total) > self._config.poll_err_max_rate
+            ):
+                poll_unhealthy = True
+
+        overall     = override_status or self._compute_status(locked_min, poll_unhealthy)
+        summary     = override_summary or self._build_summary(
+            overall, locked_min, poll_unhealthy, poll_ok, poll_err
+        )
 
         dc_str     = "connected" if s.dc_connected else "disconnected"
         sheets_str = "ok" if s.sheets_last_ok else "error"
+        poll_total = poll_ok + poll_err
+        poll_str   = (
+            f"{poll_ok}/{poll_total}" if (polling_active and reset_counters) else "n/a"
+        )
 
         logger.info(
             f"{LOG_TAG} | "
@@ -364,6 +400,7 @@ class DashboardReporter:
             f"sheets={sheets_str} | "
             f"locked_min={locked_min} | "
             f"bridged_30m={s.bridged_30m} | "
+            f"poll_ok={poll_str} | "
             f"summary={summary}"
         )
 

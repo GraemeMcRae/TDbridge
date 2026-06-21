@@ -242,6 +242,58 @@ class Config:
         # Secret token Telegram includes in X-Telegram-Bot-Api-Secret-Token header
         self.telegram_webhook_secret: str = get("TELEGRAM_WEBHOOK_SECRET", required=False)
 
+        # ------------------------------------------------------------------ #
+        # Gateway configuration                                              #
+        # ------------------------------------------------------------------ #
+        # OWN_GATEWAY names the gateway this instance owns (acts as server for).
+        # Empty string (the default) means this instance owns no gateway and
+        # acts only as a client to remote gateways (used in testing).
+        self.own_gateway: str = os.getenv(
+            self.env_prefix + "OWN_GATEWAY", ""
+        ).strip()
+
+        # TELEGRAM_GATEWAYS names a JSON file (shared, no TEST_/PROD_ prefix)
+        # listing all known gateways: name, url, secret, and behavior flags.
+        # See gateway_config.py / TDbridge_Gateway_Protocol.md. Empty/unset means
+        # no gateway file (gateway feature inactive).
+        self.gateways_file: str = os.getenv("TELEGRAM_GATEWAYS", "").strip()
+
+        # Internal localhost port the gateway server binds (behind stunnel).
+        # Server-side deployment detail; the external port is encoded in each
+        # gateway's url in the gateways file. Default 8446 (prod) / 8090 (test)
+        # by convention, but always read from .env when present.
+        self.gateway_listen_port: int = int(
+            os.getenv(self.env_prefix + "GATEWAY_LISTEN_PORT", "0") or "0"
+        )
+
+        # ------------------------------------------------------------------ #
+        # Polling-health check (reported via the Manager Dashboard)          #
+        # ------------------------------------------------------------------ #
+        # The DashboardReporter flags the polling-health status as ERROR when,
+        # in a health-check interval, ALL of these hold:
+        #   • polling is active, AND
+        #   • the non-200 (error) poll count is >= POLL_ERR_MIN_COUNT, AND
+        #   • errors exceed POLL_ERR_MAX_RATE of all polls (success rate < 95%).
+        # Both an absolute floor and a rate must be exceeded, so neither a quiet
+        # interval with a few stray errors nor a high-volume interval with a tiny
+        # error fraction will trip it. Defaults: 9 errors and 0.05 (5%), chosen
+        # because ~180 polls occur per 30-minute interval and 5% of 180 is 9.
+        self.poll_err_min_count: int = int(
+            os.getenv(self.env_prefix + "POLL_ERR_MIN_COUNT", "9") or "9"
+        )
+        self.poll_err_max_rate: float = float(
+            os.getenv(self.env_prefix + "POLL_ERR_MAX_RATE", "0.05") or "0.05"
+        )
+        gateways_path = (
+            str(PROJECT_ROOT / self.gateways_file) if self.gateways_file else ""
+        )
+        # Parsed gateway definitions, keyed by gateway name (empty dict if no
+        # file configured). Loaded and validated at startup so a malformed file
+        # or a bad OWN_GATEWAY fails fast rather than at first gateway use.
+        from gateway_config import load_gateways, validate_own_gateway
+        self.gateways = load_gateways(gateways_path)
+        validate_own_gateway(self.gateways, self.own_gateway)
+
         # Google Sheets
         self.google_spreadsheet_name: str = get("GOOGLE_SPREADSHEET_NAME")
 
@@ -422,9 +474,25 @@ class Config:
                     and record.name.startswith("telegram.ext")
                 )
 
+        # Silence httpx's per-request INFO logging. While polling, Telegram is
+        # hit every ~10 s and httpx logs each "getUpdates ... 200 OK", which
+        # buries real events and wraps the log in ~25 h. We raise httpx's logger
+        # to WARNING so routine successes produce nothing (genuine httpx warnings
+        # and errors still appear). Poll success/failure is instead tracked and
+        # logged by the counting request class (see PollCountingRequest in
+        # bot.py), which has the real status code — no log-text parsing, no
+        # logger/handler-propagation subtleties.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
         root = logging.getLogger()
         root.setLevel(logging.INFO)
-        root.addFilter(_SuppressPTBShutdownCritical())
+        _ptb_filter = _SuppressPTBShutdownCritical()
+
+        # IMPORTANT: the PTB-shutdown filter is attached to the HANDLERS, not to
+        # the root logger. A filter on a logger only runs for records logged
+        # directly to that logger; it is NOT applied to records that propagate
+        # up from child loggers (e.g. "telegram.ext"). Handler-level filters DO
+        # run on every record reaching the handler, including propagated ones.
 
         # Rotating file handler: 5 MiB × 5 backups.
         # At rotation, Python's RotatingFileHandler renames:
@@ -436,12 +504,33 @@ class Config:
             encoding="utf-8",
         )
         fh.setFormatter(fmt)
+        fh.addFilter(_ptb_filter)
         root.addHandler(fh)
 
         # Console handler — same format, useful during development
         ch = logging.StreamHandler(sys.stdout)
         ch.setFormatter(fmt)
+        ch.addFilter(_ptb_filter)
         root.addHandler(ch)
+
+    def take_poll_counts(self) -> tuple:
+        """Return (ok, err) getUpdates counts since the last call, and reset
+        them. Used by the DashboardReporter to compute polling health each
+        cycle. Returns (0, 0) if poll counting isn't active.
+
+        The counts are maintained by the counting request class registered via
+        set_poll_counters() (see bot.py PollCountingRequest).
+        """
+        pc = getattr(self, "_poll_counters", None)
+        if pc is None:
+            return (0, 0)
+        return pc.take_interval_counts()
+
+    def set_poll_counters(self, counters) -> None:
+        """Register the object that tracks getUpdates poll success/error counts.
+        Called once at startup by bot.py. The object must expose
+        take_interval_counts() -> (ok, err)."""
+        self._poll_counters = counters
 
 
 # ---------------------------------------------------------------------------

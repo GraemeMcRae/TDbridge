@@ -36,6 +36,12 @@ google_credentials*.json
 google_oauth_client*.json
 google_oauth_token*.json
 
+# TDbridge gateways (contain secrets)
+[Tt]elegram_[Gg]ateways.json
+
+# HCF_login_status.json - keeps track of logged in users across bot restarts
+*login_status*.json
+
 # Python
 __pycache__/
 *.py[cod]
@@ -67,6 +73,7 @@ htmlcov/
 [Jj]unk*
 Versioning*
 _file_dates_snapshot.json
+*.pcap
 
 # Backups of project files
 *BK202*.*
@@ -76,9 +83,6 @@ Trip*.csv
 *concat*.csv
 *concat*.xl*
 Work_Order*.csv
-
-# HCF_login_status.json - keeps track of logged in users across bot restarts
-*login_status*.json
 
 # SQLite database
 TDbridge*.db*

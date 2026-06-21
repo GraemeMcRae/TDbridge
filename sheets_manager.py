@@ -20,6 +20,8 @@ D_User  (sheet: D_User_Sheet)
     T_GroupID       — Telegram group ID (user-maintained; used by TDbridge)
     T_Title         — Human-readable Telegram group title (user-maintained; not used)
     T_LastFound     — Serial date; not used by TDbridge
+    T_Gateway       — Gateway name for this user's group, or blank for native
+                      (user-maintained; used by TDbridge gateway routing)
 
 D_Channel  (sheet: D_Channel_Sheet)
     D_ChannelID     — Discord channel snowflake (text)
@@ -33,6 +35,10 @@ T_Group  (sheet: T_Group_Sheet)
     T_Type          — "group" / "supergroup" (written by TDbridge)
     T_LastFound     — Serial date; written by TDbridge
     T_Status        — "Active" / "Inactive" (user-maintained; used by TDbridge)
+    T_Gateway       — Gateway name through which this group is reached, or blank
+                      for native (user-maintained). The unique key for a T_Group
+                      row is (T_GroupID, T_Gateway); the same T_GroupID may appear
+                      with different gateways or with none.
 
 Routing tables exposed
 ----------------------
@@ -82,7 +88,9 @@ def _normalise_id(raw: object) -> str:
     return str(raw).strip()
 
 
-# ---------------------------------------------------------------------------
+def _norm_gateway(raw: object) -> str:
+    """Return a gateway name as a stripped string ("" means native/no gateway)."""
+    return str(raw).strip()# ---------------------------------------------------------------------------
 # TableManager instances (one per table)
 # ---------------------------------------------------------------------------
 _d_user_tm = TableManager(
@@ -90,7 +98,7 @@ _d_user_tm = TableManager(
     required_columns=[
         "D_ID", "D_UserName", "D_Nickname", "D_DisplayName", "D_LastFound",
         "D_ChannelID", "D_ChannelName", "D_UserStatus", "T_GroupID",
-        "T_Title", "T_LastFound",
+        "T_Title", "T_LastFound", "T_Gateway",
     ],
 )
 
@@ -101,7 +109,7 @@ _d_channel_tm = TableManager(
 
 _t_group_tm = TableManager(
     sheet_name="T_Group_Sheet",
-    required_columns=["T_GroupID", "T_Title", "T_Type", "T_LastFound", "T_Status"],
+    required_columns=["T_GroupID", "T_Title", "T_Type", "T_LastFound", "T_Status", "T_Gateway"],
 )
 
 # ---------------------------------------------------------------------------
@@ -113,6 +121,9 @@ user_by_discord_id: dict[str, dict]  = {}
 user_by_tg_group_id: dict[str, dict] = {}
 channel_by_id: dict[str, dict]       = {}
 group_by_id: dict[str, dict]         = {}
+# Composite-keyed group cache: (T_GroupID, T_Gateway) → T_Group row.
+# T_Gateway is normalised (stripped); blank means the group is reached natively.
+group_by_id_gateway: dict[tuple[str, str], dict] = {}
 
 _last_refresh_time: Optional[datetime] = None
 
@@ -140,9 +151,41 @@ def get_channel(channel_id: str) -> Optional[dict]:
 
 
 def get_tg_group(tg_group_id: str) -> Optional[dict]:
-    """Return the T_Group row for a Telegram group ID, or None."""
+    """Return the T_Group row for a Telegram group ID, or None.
+
+    Looks up by T_GroupID alone (ignoring gateway). Retained for backward
+    compatibility and for native-only routing. For gateway-aware lookups use
+    get_tg_group_via_gateway().
+    """
     with _lock:
         return group_by_id.get(_normalise_id(tg_group_id))
+
+
+def get_tg_group_via_gateway(
+    tg_group_id: str, gateway: str = ""
+) -> Optional[dict]:
+    """Return the T_Group row for a (T_GroupID, T_Gateway) combo, or None.
+
+    The unique key for a group is the (T_GroupID, T_Gateway) pair. A blank
+    gateway ("") means the group is reached natively (this instance is itself
+    in the Telegram group). On duplicate combos the first table row wins (this
+    is enforced at cache-build time).
+    """
+    with _lock:
+        return group_by_id_gateway.get(
+            (_normalise_id(tg_group_id), _norm_gateway(gateway))
+        )
+
+
+def is_active_group_via_gateway(tg_group_id: str, gateway: str = "") -> bool:
+    """True if (T_GroupID, T_Gateway) names an Active T_Group row.
+
+    This is the gateway-aware validation described in the gateway protocol:
+    a group is only valid for a given gateway if there is an Active T_Group
+    row matching that exact (T_GroupID, T_Gateway) combination.
+    """
+    row = get_tg_group_via_gateway(tg_group_id, gateway)
+    return bool(row) and _is_active(row.get("T_Status", ""))
 
 
 def get_user_by_tg_group_inactive(tg_group_id: str) -> Optional[dict]:
@@ -205,7 +248,10 @@ def _build_caches(
     new_user_by_tg: dict[str, dict]   = {}
     new_channel: dict[str, dict]      = {}
     new_group: dict[str, dict]        = {}
+    new_group_by_combo: dict[tuple[str, str], dict] = {}
 
+    cb_added = 0
+    cb_skipped = 0
     for row in user_records:
         did = _normalise_id(row.get("D_ID", ""))
         if did:
@@ -214,13 +260,18 @@ def _build_caches(
         if tgid:
             status = row.get("D_UserStatus", "")
             active = _is_active(status)
-            logger.info(
+            # Per-row detail is available at DEBUG; INFO gets a summary only,
+            # to keep the log readable and avoid rapid log rotation.
+            logger.debug(
                 f"Cache build: D_ID={did!r} T_GroupID={tgid!r} "
                 f"D_UserStatus={status!r} → "
                 f"{'added to user_by_tg_group_id' if active else 'SKIPPED (not active)'}"
             )
             if active:
                 new_user_by_tg[tgid] = row
+                cb_added += 1
+            else:
+                cb_skipped += 1
 
     for row in channel_records:
         cid = _normalise_id(row.get("D_ChannelID", ""))
@@ -230,22 +281,33 @@ def _build_caches(
     for row in group_records:
         gid = _normalise_id(row.get("T_GroupID", ""))
         if gid:
+            # Existing T_GroupID-only cache (unchanged behavior; last row wins).
             new_group[gid] = row
+            # Composite (T_GroupID, T_Gateway) cache. Per the gateway protocol,
+            # the unique key is the pair, and on a duplicate combo the FIRST row
+            # in the table wins — so only set if not already present.
+            gw = _norm_gateway(row.get("T_Gateway", ""))
+            combo = (gid, gw)
+            if combo not in new_group_by_combo:
+                new_group_by_combo[combo] = row
 
     global user_by_discord_id, user_by_tg_group_id, channel_by_id, group_by_id
+    global group_by_id_gateway
     global _last_refresh_time
     with _lock:
         user_by_discord_id  = new_user_by_id
         user_by_tg_group_id = new_user_by_tg
         channel_by_id       = new_channel
         group_by_id         = new_group
+        group_by_id_gateway = new_group_by_combo
         _last_refresh_time  = localnow()
 
     logger.info(
         f"Sheets cache refreshed: "
         f"{len(new_user_by_id)} users, "
         f"{len(new_channel)} channels, "
-        f"{len(new_group)} TG groups"
+        f"{len(new_group)} TG groups "
+        f"({cb_added} active user→group mappings, {cb_skipped} skipped inactive)"
     )
 
 
