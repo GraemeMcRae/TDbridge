@@ -2263,12 +2263,18 @@ async def _sheets_refresh_loop() -> None:
 
 
 async def _db_purge_loop() -> None:
-    """Purge old SQLite records once per day."""
+    """Purge old SQLite records once per day, and sweep gateway-file leftovers."""
     TWENTY_FOUR_HOURS = 86400
     while True:
         await asyncio.sleep(TWENTY_FOUR_HOURS)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, db.purge_older_than, 30)
+        # Sweep any gateway attachment left on disk > 24h (should not happen;
+        # sweep_leftovers logs an ERROR per leftover). Only meaningful when this
+        # instance owns a gateway, but the call is harmless otherwise.
+        if _gateway_server.enabled:
+            import gateway_files
+            await loop.run_in_executor(None, gateway_files.sweep_leftovers)
 
 
 # ===========================================================================

@@ -142,6 +142,8 @@ def init_db() -> None:
         conn.execute(_CREATE_BOT_STATUS_TABLE_SQL)
         conn.execute(_CREATE_GATEWAY_QUEUE_TABLE_SQL)
         conn.execute(_CREATE_GATEWAY_QUEUE_INDEX_SQL)
+        conn.execute(_CREATE_GATEWAY_FILES_TABLE_SQL)
+        conn.execute(_CREATE_GATEWAY_FILES_TOKEN_INDEX_SQL)
     logger.info(f"SQLite message store initialised: {_DB_PATH}")
 
 
@@ -455,3 +457,88 @@ def gateway_queue_depth(gateway: str = None) -> int:
     with _connect() as conn:
         row = conn.execute(sql, args).fetchone()
     return int(row[0]) if row else 0
+
+
+# ===========================================================================
+# Gateway file reference store
+# ===========================================================================
+# Tracks attachments held on disk for the gateway two-hop transfer. The bytes
+# live on disk (see gateway_files.py); this table maps the upload file_ref and
+# the download capability token to the on-disk path plus metadata, so getfile
+# and the capability GET can resolve them, and so cleanup can find expired rows.
+
+_CREATE_GATEWAY_FILES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS gateway_files (
+    file_ref       TEXT PRIMARY KEY,
+    download_token TEXT,
+    gateway        TEXT NOT NULL,
+    path           TEXT NOT NULL,
+    file_name      TEXT NOT NULL DEFAULT '',
+    mime_type      TEXT NOT NULL DEFAULT '',
+    size           INTEGER NOT NULL DEFAULT 0,
+    created_at     REAL NOT NULL
+);
+"""
+
+_CREATE_GATEWAY_FILES_TOKEN_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_gwf_token
+    ON gateway_files (download_token);
+"""
+
+
+def gateway_file_add(file_ref: str, gateway: str, path: str,
+                     file_name: str, mime_type: str, size: int) -> None:
+    """Record a newly-uploaded gateway file (no download token yet)."""
+    sql = """
+        INSERT OR REPLACE INTO gateway_files
+            (file_ref, download_token, gateway, path, file_name, mime_type, size, created_at)
+        VALUES (?, NULL, ?, ?, ?, ?, ?, ?)
+    """
+    with _connect() as conn:
+        conn.execute(sql, (str(file_ref), str(gateway), str(path),
+                           str(file_name), str(mime_type), int(size), time.time()))
+
+
+def gateway_file_set_token(file_ref: str, download_token: str) -> bool:
+    """Assign a download capability token to a file_ref. Returns True if the
+    file_ref exists and was updated."""
+    sql = "UPDATE gateway_files SET download_token = ? WHERE file_ref = ?"
+    with _connect() as conn:
+        cursor = conn.execute(sql, (str(download_token), str(file_ref)))
+    return cursor.rowcount > 0
+
+
+def gateway_file_by_ref(file_ref: str):
+    """Return the file row for a file_ref as a dict, or None."""
+    sql = "SELECT * FROM gateway_files WHERE file_ref = ?"
+    with _connect() as conn:
+        row = conn.execute(sql, (str(file_ref),)).fetchone()
+    return dict(row) if row else None
+
+
+def gateway_file_by_token(download_token: str):
+    """Return the file row for a download capability token as a dict, or None."""
+    sql = "SELECT * FROM gateway_files WHERE download_token = ?"
+    with _connect() as conn:
+        row = conn.execute(sql, (str(download_token),)).fetchone()
+    return dict(row) if row else None
+
+
+def gateway_file_delete(file_ref: str) -> Optional[str]:
+    """Delete the reference row for file_ref. Returns the on-disk path that was
+    recorded (so the caller can remove the file), or None if not found."""
+    with _connect() as conn:
+        row = conn.execute("SELECT path FROM gateway_files WHERE file_ref = ?",
+                           (str(file_ref),)).fetchone()
+        if row is None:
+            return None
+        path = row["path"]
+        conn.execute("DELETE FROM gateway_files WHERE file_ref = ?", (str(file_ref),))
+    return path
+
+
+def gateway_files_all():
+    """Return all gateway file rows as dicts (for cleanup sweeps)."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM gateway_files").fetchall()
+    return [dict(r) for r in rows]

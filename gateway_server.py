@@ -37,6 +37,7 @@ from typing import Optional
 from aiohttp import web
 
 import db
+import gateway_files
 import gateway_protocol as gp
 
 logger = logging.getLogger("TDbridge")
@@ -102,12 +103,21 @@ class GatewayServer:
 
         self._poll_wakeup = asyncio.Event()
 
-        app = web.Application()
+        # Ensure the attachment directory exists (we own a gateway).
+        try:
+            gateway_files.ensure_dir()
+        except Exception as e:
+            logger.warning("Gateway files dir could not be created: %s", e)
+
+        app = web.Application(client_max_size=self._max_upload_bytes() + (1024 * 1024))
         app.add_routes([
             web.get("/gateway/health", self._handle_health),
             web.post("/gateway/send", self._handle_send),
             web.post("/gateway/poll", self._handle_poll),
             web.post("/gateway/ack", self._handle_ack),
+            web.post("/gateway/upload", self._handle_upload),
+            web.post("/gateway/getfile", self._handle_getfile),
+            web.get("/gateway/file/{token}", self._handle_download),
         ])
         if self._debug_endpoints:
             app.add_routes([
@@ -374,3 +384,111 @@ class GatewayServer:
         promptly. Safe to call from the loop thread."""
         if self._poll_wakeup is not None:
             self._poll_wakeup.set()
+
+    # ------------------------------------------------------------------ #
+    # Attachments (two-hop: upload → getfile → capability GET)           #
+    # ------------------------------------------------------------------ #
+    def _max_upload_bytes(self) -> int:
+        return int(getattr(self._config, "gateway_filesize_mb", 50)) * 1024 * 1024
+
+    def _check_header_secret(self, request: web.Request) -> Optional[web.Response]:
+        """Auth for upload/getfile, whose bodies aren't envelope JSON. The
+        secret and (for upload) the target gateway ride in headers:
+            X-Gateway-Name, X-Gateway-Secret
+        Returns a 401 Response on failure, or None on success."""
+        name = request.headers.get("X-Gateway-Name", "")
+        secret = request.headers.get("X-Gateway-Secret", "")
+        if name != self._own_gateway:
+            logger.warning(
+                "Gateway file auth: header gateway %r != served %r — rejected.",
+                name, self._own_gateway,
+            )
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if not secret or secret != self._own_def.secret:
+            logger.warning("Gateway file auth: bad/missing secret — rejected.")
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return None
+
+    async def _handle_upload(self, request: web.Request) -> web.Response:
+        """Receive raw attachment bytes; return a file_ref. Secret + metadata in
+        headers: X-Gateway-Name, X-Gateway-Secret, X-File-Name, X-Mime-Type."""
+        auth_err = self._check_header_secret(request)
+        if auth_err is not None:
+            return auth_err
+        file_name = request.headers.get("X-File-Name", "") or "attachment"
+        mime_type = request.headers.get("X-Mime-Type", "") or "application/octet-stream"
+        try:
+            data = await request.read()
+        except Exception:
+            return web.json_response({"error": "bad request"}, status=400)
+        limit = self._max_upload_bytes()
+        if len(data) > limit:
+            return web.json_response({
+                "error": f"file too large ({len(data)} bytes > {limit} limit)"
+            }, status=413)
+        if not data:
+            return web.json_response({"error": "empty upload"}, status=400)
+        info = await asyncio.get_running_loop().run_in_executor(
+            None, gateway_files.store_upload,
+            self._own_gateway, data, file_name, mime_type,
+        )
+        return web.json_response({
+            "protocol_version": gp.PROTOCOL_VERSION,
+            **info,
+        })
+
+    async def _handle_getfile(self, request: web.Request) -> web.Response:
+        """Exchange a file_ref for a short-lived capability download URL.
+        Secret in header X-Gateway-Secret + X-Gateway-Name; file_ref in the JSON
+        body {"file_ref": "..."}."""
+        auth_err = self._check_header_secret(request)
+        if auth_err is not None:
+            return auth_err
+        try:
+            body = json.loads(await request.text() or "{}")
+        except Exception:
+            return web.json_response({"error": "bad request"}, status=400)
+        file_ref = body.get("file_ref")
+        if not file_ref:
+            return web.json_response({"error": "missing file_ref"}, status=400)
+        token = await asyncio.get_running_loop().run_in_executor(
+            None, gateway_files.make_download_token, file_ref
+        )
+        if token is None:
+            return web.json_response({"error": "unknown file_ref"}, status=404)
+        # Build the external capability URL from the gateway's configured url.
+        # The gateway url looks like https://host:port/gateway/<name>; the file
+        # path is served at https://host:port/gateway/file/<token>.
+        base = self._own_def.url
+        # strip the trailing /gateway/<name> to get the scheme://host:port/gateway root
+        root = base.rsplit("/gateway/", 1)[0] if "/gateway/" in base else base
+        download_url = f"{root}/gateway/file/{token}"
+        return web.json_response({
+            "protocol_version": gp.PROTOCOL_VERSION,
+            "file_ref": file_ref,
+            "download_url": download_url,
+        })
+
+    async def _handle_download(self, request: web.Request) -> web.Response:
+        """Serve attachment bytes for a capability token (no secret — the
+        unguessable token IS the capability, HTTPS-only). The token rides in the
+        URL path; possession of the getfile-issued URL authorises the fetch."""
+        token = request.match_info.get("token", "")
+        row = await asyncio.get_running_loop().run_in_executor(
+            None, gateway_files.resolve_token, token
+        )
+        if row is None:
+            return web.json_response({"error": "not found"}, status=404)
+        try:
+            with open(row["path"], "rb") as f:
+                data = f.read()
+        except OSError:
+            return web.json_response({"error": "not found"}, status=404)
+        return web.Response(
+            body=data,
+            content_type=(row.get("mime_type") or "application/octet-stream"),
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="{row.get("file_name") or "attachment"}"'
+            },
+        )

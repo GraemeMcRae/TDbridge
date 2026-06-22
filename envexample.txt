@@ -37,6 +37,10 @@ TEST_OWN_GATEWAY=""
 TEST_GATEWAY_LISTEN_PORT=8090
 # Expose debug-only gateway endpoints (e.g. /gateway/debug/enqueue) for testing the queue; MUST be false in normal use
 TEST_GATEWAY_DEBUG_ENDPOINTS=false
+# Directory for storing attachments until they are successfully sent or received through the gateway (only used if OWN_GATEWAY != "")
+TEST_GATEWAY_FILES=gateway_files_test
+# Size limit of gateway files, in megabytes
+TEST_GATEWAY_FILESIZE=50
 # Dashboard polling-health: flag ERROR when polling active AND non-200 errors >= this count AND errors exceed the max rate below
 TEST_POLL_ERR_MIN_COUNT=9
 # Max fraction of polls that may be errors before ERROR (0.05 = 5%, i.e. success rate must be >= 95%)
@@ -96,6 +100,10 @@ PROD_OWN_GATEWAY="TDbridge_gw"
 PROD_GATEWAY_LISTEN_PORT=8446
 # Expose debug-only gateway endpoints (e.g. /gateway/debug/enqueue) for testing the queue; MUST be false in normal use
 PROD_GATEWAY_DEBUG_ENDPOINTS=false
+# Directory for storing attachments until they are successfully sent or received through the gateway (only used if OWN_GATEWAY != "")
+PROD_GATEWAY_FILES=gateway_files
+# Size limit of gateway files, in megabytes
+PROD_GATEWAY_FILESIZE=50
 # Dashboard polling-health: flag ERROR when polling active AND non-200 errors >= this count AND errors exceed the max rate below
 PROD_POLL_ERR_MIN_COUNT=9
 # Max fraction of polls that may be errors before ERROR (0.05 = 5%, i.e. success rate must be >= 95%)

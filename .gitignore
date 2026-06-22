@@ -91,6 +91,7 @@ TDbridge*.db*
 bm/
 tm/
 browser_data*/
+gateway_files*/
 verbose*.png
 debug*.png
 page_dump*.json

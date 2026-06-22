@@ -274,6 +274,18 @@ class Config:
             self.env_prefix + "GATEWAY_DEBUG_ENDPOINTS", "false"
         ).strip().lower() in ("true", "1", "yes")
 
+        # Directory where gateway attachments are held until they have been
+        # successfully sent or received (only used when this instance owns a
+        # gateway). Relative paths are resolved against PROJECT_ROOT.
+        _gw_files = os.getenv(self.env_prefix + "GATEWAY_FILES", "").strip()
+        self.gateway_files_dir: str = (
+            str(PROJECT_ROOT / _gw_files) if _gw_files else ""
+        )
+        # Maximum gateway attachment size in megabytes.
+        self.gateway_filesize_mb: int = int(
+            os.getenv(self.env_prefix + "GATEWAY_FILESIZE", "50") or "50"
+        )
+
         # ------------------------------------------------------------------ #
         # Polling-health check (reported via the Manager Dashboard)          #
         # ------------------------------------------------------------------ #
