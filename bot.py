@@ -2644,14 +2644,15 @@ async def _startup(discord_client: discord.Client) -> None:
     _discord_refresh_task  = asyncio.create_task(_discord_refresh_loop(discord_client))
     _t_group_flush_task    = asyncio.create_task(sheets_manager.t_group_flush_loop())
 
-    # Emit startup Status Report and start the 30-minute reporting loop
-    _dashboard_reporter.emit_startup()
-    _dashboard_task = asyncio.create_task(_dashboard_reporter.run_loop())
-
-    # Start the gateway server (no-op for a client-only instance).
+    # Start the gateway server before the first Status Report so its state is
+    # reflected accurately (no-op for a client-only instance).
     bot_status.gateway_expected = _gateway_server.enabled
     await _gateway_server.start()
     bot_status.gateway_serving = _gateway_server.is_serving()
+
+    # Emit startup Status Report and start the 30-minute reporting loop
+    _dashboard_reporter.emit_startup()
+    _dashboard_task = asyncio.create_task(_dashboard_reporter.run_loop())
 
     logger.info("=== TDbridge ready ===")
 
