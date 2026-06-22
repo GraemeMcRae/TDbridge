@@ -115,6 +115,14 @@ class BotStatus:
         # Bridging counter — reset after each Status Report
         self.bridged_30m: int = 0
 
+        # Gateway server liveness (Phase 2). gateway_expected is True when this
+        # instance owns a gateway and should be running its server; gateway_serving
+        # reflects whether the server is currently bound. A health problem is
+        # expected-but-not-serving. For a client-only instance both stay False
+        # and the gateway never affects health.
+        self.gateway_expected: bool = False
+        self.gateway_serving: bool = False
+
 
 # Module-level singleton — imported by bot.py and sheets_manager.py
 status = BotStatus()
@@ -327,6 +335,9 @@ class DashboardReporter:
             return "ERROR"
         if poll_unhealthy:
             return "ERROR"
+        if s.gateway_expected and not s.gateway_serving:
+            # We own a gateway but its server isn't running — peers can't reach us.
+            return "ERROR"
         if not s.sheets_last_ok or locked_min > 0:
             return "WARN"
         return "OK"
@@ -345,6 +356,8 @@ class DashboardReporter:
                 f"Telegram polling errors: {poll_err}/{total} polls failed "
                 f"({pct:.1f}%) — possible duplicate poller; consider restart"
             )
+        if s.gateway_expected and not s.gateway_serving:
+            return "Gateway server not running (owned gateway is unreachable)"
         if not s.sheets_last_ok:
             return "Google Sheets error"
         if locked_min > 0:
@@ -390,6 +403,11 @@ class DashboardReporter:
         poll_str   = (
             f"{poll_ok}/{poll_total}" if (polling_active and reset_counters) else "n/a"
         )
+        # Gateway field: only meaningful when this instance owns a gateway.
+        gw_str = (
+            ("serving" if s.gateway_serving else "DOWN")
+            if s.gateway_expected else "n/a"
+        )
 
         logger.info(
             f"{LOG_TAG} | "
@@ -401,6 +419,7 @@ class DashboardReporter:
             f"locked_min={locked_min} | "
             f"bridged_30m={s.bridged_30m} | "
             f"poll_ok={poll_str} | "
+            f"gw={gw_str} | "
             f"summary={summary}"
         )
 

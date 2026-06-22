@@ -57,6 +57,7 @@ from config import config, localnow
 import db
 import sheets_manager
 from dashboard_reporter import DashboardReporter, status as bot_status
+from gateway_server import GatewayServer
 
 # On Linux (server), Telegram updates are received via webhook — the bot runs
 # its own HTTPS server and Telegram POSTs updates to it.
@@ -223,6 +224,9 @@ _t_group_flush_task: Optional[asyncio.Task] = None
 
 # Dashboard reporter — emits Status Report log lines every 30 minutes
 _dashboard_reporter = DashboardReporter(config, bot_status)
+
+# Gateway server — serves this instance's OWN_GATEWAY (no-op if client-only).
+_gateway_server = GatewayServer(config)
 
 
 # ===========================================================================
@@ -2644,6 +2648,11 @@ async def _startup(discord_client: discord.Client) -> None:
     _dashboard_reporter.emit_startup()
     _dashboard_task = asyncio.create_task(_dashboard_reporter.run_loop())
 
+    # Start the gateway server (no-op for a client-only instance).
+    bot_status.gateway_expected = _gateway_server.enabled
+    await _gateway_server.start()
+    bot_status.gateway_serving = _gateway_server.is_serving()
+
     logger.info("=== TDbridge ready ===")
 
 
@@ -2665,6 +2674,13 @@ async def _shutdown() -> None:
     # Emit shutdown Status Report before stopping
     _dashboard_reporter.emit_shutdown()
     _dashboard_reporter.stop()
+
+    # Stop the gateway server (releases the listen port). No-op if not started.
+    try:
+        await _gateway_server.stop()
+        bot_status.gateway_serving = False
+    except Exception as e:
+        logger.warning(f"Error during gateway server shutdown: {e}")
 
     bot_status.dc_connected = False
 
