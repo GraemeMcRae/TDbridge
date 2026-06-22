@@ -417,14 +417,28 @@ class GatewayServer:
             return auth_err
         file_name = request.headers.get("X-File-Name", "") or "attachment"
         mime_type = request.headers.get("X-Mime-Type", "") or "application/octet-stream"
+        limit = self._max_upload_bytes()
+        # Early rejection by Content-Length, before buffering the body, so a
+        # very large upload is refused cheaply with a clear 413.
+        try:
+            declared = int(request.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            declared = 0
+        if declared > limit:
+            return web.json_response({
+                "error": f"file too large ({declared} bytes > {limit} byte limit)"
+            }, status=413)
         try:
             data = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            return web.json_response({
+                "error": f"file too large (exceeds {limit} byte limit)"
+            }, status=413)
         except Exception:
             return web.json_response({"error": "bad request"}, status=400)
-        limit = self._max_upload_bytes()
         if len(data) > limit:
             return web.json_response({
-                "error": f"file too large ({len(data)} bytes > {limit} limit)"
+                "error": f"file too large ({len(data)} bytes > {limit} byte limit)"
             }, status=413)
         if not data:
             return web.json_response({"error": "empty upload"}, status=400)
