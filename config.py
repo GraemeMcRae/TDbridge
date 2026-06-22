@@ -532,6 +532,26 @@ class Config:
         take_interval_counts() -> (ok, err)."""
         self._poll_counters = counters
 
+    def gateway_config_summary(self) -> str:
+        """Return a one-line human-readable summary of the loaded gateway
+        configuration and this instance's derived role for each gateway. Used
+        for the startup banner so operators can confirm the gateways file and
+        OWN_GATEWAY were read correctly. (The gateway runtime itself is a later
+        phase; this only reports configuration.)"""
+        gws = getattr(self, "gateways", {}) or {}
+        if not gws:
+            return "Gateways    : none configured (gateway feature inactive)"
+        own = self.own_gateway or ""
+        server_names = [n for n, g in gws.items() if g.is_server_for(own)]
+        client_names = [n for n, g in gws.items() if g.is_client_for(own)]
+        own_str = own if own else "(none — client-only)"
+        parts = [f"own={own_str}"]
+        if server_names:
+            parts.append("server_for=" + ",".join(server_names))
+        if client_names:
+            parts.append("client_for=" + ",".join(client_names))
+        return "Gateways    : " + " | ".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # Singleton — instantiated once at module level so every import shares it

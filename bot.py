@@ -2576,6 +2576,7 @@ async def _startup(discord_client: discord.Client) -> None:
     logger.info(f"Telegram bot: {config.telegram_bot_name} (@{config.telegram_bot_username})")
     logger.info(f"Spreadsheet : {config.google_spreadsheet_name}")
     logger.info(f"SQLite DB   : {config.sqlite_db_file}")
+    logger.info(config.gateway_config_summary())
 
     # ---- Set bot nickname in all guilds ----
     # Nickname is per-guild, so we loop.  Errors are logged at ERROR level
