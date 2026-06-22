@@ -266,6 +266,14 @@ class Config:
             os.getenv(self.env_prefix + "GATEWAY_LISTEN_PORT", "0") or "0"
         )
 
+        # When true, the gateway server exposes debug-only endpoints (e.g.
+        # /gateway/debug/enqueue) used to test the queue/poll/ack machinery
+        # before the routing integration (Phase 6) provides the real event
+        # source. MUST be false in normal operation. Per-environment.
+        self.gateway_debug_endpoints: bool = os.getenv(
+            self.env_prefix + "GATEWAY_DEBUG_ENDPOINTS", "false"
+        ).strip().lower() in ("true", "1", "yes")
+
         # ------------------------------------------------------------------ #
         # Polling-health check (reported via the Manager Dashboard)          #
         # ------------------------------------------------------------------ #

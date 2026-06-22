@@ -2647,6 +2647,21 @@ async def _startup(discord_client: discord.Client) -> None:
     # Start the gateway server before the first Status Report so its state is
     # reflected accurately (no-op for a client-only instance).
     bot_status.gateway_expected = _gateway_server.enabled
+
+    async def _gateway_send_text(chat_id, text, reply_to):
+        """Echo-path hook: send a text message to a Telegram group and return
+        the list of real message_id(s). Used by the gateway server."""
+        bot = _tg_app.bot if _tg_app else None
+        if bot is None:
+            raise RuntimeError("Telegram app not available")
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=(text or ""),
+            reply_to_message_id=reply_to,
+        )
+        return [sent.message_id]
+
+    _gateway_server.set_send_text_hook(_gateway_send_text)
     await _gateway_server.start()
     bot_status.gateway_serving = _gateway_server.is_serving()
 

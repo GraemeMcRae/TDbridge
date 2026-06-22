@@ -94,6 +94,27 @@ CREATE TABLE IF NOT EXISTS bot_status (
 );
 """
 
+# gateway_queue table — events queued for delivery to a gateway peer that polls
+# us. One row per queued event. The autoincrement id doubles as the delivery
+# cursor / FIFO order. delivered_at is NULL until an event is returned in a poll
+# response; for RequireACK gateways the row is retained after delivery and only
+# removed by a matching ack, so an undelivered poll response can be retried.
+_CREATE_GATEWAY_QUEUE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS gateway_queue (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    gateway       TEXT    NOT NULL,
+    chat_id       TEXT    NOT NULL,
+    event_json    TEXT    NOT NULL,
+    created_at    REAL    NOT NULL,
+    delivered_at  REAL
+);
+"""
+
+_CREATE_GATEWAY_QUEUE_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_gwq_gateway
+    ON gateway_queue (gateway, id);
+"""
+
 
 def _connect() -> sqlite3.Connection:
     """Open a new SQLite connection with WAL mode for better concurrency."""
@@ -119,6 +140,8 @@ def init_db() -> None:
         conn.execute("DROP INDEX IF EXISTS idx_dc")
         conn.execute(_CREATE_INDEX_DC_SQL)
         conn.execute(_CREATE_BOT_STATUS_TABLE_SQL)
+        conn.execute(_CREATE_GATEWAY_QUEUE_TABLE_SQL)
+        conn.execute(_CREATE_GATEWAY_QUEUE_INDEX_SQL)
     logger.info(f"SQLite message store initialised: {_DB_PATH}")
 
 
@@ -320,3 +343,115 @@ def purge_older_than(days: int = 30) -> int:
     if deleted:
         logger.info(f"DB purge: removed {deleted} records older than {days} days")
     return deleted
+
+
+# ===========================================================================
+# Gateway event queue
+# ===========================================================================
+# Events queued for a gateway peer that polls us. See gateway_server.py and
+# TDbridge_Gateway_Protocol.md. All functions are synchronous (call via
+# run_in_executor from async code), matching the rest of this module.
+
+def gateway_enqueue(gateway: str, chat_id: str, event_json: str) -> int:
+    """Append one event to the queue for `gateway`. Returns the new row id
+    (which is also the FIFO delivery order)."""
+    sql = """
+        INSERT INTO gateway_queue (gateway, chat_id, event_json, created_at, delivered_at)
+        VALUES (?, ?, ?, ?, NULL)
+    """
+    with _connect() as conn:
+        cursor = conn.execute(sql, (str(gateway), str(chat_id), str(event_json), time.time()))
+        new_id = cursor.lastrowid
+    logger.debug(f"Gateway queue: enqueued id={new_id} for gateway={gateway}")
+    return int(new_id)
+
+
+def gateway_peek(gateway: str, limit: int = 100) -> list:
+    """Return up to `limit` queued events for `gateway`, oldest first, as a list
+    of dicts {id, chat_id, event_json}. Does NOT mark them delivered."""
+    sql = """
+        SELECT id, chat_id, event_json
+        FROM gateway_queue
+        WHERE gateway = ?
+        ORDER BY id ASC
+        LIMIT ?
+    """
+    with _connect() as conn:
+        rows = conn.execute(sql, (str(gateway), int(limit))).fetchall()
+    return [{"id": r["id"], "chat_id": r["chat_id"], "event_json": r["event_json"]} for r in rows]
+
+
+def gateway_mark_delivered(ids: list) -> None:
+    """Mark the given queue row ids as delivered (sets delivered_at=now).
+    Used for RequireACK gateways, which retain rows until acked."""
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    sql = f"UPDATE gateway_queue SET delivered_at = ? WHERE id IN ({placeholders})"
+    with _connect() as conn:
+        conn.execute(sql, (time.time(), *[int(i) for i in ids]))
+
+
+def gateway_delete(ids: list) -> int:
+    """Delete the given queue row ids. Returns the number of rows removed.
+    Used both for non-RequireACK immediate dequeue and for ack-driven dequeue."""
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    sql = f"DELETE FROM gateway_queue WHERE id IN ({placeholders})"
+    with _connect() as conn:
+        cursor = conn.execute(sql, tuple(int(i) for i in ids))
+    return cursor.rowcount
+
+
+def gateway_delete_by_chat_and_msgids(gateway: str, chat_id: str, message_ids: list) -> int:
+    """Delete queued events for `gateway`/`chat_id` whose payload message_id is
+    in `message_ids`. Used by ack: the client acks by (chat_id, message_ids),
+    not by our internal queue row id. Returns rows removed.
+
+    Because the queue stores the serialized envelope, we match on the message_id
+    inside each event's payload. We do this in Python rather than SQL/JSON1 to
+    avoid depending on the SQLite JSON1 extension being present.
+    """
+    if not message_ids:
+        return 0
+    want = {str(m) for m in message_ids}
+    sql = """
+        SELECT id, event_json FROM gateway_queue
+        WHERE gateway = ? AND chat_id = ?
+    """
+    to_delete = []
+    import json as _json
+    with _connect() as conn:
+        rows = conn.execute(sql, (str(gateway), str(chat_id))).fetchall()
+        for r in rows:
+            try:
+                env = _json.loads(r["event_json"])
+                payload = env.get("payload", {}) or {}
+                mid = payload.get("message_id")
+                if mid is not None and str(mid) in want:
+                    to_delete.append(r["id"])
+            except Exception:
+                continue
+        if to_delete:
+            placeholders = ",".join("?" for _ in to_delete)
+            cursor = conn.execute(
+                f"DELETE FROM gateway_queue WHERE id IN ({placeholders})",
+                tuple(to_delete),
+            )
+            return cursor.rowcount
+    return 0
+
+
+def gateway_queue_depth(gateway: str = None) -> int:
+    """Return the number of queued events, optionally for one gateway.
+    Used by health reporting."""
+    if gateway is None:
+        sql = "SELECT COUNT(*) FROM gateway_queue"
+        args = ()
+    else:
+        sql = "SELECT COUNT(*) FROM gateway_queue WHERE gateway = ?"
+        args = (str(gateway),)
+    with _connect() as conn:
+        row = conn.execute(sql, args).fetchone()
+    return int(row[0]) if row else 0
