@@ -1361,6 +1361,130 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
 
+async def bridge_gateway_message_to_discord(
+    *,
+    tg_group_id: str,
+    tg_msg_id: str,
+    sender_name: str,
+    text: str,
+    reply_to_tg_id: Optional[str] = None,
+) -> Optional[str]:
+    """Bridge a gateway-originated message to Discord (Phase 6a, text-only).
+
+    This is the "central function" of the gateway server: after a message has
+    been placed in the Telegram group (Echo=true, by the caller, who then passes
+    the real message_id here) — or after the client asserts it posted the message
+    itself (Echo=false, client-supplied id) — we mirror it into Discord exactly
+    as if it had arrived as a normal incoming Telegram message.
+
+    Routing is by T_GroupID ALONE (the prod sheet does not model gateways), using
+    the same Active/Inactive/fallback cases as route_tg_to_discord. The message
+    is attributed to `sender_name` (the gateway message's from.first_name, or the
+    gateway name). Returns the Discord message id (as a string) on success, or
+    None if it could not be bridged.
+
+    Attachments are NOT handled here (Phase 4 deferred them in the send path);
+    text only.
+    """
+    logger.info(
+        f"GW→DC: bridging gateway message {tg_msg_id} for group {tg_group_id} "
+        f"(sender {sender_name!r})"
+    )
+
+    # ---- Determine target Discord channel (same cases as TG→DC) ----
+    user_row = sheets_manager.get_user_by_tg_group(tg_group_id)
+    _inactive_row: Optional[dict] = None
+    if not user_row:
+        _inactive_row = sheets_manager.get_user_by_tg_group_inactive(tg_group_id)
+
+    if user_row:
+        dc_channel_id = str(user_row.get("D_ChannelID", "")).strip()
+        dc_user_id    = str(user_row.get("D_ID", "")).strip()
+        user_tag      = f"<@{dc_user_id}>" if dc_user_id else ""
+    elif _inactive_row:
+        dc_channel_id = str(_inactive_row.get("D_ChannelID", "")).strip()
+        dc_user_id    = str(_inactive_row.get("D_ID", "")).strip()
+        user_tag      = f"<@{dc_user_id}>" if dc_user_id else ""
+    else:
+        active_channels = sheets_manager.get_active_channels()
+        if not active_channels:
+            logger.warning(
+                f"GW→DC unroutable | tg_group={tg_group_id} | no active channels"
+            )
+            return None
+        dc_channel_id = active_channels[0]["D_ChannelID"]
+        dc_user_id    = ""
+        user_tag      = ""  # no pseudo-tag for gateway messages
+
+    channel = await _get_discord_channel(dc_channel_id)
+    if channel is None:
+        logger.error(f"GW→DC: Discord channel {dc_channel_id} not found")
+        return None
+    webhook = await _get_discord_webhook(channel)
+    if webhook is None:
+        logger.error(f"GW→DC: webhook unavailable for #{channel.name}")
+        return None
+
+    # ---- Reply resolution ----
+    discord_reply_to_id: Optional[int] = None
+    root_tg_msg_id = tg_msg_id
+    if reply_to_tg_id:
+        loop = asyncio.get_running_loop()
+        parent_record = await loop.run_in_executor(
+            None, db.find_by_tg, tg_group_id, str(reply_to_tg_id)
+        )
+        if parent_record:
+            discord_reply_to_id = int(parent_record["dc_message_id"])
+            root_tg_msg_id = parent_record["root_tg_msg_id"]
+    is_reply = bool(discord_reply_to_id)
+
+    # ---- Build content ----
+    attribution = f"👤 **{sender_name} [GW]**" if is_reply else ""
+    tag_prefix = f"{user_tag}\n" if (user_tag and not is_reply) else ""
+    parts = [p for p in [tag_prefix.rstrip(), attribution, text or ""] if p]
+    content = "\n".join(parts).strip()
+    if len(content) > 2000:
+        content = content[:1997] + "…"
+
+    reference = None
+    if discord_reply_to_id:
+        try:
+            ref_msg = await channel.fetch_message(discord_reply_to_id)
+            reference = ref_msg.to_reference(fail_if_not_exists=False)
+        except Exception:
+            reference = None
+
+    dc_msg = await _send_to_discord(
+        channel, webhook, sender_name, content, [], reference
+    )
+    if dc_msg is None:
+        return None
+    dc_msg_id = _dc_msg_id_str(dc_msg.id)
+
+    # ---- Store mapping (same store as TG→DC, so replies/reactions resolve) ----
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None, db.store_message,
+        tg_group_id, tg_msg_id, dc_channel_id, dc_msg_id, root_tg_msg_id, dc_user_id,
+    )
+
+    _dc_text_esc = content.replace("\n", "\\n")
+    logger.info(
+        f"GW→DC bridged | "
+        f"tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
+        f"sender={sender_name!r} | "
+        f"dc_msg={dc_msg_id} | dc_channel=#{channel.name}({dc_channel_id}) | "
+        f"dc_text={_dc_text_esc!r} | "
+        f"{'reply_to_dc=' + str(discord_reply_to_id) if is_reply else 'new_message'}"
+    )
+    bot_status.bridged_30m += 1
+    try:
+        _dashboard_reporter.save_to_db()
+    except Exception:
+        pass
+    return dc_msg_id
+
+
 async def route_tg_edit_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle an edited Telegram message and mirror the edit to Discord."""
     msg = update.edited_message
@@ -2654,20 +2778,42 @@ async def _startup(discord_client: discord.Client) -> None:
     # reflected accurately (no-op for a client-only instance).
     bot_status.gateway_expected = _gateway_server.enabled
 
-    async def _gateway_send_text(chat_id, text, reply_to):
-        """Echo-path hook: send a text message to a Telegram group and return
-        the list of real message_id(s). Used by the gateway server."""
-        bot = _tg_app.bot if _tg_app else None
-        if bot is None:
-            raise RuntimeError("Telegram app not available")
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=(text or ""),
-            reply_to_message_id=reply_to,
-        )
-        return [sent.message_id]
+    async def _gateway_bridge(*, chat_id, text, reply_to, sender_name, echo, client_msg_id):
+        """The gateway's central function: place the message in Telegram
+        (Echo=true) or accept the client-supplied id (Echo=false), then bridge
+        it to Discord exactly as an incoming Telegram message would be.
 
-    _gateway_server.set_send_text_hook(_gateway_send_text)
+        Returns {"message_ids": [...], "dc_message_id": <str or None>}.
+        """
+        # Step 1: obtain the Telegram message id.
+        if echo:
+            bot = _tg_app.bot if _tg_app else None
+            if bot is None:
+                raise RuntimeError("Telegram app not available")
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=(text or ""),
+                reply_to_message_id=reply_to,
+            )
+            tg_msg_id = sent.message_id
+        else:
+            # Echo=false: the client asserts it posted the message itself and
+            # supplied the id. Nothing is sent to Telegram here.
+            if client_msg_id is None:
+                raise RuntimeError("Echo=false send requires a client-supplied message_id")
+            tg_msg_id = client_msg_id
+
+        # Step 2: bridge to Discord (text-only in Phase 6a).
+        dc_msg_id = await bridge_gateway_message_to_discord(
+            tg_group_id=_tg_group_id_str(chat_id),
+            tg_msg_id=_tg_msg_id_str(tg_msg_id),
+            sender_name=sender_name,
+            text=(text or ""),
+            reply_to_tg_id=(_tg_msg_id_str(reply_to) if reply_to is not None else None),
+        )
+        return {"message_ids": [tg_msg_id], "dc_message_id": dc_msg_id}
+
+    _gateway_server.set_bridge_hook(_gateway_bridge)
     await _gateway_server.start()
     bot_status.gateway_serving = _gateway_server.is_serving()
 

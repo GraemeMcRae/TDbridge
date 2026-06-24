@@ -58,19 +58,21 @@ class GatewayServer:
         self._debug_endpoints: bool = bool(
             getattr(config, "gateway_debug_endpoints", False)
         )
-        # Async hook injected by bot.py to send a text message to Telegram for
-        # the Echo=true path. Signature:
-        #   async def send_text(chat_id: int, text: Optional[str],
-        #                        reply_to: Optional[int]) -> list[int]
-        # Returns the list of real Telegram message_id(s) produced.
-        self._send_text_hook = None
+        # Async hook injected by bot.py implementing the gateway's central
+        # function: place the message in Telegram (Echo=true) or accept the
+        # client-supplied id (Echo=false), then bridge it to Discord. Signature:
+        #   async def bridge(*, chat_id: int, text: Optional[str],
+        #                    reply_to: Optional[int], sender_name: str,
+        #                    echo: bool, client_msg_id: Optional[int]) -> dict
+        # Returns {"message_ids": [...], "dc_message_id": <str or None>}.
+        self._bridge_hook = None
         # asyncio.Event used to wake long-poll waiters when an event is queued.
         # Created lazily in start() on the running loop.
         self._poll_wakeup = None
 
-    def set_send_text_hook(self, hook) -> None:
-        """Inject the async Telegram text-send hook used by the Echo path."""
-        self._send_text_hook = hook
+    def set_bridge_hook(self, hook) -> None:
+        """Inject the async send-and-bridge hook (the gateway's central function)."""
+        self._bridge_hook = hook
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                          #
@@ -241,41 +243,45 @@ class GatewayServer:
                 f"(attachment support is Phase 4)"
             )
 
+        # Derive the sender name for Discord attribution: the gateway message's
+        # from.first_name if present, else the gateway name (per design).
+        from_user = payload.from_user
+        sender_name = (
+            from_user.first_name if (from_user and from_user.first_name)
+            else self._own_gateway
+        )
+
         echo = bool(self._own_def.echo)
-        if echo:
-            if self._send_text_hook is None:
-                return web.json_response({
-                    "protocol_version": gp.PROTOCOL_VERSION,
-                    "status": "error",
-                    "note": "Echo send hook not available",
-                }, status=503)
-            try:
-                msg_ids = await self._send_text_hook(
-                    payload.chat_id, payload.text, payload.reply_to
-                )
-            except Exception as e:
-                logger.warning("Gateway send (echo) failed: %s", e)
-                return web.json_response({
-                    "protocol_version": gp.PROTOCOL_VERSION,
-                    "status": "error",
-                    "note": f"Telegram send failed: {e}",
-                }, status=502)
+        if self._bridge_hook is None:
             return web.json_response({
                 "protocol_version": gp.PROTOCOL_VERSION,
-                "status": "sent",
-                "chat": {"id": payload.chat_id},
-                "message_ids": list(msg_ids),
-                "notes": notes,
-            })
-        else:
-            # Echo=false: accept the client-supplied id; nothing sent to Telegram.
+                "status": "error",
+                "note": "bridge hook not available",
+            }, status=503)
+        try:
+            result = await self._bridge_hook(
+                chat_id=payload.chat_id,
+                text=payload.text,
+                reply_to=payload.reply_to,
+                sender_name=sender_name,
+                echo=echo,
+                client_msg_id=payload.message_id,
+            )
+        except Exception as e:
+            logger.warning("Gateway send/bridge failed: %s", e)
             return web.json_response({
                 "protocol_version": gp.PROTOCOL_VERSION,
-                "status": "accepted",
-                "chat": {"id": payload.chat_id},
-                "message_ids": ([payload.message_id] if payload.message_id is not None else []),
-                "notes": notes,
-            })
+                "status": "error",
+                "note": f"send/bridge failed: {e}",
+            }, status=502)
+        return web.json_response({
+            "protocol_version": gp.PROTOCOL_VERSION,
+            "status": ("sent" if echo else "accepted"),
+            "chat": {"id": payload.chat_id},
+            "message_ids": list(result.get("message_ids", [])),
+            "dc_message_id": result.get("dc_message_id"),
+            "notes": notes,
+        })
 
     async def _handle_poll(self, request: web.Request) -> web.Response:
         """Long-poll for queued events (up to ~10 s). Returns queued events for
