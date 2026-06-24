@@ -313,10 +313,14 @@ class GatewayServer:
                     await asyncio.get_running_loop().run_in_executor(
                         None, db.gateway_mark_delivered, ids
                     )
+                    # Files are retained until ack (client may still download).
                 else:
                     await asyncio.get_running_loop().run_in_executor(
                         None, db.gateway_delete, ids
                     )
+                    # Non-ACK: delivery is the terminal moment — delete any
+                    # attachment files these events referenced.
+                    await self._delete_event_files(events)
                 return web.json_response({
                     "protocol_version": gp.PROTOCOL_VERSION,
                     "events": events,
@@ -352,10 +356,28 @@ class GatewayServer:
                 {"error": "ack endpoint requires event_type 'ack'"}, status=400
             )
         payload = env.payload   # IdsPayload
-        removed = await asyncio.get_running_loop().run_in_executor(
+        loop = asyncio.get_running_loop()
+        # Read the matching queued events first so we can delete their attachment
+        # files once the rows are removed (ack is the terminal moment for
+        # RequireACK gateways — no further download will be requested).
+        matching = await loop.run_in_executor(
+            None, db.gateway_peek, self._own_gateway, 1000
+        )
+        want = {str(m) for m in payload.message_ids}
+        to_clean = []
+        for r in matching:
+            try:
+                ev = json.loads(r["event_json"])
+                mid = ev.get("payload", {}).get("message_id")
+                if mid is not None and str(mid) in want:
+                    to_clean.append(ev)
+            except Exception:
+                continue
+        removed = await loop.run_in_executor(
             None, db.gateway_delete_by_chat_and_msgids,
             self._own_gateway, str(payload.chat_id), payload.message_ids,
         )
+        await self._delete_event_files(to_clean)
         return web.json_response({
             "protocol_version": gp.PROTOCOL_VERSION,
             "status": "ack",
@@ -390,6 +412,28 @@ class GatewayServer:
         promptly. Safe to call from the loop thread."""
         if self._poll_wakeup is not None:
             self._poll_wakeup.set()
+
+    async def _delete_event_files(self, events: list) -> None:
+        """Delete any gateway attachment files referenced by the given event
+        dicts. Called at a terminal moment (non-ACK delivery, or ack), when the
+        files can no longer be requested. No-op for events without attachments
+        (the common case until outbound attachments are wired in a later phase).
+        """
+        refs = []
+        for ev in events:
+            try:
+                for att in (ev.get("payload", {}).get("attachments") or []):
+                    ref = att.get("file_ref")
+                    if ref:
+                        refs.append(ref)
+            except Exception:
+                continue
+        if not refs:
+            return
+        loop = asyncio.get_running_loop()
+        for ref in refs:
+            await loop.run_in_executor(None, gateway_files.delete_file, ref)
+        logger.debug("Gateway: deleted %d attachment file(s) at terminal moment.", len(refs))
 
     # ------------------------------------------------------------------ #
     # Attachments (two-hop: upload → getfile → capability GET)           #
