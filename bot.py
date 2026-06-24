@@ -58,6 +58,7 @@ import db
 import sheets_manager
 from dashboard_reporter import DashboardReporter, status as bot_status
 from gateway_server import GatewayServer
+from gateway_retry import with_retry, RetryGaveUp
 
 # On Linux (server), Telegram updates are received via webhook — the bot runs
 # its own HTTPS server and Telegram POSTs updates to it.
@@ -451,27 +452,42 @@ async def _send_to_discord(
     try:
         if reference is not None:
             # Reply: must use channel.send() — webhook.send() has no reference param
-            dc_msg = await channel.send(
-                content=content,
-                files=files if files else discord.utils.MISSING,
-                reference=reference,
-                mention_author=False,
+            dc_msg = await with_retry(
+                f"DC reply send #{channel.name}",
+                lambda: channel.send(
+                    content=content,
+                    files=files if files else discord.utils.MISSING,
+                    reference=reference,
+                    mention_author=False,
+                ),
+                platform="discord",
             )
         elif webhook is not None:
             # New message: use webhook for custom display name
-            dc_msg = await webhook.send(
-                content=content,
-                username=f"{sender_name} [TG]",
-                files=files if files else discord.utils.MISSING,
-                wait=True,
+            dc_msg = await with_retry(
+                f"DC webhook send #{channel.name}",
+                lambda: webhook.send(
+                    content=content,
+                    username=f"{sender_name} [TG]",
+                    files=files if files else discord.utils.MISSING,
+                    wait=True,
+                ),
+                platform="discord",
             )
         else:
             # Fallback: no webhook available, use plain channel send
-            dc_msg = await channel.send(
-                content=content,
-                files=files if files else discord.utils.MISSING,
+            dc_msg = await with_retry(
+                f"DC channel send #{channel.name}",
+                lambda: channel.send(
+                    content=content,
+                    files=files if files else discord.utils.MISSING,
+                ),
+                platform="discord",
             )
         return dc_msg
+    except RetryGaveUp as e:
+        logger.error(f"Failed to send to Discord #{channel.name} after retries: {e}")
+        return None
     except Exception as e:
         logger.error(f"Failed to send to Discord #{channel.name}: {e}")
         return None
@@ -921,7 +937,11 @@ async def _handle_tg_delete_command(
         if dc_channel:
             try:
                 dc_msg_obj = await dc_channel.fetch_message(int(dc_msg_id))
-                await dc_msg_obj.delete()
+                await with_retry(
+                    f"DC delete #{dc_channel.name}",
+                    lambda: dc_msg_obj.delete(),
+                    platform="discord",
+                )
                 discord_deleted = True
                 logger.info(
                     f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
@@ -1517,7 +1537,11 @@ async def route_tg_edit_to_discord(update: Update, context: ContextTypes.DEFAULT
     # Cascade 1: try to edit the original Discord message
     try:
         dc_msg = await channel.fetch_message(dc_msg_id)
-        await dc_msg.edit(content=edit_prefix + new_text)
+        await with_retry(
+            f"DC edit #{channel.name}",
+            lambda: dc_msg.edit(content=edit_prefix + new_text),
+            platform="discord",
+        )
         logger.info(f"Edited Discord message {dc_msg_id} for TG edit {tg_msg_id}")
         return
     except discord.NotFound:
@@ -1636,7 +1660,11 @@ async def route_tg_reaction_to_discord(update: Update, context: ContextTypes.DEF
         native_ok = False
         if behavior in ("react", "both"):
             try:
-                await ref_msg.add_reaction(emoji_str)
+                await with_retry(
+                    f"DC add_reaction #{channel.name}",
+                    lambda: ref_msg.add_reaction(emoji_str),
+                    platform="discord",
+                )
                 native_ok = True
             except Exception as e:
                 logger.warning(
