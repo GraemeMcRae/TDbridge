@@ -2035,19 +2035,35 @@ class TDbridgeDiscordClient(discord.Client):
         except Exception as e:
             logger.error(f"Failed to send Discord message to Telegram group {tg_group_id}: {e}")
 
-    async def on_message_edit(
-        self, before: discord.Message, after: discord.Message
+    async def on_raw_message_edit(
+        self, payload: discord.RawMessageUpdateEvent
     ) -> None:
-        """Bridge a Discord message edit to Telegram."""
-        if after.author == self.user or after.webhook_id:
+        """Bridge a Discord message edit to Telegram.
+
+        Uses the RAW event so edits to messages not in discord.py's cache (e.g.
+        created before the most recent restart) still bridge. The raw event
+        carries the new fields in payload.data (the gateway payload) rather than
+        a discord.Message, so we read content/author from there.
+        """
+        data = payload.data or {}
+        # Ignore edits from the bot itself or from webhooks (our own bridged
+        # messages are posted via webhook).
+        if "webhook_id" in data:
+            return
+        author = data.get("author") or {}
+        author_id = str(author.get("id", ""))
+        if self.user and author_id == str(self.user.id):
+            return
+        # Some edit events (embeds resolving, pins) carry no content change.
+        if "content" not in data:
             return
 
-        dc_channel_id = str(after.channel.id)
-        dc_msg_id     = str(after.id)
+        dc_channel_id = str(payload.channel_id)
+        dc_msg_id     = str(payload.message_id)
         sender_name   = (
-            after.author.nick
-            or after.author.display_name
-            or after.author.name
+            author.get("global_name")
+            or author.get("username")
+            or "Discord user"
         )
 
         loop = asyncio.get_running_loop()
@@ -2057,7 +2073,7 @@ class TDbridgeDiscordClient(discord.Client):
 
         tg_group_id  = record["tg_group_id"]
         tg_msg_id    = int(record["tg_message_id"])
-        resolved_edit = _resolve_discord_mentions(after.content)
+        resolved_edit = _resolve_discord_mentions(data.get("content", ""))
         new_text      = f"✏️ EDIT — 👤 {sender_name} (Discord): {resolved_edit}"
 
         tg_bot: TelegramBot = _tg_app.bot
@@ -2083,16 +2099,16 @@ class TDbridgeDiscordClient(discord.Client):
         except Exception as e:
             logger.error(f"Failed to post edit fallback to Telegram: {e}")
 
-    async def on_message_delete(self, message: discord.Message) -> None:
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         """Bridge a Discord message deletion to Telegram.
 
-        A single Discord message may have produced multiple Telegram messages
-        (e.g. a media group with several photos).  We look up ALL of them and
-        act on each one, so that deleting the Discord message removes every
-        corresponding Telegram message.
+        Uses the RAW event (not on_message_delete) so it fires even for messages
+        not in discord.py's in-memory cache — notably messages created before the
+        most recent restart. A single Discord message may have produced multiple
+        Telegram messages (e.g. a media group); we act on each.
         """
-        dc_channel_id = str(message.channel.id)
-        dc_msg_id     = str(message.id)
+        dc_channel_id = str(payload.channel_id)
+        dc_msg_id     = str(payload.message_id)
 
         loop = asyncio.get_running_loop()
         records = await loop.run_in_executor(
@@ -2100,6 +2116,10 @@ class TDbridgeDiscordClient(discord.Client):
         )
         if not records:
             return
+
+        # Resolve a channel name for logging (best-effort).
+        chan = self.get_channel(payload.channel_id)
+        dc_channel_name = getattr(chan, "name", str(payload.channel_id))
 
         tg_bot: TelegramBot = _tg_app.bot
         # dc_msg_delete_behavior: "delete" | "ignore" | "<any other string>"
@@ -2163,7 +2183,7 @@ class TDbridgeDiscordClient(discord.Client):
         logger.info(
             f"DC→TG delete | "
             f"dc_msg={dc_msg_id} | "
-            f"dc_channel=#{message.channel.name}({dc_channel_id}) | "
+            f"dc_channel=#{dc_channel_name}({dc_channel_id}) | "
             f"tg_group={tg_group_id} | "
             f"tg_msgs_deleted={deleted_tg} | "
             f"tg_msgs_failed={[t for t, _ in failed_tg]}"
@@ -2177,20 +2197,33 @@ class TDbridgeDiscordClient(discord.Client):
             f"DC→TG delete | db_rows_removed={rows_removed} for dc_msg={dc_msg_id}"
         )
 
-    async def on_reaction_add(
-        self, reaction: discord.Reaction, user: discord.User
+    async def on_raw_reaction_add(
+        self, payload: discord.RawReactionActionEvent
     ) -> None:
-        """Bridge a Discord reaction to Telegram as a reply message."""
-        if user == self.user:
+        """Bridge a Discord reaction to Telegram as a reply message.
+
+        Uses the RAW event so it fires for messages not in discord.py's cache
+        (e.g. created before the most recent restart).
+        """
+        if payload.user_id == self.user.id:
             return
 
-        dc_channel_id = str(reaction.message.channel.id)
-        dc_msg_id     = str(reaction.message.id)
-        user_name     = (
-            getattr(user, "nick", None)
-            or user.display_name
-            or user.name
-        )
+        dc_channel_id = str(payload.channel_id)
+        dc_msg_id     = str(payload.message_id)
+        # payload.member is present for guild reactions; fall back to fetching
+        # the user if needed.
+        member = payload.member
+        if member is not None:
+            user_id   = member.id
+            user_name = (
+                getattr(member, "nick", None)
+                or member.display_name
+                or member.name
+            )
+        else:
+            user_id   = payload.user_id
+            fetched   = self.get_user(payload.user_id)
+            user_name = (fetched.display_name if fetched else str(payload.user_id))
 
         loop = asyncio.get_running_loop()
         record = await loop.run_in_executor(None, db.find_by_dc, dc_channel_id, dc_msg_id)
@@ -2199,7 +2232,7 @@ class TDbridgeDiscordClient(discord.Client):
 
         tg_group_id = record["tg_group_id"]
         tg_msg_id   = int(record["tg_message_id"])
-        emoji_str   = str(reaction.emoji)
+        emoji_str   = str(payload.emoji)
 
         behavior = config.reactions_dtot
         if behavior == "neither":
@@ -2253,7 +2286,7 @@ class TDbridgeDiscordClient(discord.Client):
         logger.info(
             f"DC→TG reaction | "
             f"dc_msg={dc_msg_id} | dc_channel={dc_channel_id} | "
-            f"user={user_name!r}({str(user.id)}) | emoji={emoji_str} | "
+            f"user={user_name!r}({str(user_id)}) | emoji={emoji_str} | "
             f"tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
             f"behavior={behavior} | "
             f"native={'ok' if native_ok else 'skipped/failed'} | "
