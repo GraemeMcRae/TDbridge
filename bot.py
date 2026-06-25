@@ -1746,6 +1746,11 @@ class TDbridgeDiscordClient(discord.Client):
         # ---- Determine target Telegram group ----
         tg_group_id: Optional[str] = None
         root_tg_msg_id: Optional[str] = None
+        # The Telegram message id to reply to: the IMMEDIATE parent's own id, so
+        # the reply tree is preserved faithfully (not flattened to the root).
+        # Stays None when this is not a reply or the parent isn't on the TG side,
+        # in which case we post a new message rather than walking toward the root.
+        immediate_reply_tg_id: Optional[str] = None
 
         loop = asyncio.get_running_loop()
 
@@ -1758,6 +1763,7 @@ class TDbridgeDiscordClient(discord.Client):
             if parent_record:
                 tg_group_id    = parent_record["tg_group_id"]
                 root_tg_msg_id = parent_record["root_tg_msg_id"]
+                immediate_reply_tg_id = parent_record["tg_message_id"]
 
         # Case 2: First tagged user OR role (left-to-right in message text)
         # that is Active, has a T_GroupID, and has a D_ChannelID matching
@@ -1923,9 +1929,9 @@ class TDbridgeDiscordClient(discord.Client):
         tg_bot: TelegramBot = _tg_app.bot
 
         reply_to_telegram_id: Optional[int] = None
-        if root_tg_msg_id:
+        if immediate_reply_tg_id:
             try:
-                reply_to_telegram_id = int(root_tg_msg_id)
+                reply_to_telegram_id = int(immediate_reply_tg_id)
             except (ValueError, TypeError):
                 pass
 
