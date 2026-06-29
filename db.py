@@ -444,8 +444,18 @@ def gateway_delete_by_chat_and_msgids(gateway: str, chat_id: str, message_ids: l
             try:
                 env = _json.loads(r["event_json"])
                 payload = env.get("payload", {}) or {}
+                # An event may identify its message(s) by either a single
+                # message_id (message/edited_message/reaction) or a list of
+                # message_ids (deletion/ack). Match if ANY of those ids is acked,
+                # so deletion events — which carry message_ids, not message_id —
+                # can be dequeued. (Without this, such events loop forever.)
+                ids = set()
                 mid = payload.get("message_id")
-                if mid is not None and str(mid) in want:
+                if mid is not None:
+                    ids.add(str(mid))
+                for m in (payload.get("message_ids") or []):
+                    ids.add(str(m))
+                if ids & want:
                     to_delete.append(r["id"])
             except Exception:
                 continue

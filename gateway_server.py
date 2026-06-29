@@ -368,8 +368,14 @@ class GatewayServer:
         for r in matching:
             try:
                 ev = json.loads(r["event_json"])
-                mid = ev.get("payload", {}).get("message_id")
-                if mid is not None and str(mid) in want:
+                p = ev.get("payload", {}) or {}
+                ids = set()
+                mid = p.get("message_id")
+                if mid is not None:
+                    ids.add(str(mid))
+                for m in (p.get("message_ids") or []):
+                    ids.add(str(m))
+                if ids & want:
                     to_clean.append(ev)
             except Exception:
                 continue
