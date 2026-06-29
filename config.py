@@ -227,6 +227,13 @@ class Config:
             # Unset/blank → platform default (polling on Windows/WSL)
             self.telegram_use_polling = (self.platform == "Windows")
 
+        # Maximum messages allowed in ~1 second per Telegram group before the
+        # burst circuit breaker trips (0 = disabled). Counts total throughput
+        # across both directions and the gateway. See gateway_ratelimit.py.
+        self.telegram_burstrate: int = int(
+            os.getenv(self.env_prefix + "TELEGRAM_BURSTRATE", "0") or "0"
+        )
+
         # Telegram webhook
         # TELEGRAM_WEBHOOK_URL must be a publicly reachable HTTPS URL whose
         # path Telegram will POST updates to.

@@ -229,6 +229,26 @@ def get_active_tg_groups() -> list[dict]:
         return [r for r in group_by_id.values() if _is_active(r.get("T_Status", ""))]
 
 
+def set_group_status_in_memory(tg_group_id: str, status: str) -> bool:
+    """Set a T_Group row's T_Status in the IN-MEMORY cache only — never written
+    back to the sheet. Used by the burst circuit breaker to mark a group
+    "Excessive Rate" (which _is_active() treats as not-active, suppressing all
+    bridging). The next cache refresh re-reads the real status, auto-resetting.
+    Returns True if the group was found and updated.
+    """
+    key = _normalise_id(tg_group_id)
+    with _lock:
+        row = group_by_id.get(key)
+        if row is None:
+            return False
+        row["T_Status"] = status
+        # Keep the composite-keyed cache consistent if present.
+        for (gid, _gw), grow in group_by_id_gateway.items():
+            if gid == key:
+                grow["T_Status"] = status
+    return True
+
+
 def _is_active(status: str) -> bool:
     """Return True if the status string contains 'Active' (case-insensitive)."""
     return "active" in status.lower() and "inactive" not in status.lower()

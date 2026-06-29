@@ -59,6 +59,8 @@ import sheets_manager
 from dashboard_reporter import DashboardReporter, status as bot_status
 from gateway_server import GatewayServer
 from gateway_retry import with_retry, RetryGaveUp
+import gateway_protocol as gp
+import gateway_ratelimit
 
 # On Linux (server), Telegram updates are received via webhook — the bot runs
 # its own HTTPS server and Telegram POSTs updates to it.
@@ -1029,6 +1031,16 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
     tg_chat = update.effective_chat
     tg_group_id = _tg_group_id_str(tg_chat.id)
     tg_msg_id   = _tg_msg_id_str(msg.message_id)
+
+    # ---- Burst circuit breaker (total throughput protection) ----
+    if not gateway_ratelimit.check_and_record(tg_group_id, config.telegram_burstrate):
+        # Tripped: mark the group "Excessive Rate" in memory (suppresses all
+        # bridging + gateway-out until the next cache refresh re-reads it).
+        sheets_manager.set_group_status_in_memory(
+            tg_group_id, gateway_ratelimit.STATUS_EXCESSIVE_RATE
+        )
+        return
+
     sender_name = (
         msg.from_user.full_name if msg.from_user else tg_chat.title or "Unknown"
     )
@@ -1183,6 +1195,13 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
     # ---- Determine reply-chain root ----
     reply_to_tg_id: Optional[str] = None
     discord_reply_to_id: Optional[int] = None
+    # origin_gateway inherited from the reply-parent (propagates down the tree);
+    # blank for a non-reply message (never gateway-origin unless it came in via
+    # the gateway, which is handled in bridge_gateway_message_to_discord).
+    inherited_origin_gateway: str = ""
+    # The immediate parent's own tg id, used when enqueuing an outbound reply
+    # event so the client learns which of its messages was replied to.
+    parent_immediate_tg_id: Optional[str] = None
 
     if msg.reply_to_message:
         parent_tg_id = _tg_msg_id_str(msg.reply_to_message.message_id)
@@ -1193,6 +1212,8 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         if parent_record:
             discord_reply_to_id = int(parent_record["dc_message_id"])
             reply_to_tg_id      = parent_record["root_tg_msg_id"]
+            inherited_origin_gateway = parent_record.get("origin_gateway", "") or ""
+            parent_immediate_tg_id = parent_record["tg_message_id"]
         root_tg_msg_id = reply_to_tg_id or tg_msg_id
     else:
         root_tg_msg_id = tg_msg_id  # this message IS the root
@@ -1334,6 +1355,7 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         dc_msg_id,
         root_tg_msg_id,
         dc_user_id,
+        inherited_origin_gateway,
     )
     # Detailed TG→DC bridge log — all key fields on one line for easy grep/research
     _tg_raw_text = (msg.text or msg.caption or "").replace("\n", "\\n")
@@ -1380,6 +1402,103 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
 
+    # If this Telegram message is a reply to a gateway-origin message, the reply
+    # also flows back out the gateway to the client.
+    if inherited_origin_gateway:
+        await _gw_enqueue_outbound_message(
+            origin_gateway=inherited_origin_gateway,
+            tg_group_id=tg_group_id,
+            tg_msg_id=tg_msg_id,
+            text=(msg.text or msg.caption or ""),
+            sender_name=sender_name,
+            reply_to_tg_id=parent_immediate_tg_id,
+        )
+
+
+async def _gw_enqueue_outbound_message(
+    origin_gateway: str, tg_group_id: str, tg_msg_id: str,
+    text: str, sender_name: str, reply_to_tg_id: Optional[str],
+    edited: bool = False,
+) -> None:
+    """Enqueue an outbound 'message' (or 'edited_message') event for the gateway
+    client — used when a reply to (or edit of) a gateway-origin message occurs."""
+    if not _gateway_server.is_serving():
+        return
+    try:
+        gid = int(tg_group_id)
+        mid = int(tg_msg_id)
+    except (ValueError, TypeError):
+        return
+    reply_to = None
+    if reply_to_tg_id:
+        try:
+            reply_to = int(reply_to_tg_id)
+        except (ValueError, TypeError):
+            reply_to = None
+    env = gp.make_message(
+        origin_gateway, gid,
+        message_id=mid,
+        text=text,
+        reply_to=reply_to,
+        from_user=gp.User(first_name=sender_name, is_synthetic=True),
+        edited=edited,
+    )
+    await _gateway_server.enqueue_outbound(
+        origin_gateway, gid, env.to_json(include_secret=False)
+    )
+    logger.info(
+        f"GW outbound | gateway={origin_gateway} | type="
+        f"{'edited_message' if edited else 'message'} | "
+        f"tg_group={tg_group_id} | tg_msg={tg_msg_id} | "
+        f"reply_to={reply_to} | sender={sender_name!r}"
+    )
+
+
+async def _gw_enqueue_outbound_reaction(
+    origin_gateway: str, tg_group_id: str, tg_msg_id: str,
+    emoji: list, sender_name: str,
+) -> None:
+    """Enqueue an outbound 'reaction' event for the gateway client."""
+    if not _gateway_server.is_serving():
+        return
+    try:
+        gid = int(tg_group_id)
+        mid = int(tg_msg_id)
+    except (ValueError, TypeError):
+        return
+    env = gp.make_reaction(
+        origin_gateway, gid, mid, list(emoji),
+        from_user=gp.User(first_name=sender_name, is_synthetic=True),
+    )
+    await _gateway_server.enqueue_outbound(
+        origin_gateway, gid, env.to_json(include_secret=False)
+    )
+    logger.info(
+        f"GW outbound | gateway={origin_gateway} | type=reaction | "
+        f"tg_group={tg_group_id} | tg_msg={tg_msg_id} | emoji={emoji}"
+    )
+
+
+async def _gw_enqueue_outbound_deletion(
+    origin_gateway: str, tg_group_id: str, tg_msg_ids: list,
+) -> None:
+    """Enqueue an outbound 'deletion' event for the gateway client."""
+    if not _gateway_server.is_serving():
+        return
+    try:
+        gid = int(tg_group_id)
+        mids = [int(m) for m in tg_msg_ids]
+    except (ValueError, TypeError):
+        return
+    env = gp.make_deletion(origin_gateway, gid, mids)
+    await _gateway_server.enqueue_outbound(
+        origin_gateway, gid, env.to_json(include_secret=False)
+    )
+    logger.info(
+        f"GW outbound | gateway={origin_gateway} | type=deletion | "
+        f"tg_group={tg_group_id} | tg_msgs={mids}"
+    )
+
 
 async def bridge_gateway_message_to_discord(
     *,
@@ -1388,6 +1507,7 @@ async def bridge_gateway_message_to_discord(
     sender_name: str,
     text: str,
     reply_to_tg_id: Optional[str] = None,
+    origin_gateway: str = "",
 ) -> Optional[str]:
     """Bridge a gateway-originated message to Discord (Phase 6a, text-only).
 
@@ -1482,10 +1602,13 @@ async def bridge_gateway_message_to_discord(
     dc_msg_id = _dc_msg_id_str(dc_msg.id)
 
     # ---- Store mapping (same store as TG→DC, so replies/reactions resolve) ----
+    # Mark this message with its origin gateway so that replies/reactions/edits/
+    # deletions concerning it (or its descendants) flow back out the gateway.
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None, db.store_message,
         tg_group_id, tg_msg_id, dc_channel_id, dc_msg_id, root_tg_msg_id, dc_user_id,
+        origin_gateway,
     )
 
     _dc_text_esc = content.replace("\n", "\\n")
@@ -1533,6 +1656,19 @@ async def route_tg_edit_to_discord(update: Update, context: ContextTypes.DEFAULT
 
     new_text = msg.text or msg.caption or ""
     edit_prefix = f"✏️ EDIT — 👤 **{sender_name} [TG]**\n"
+    origin_gateway = record.get("origin_gateway", "") or ""
+
+    async def _enqueue_tg_edit_outbound():
+        if origin_gateway:
+            await _gw_enqueue_outbound_message(
+                origin_gateway=origin_gateway,
+                tg_group_id=str(tg_group_id),
+                tg_msg_id=str(tg_msg_id),
+                text=new_text,
+                sender_name=sender_name,
+                reply_to_tg_id=None,
+                edited=True,
+            )
 
     # Cascade 1: try to edit the original Discord message
     try:
@@ -1543,6 +1679,7 @@ async def route_tg_edit_to_discord(update: Update, context: ContextTypes.DEFAULT
             platform="discord",
         )
         logger.info(f"Edited Discord message {dc_msg_id} for TG edit {tg_msg_id}")
+        await _enqueue_tg_edit_outbound()
         return
     except discord.NotFound:
         pass
@@ -1566,6 +1703,7 @@ async def route_tg_edit_to_discord(update: Update, context: ContextTypes.DEFAULT
             reference=reference,
             mention_author=False,
         )
+        await _enqueue_tg_edit_outbound()
     except Exception as e:
         logger.error(f"Failed to post edit fallback to Discord: {e}")
 
@@ -1689,6 +1827,18 @@ async def route_tg_reaction_to_discord(update: Update, context: ContextTypes.DEF
             f"behavior={behavior} | native={'ok' if native_ok else 'skipped/failed'} | "
             f"reply={'ok' if reply_ok else 'skipped'}"
         )
+
+        # If the reacted-to message is gateway-origin, the reaction flows out.
+        origin_gateway = record.get("origin_gateway", "") or ""
+        if origin_gateway:
+            emoji_list = [getattr(r, "emoji", "?") for r in new_reactions]
+            await _gw_enqueue_outbound_reaction(
+                origin_gateway=origin_gateway,
+                tg_group_id=str(tg_group_id),
+                tg_msg_id=str(tg_msg_id),
+                emoji=emoji_list,
+                sender_name=actor_name,
+            )
     except Exception as e:
         logger.warning(
             f"TG→DC reaction | tg_msg={tg_msg_id} | dc_msg={dc_msg_id} | "
@@ -1751,6 +1901,9 @@ class TDbridgeDiscordClient(discord.Client):
         # Stays None when this is not a reply or the parent isn't on the TG side,
         # in which case we post a new message rather than walking toward the root.
         immediate_reply_tg_id: Optional[str] = None
+        # origin_gateway inherited from the reply-parent (propagates down the
+        # tree); blank for a non-reply message.
+        inherited_origin_gateway: str = ""
 
         loop = asyncio.get_running_loop()
 
@@ -1764,6 +1917,7 @@ class TDbridgeDiscordClient(discord.Client):
                 tg_group_id    = parent_record["tg_group_id"]
                 root_tg_msg_id = parent_record["root_tg_msg_id"]
                 immediate_reply_tg_id = parent_record["tg_message_id"]
+                inherited_origin_gateway = parent_record.get("origin_gateway", "") or ""
 
         # Case 2: First tagged user OR role (left-to-right in message text)
         # that is Active, has a T_GroupID, and has a D_ChannelID matching
@@ -1919,6 +2073,15 @@ class TDbridgeDiscordClient(discord.Client):
                 logger.info(unroutable_msg)
             return
 
+        # ---- Burst circuit breaker (total throughput protection) ----
+        # Now that the target group is known, count this message toward the
+        # group's rate. If tripped, mark it "Excessive Rate" in memory and stop.
+        if not gateway_ratelimit.check_and_record(tg_group_id, config.telegram_burstrate):
+            sheets_manager.set_group_status_in_memory(
+                tg_group_id, gateway_ratelimit.STATUS_EXCESSIVE_RATE
+            )
+            return
+
         # ---- Build message text ----
         # Resolve <@id> and <#id> Discord mention tokens to readable names
         # before sending to Telegram, where raw snowflake IDs are meaningless.
@@ -1989,6 +2152,7 @@ class TDbridgeDiscordClient(discord.Client):
                         dc_msg_id,
                         _root,
                         str(message.author.id),
+                        inherited_origin_gateway,
                     )
                 if len(tg_all_ids) > 1:
                     logger.info(
@@ -2038,6 +2202,18 @@ class TDbridgeDiscordClient(discord.Client):
                     f"tg_text={_tg_text_esc!r}"
                 )
 
+                # If this Discord message is a reply to a gateway-origin
+                # message, the reply also flows back out the gateway.
+                if inherited_origin_gateway and tg_msg_id:
+                    await _gw_enqueue_outbound_message(
+                        origin_gateway=inherited_origin_gateway,
+                        tg_group_id=tg_group_id,
+                        tg_msg_id=tg_msg_id,
+                        text=text,
+                        sender_name=sender_name,
+                        reply_to_tg_id=immediate_reply_tg_id,
+                    )
+
         except Exception as e:
             logger.error(f"Failed to send Discord message to Telegram group {tg_group_id}: {e}")
 
@@ -2079,10 +2255,25 @@ class TDbridgeDiscordClient(discord.Client):
 
         tg_group_id  = record["tg_group_id"]
         tg_msg_id    = int(record["tg_message_id"])
+        origin_gateway = record.get("origin_gateway", "") or ""
         resolved_edit = _resolve_discord_mentions(data.get("content", ""))
         new_text      = f"✏️ EDIT — 👤 {sender_name} (Discord): {resolved_edit}"
 
         tg_bot: TelegramBot = _tg_app.bot
+
+        async def _enqueue_edit_outbound():
+            # An edit of a gateway-origin message flows back out the gateway as
+            # an edited_message carrying the new (resolved) text.
+            if origin_gateway:
+                await _gw_enqueue_outbound_message(
+                    origin_gateway=origin_gateway,
+                    tg_group_id=str(tg_group_id),
+                    tg_msg_id=str(tg_msg_id),
+                    text=resolved_edit,
+                    sender_name=sender_name,
+                    reply_to_tg_id=None,
+                    edited=True,
+                )
 
         # Cascade 1: try to edit the Telegram message
         try:
@@ -2091,6 +2282,7 @@ class TDbridgeDiscordClient(discord.Client):
                 message_id=tg_msg_id,
                 text=new_text,
             )
+            await _enqueue_edit_outbound()
             return
         except Exception as e:
             logger.warning(f"Could not edit TG message {tg_msg_id}: {e}")
@@ -2102,6 +2294,7 @@ class TDbridgeDiscordClient(discord.Client):
                 text=new_text,
                 reply_to_message_id=tg_msg_id,
             )
+            await _enqueue_edit_outbound()
         except Exception as e:
             logger.error(f"Failed to post edit fallback to Telegram: {e}")
 
@@ -2194,6 +2387,22 @@ class TDbridgeDiscordClient(discord.Client):
             f"tg_msgs_deleted={deleted_tg} | "
             f"tg_msgs_failed={[t for t, _ in failed_tg]}"
         )
+
+        # If any of the deleted messages were gateway-origin, the deletion also
+        # flows back out the gateway. (All records share one origin_gateway, set
+        # when the message was bridged / inherited down its reply tree.)
+        _origin_gateway = ""
+        for r in records:
+            og = r.get("origin_gateway", "") or ""
+            if og:
+                _origin_gateway = og
+                break
+        if _origin_gateway:
+            await _gw_enqueue_outbound_deletion(
+                origin_gateway=_origin_gateway,
+                tg_group_id=str(tg_group_id),
+                tg_msg_ids=tg_msg_ids,
+            )
 
         # Remove all DB records for this Discord message after attempting deletion
         rows_removed = await loop.run_in_executor(
@@ -2298,6 +2507,18 @@ class TDbridgeDiscordClient(discord.Client):
             f"native={'ok' if native_ok else 'skipped/failed'} | "
             f"reply={'ok' if reply_ok else 'skipped'}"
         )
+
+        # If the reacted-to message is gateway-origin, the reaction also flows
+        # back out the gateway to the client.
+        origin_gateway = record.get("origin_gateway", "") or ""
+        if origin_gateway:
+            await _gw_enqueue_outbound_reaction(
+                origin_gateway=origin_gateway,
+                tg_group_id=str(tg_group_id),
+                tg_msg_id=str(tg_msg_id),
+                emoji=[emoji_str],
+                sender_name=user_name,
+            )
 
 
 # ===========================================================================
@@ -2450,6 +2671,10 @@ async def _sheets_refresh_loop() -> None:
         await asyncio.sleep(config.sheets_refresh_interval)
         logger.info("Scheduled Sheets cache refresh starting")
         await sheets_manager.refresh_async()
+        # The refresh re-read every group's real T_Status from the sheet, so any
+        # group the burst circuit breaker had marked "Excessive Rate" in memory
+        # is now restored — clear the breaker's tripped state so it can flow again.
+        gateway_ratelimit.reset_all_tripped()
         logger.info(sheets_manager.status_summary())
 
 
@@ -2877,6 +3102,7 @@ async def _startup(discord_client: discord.Client) -> None:
             sender_name=sender_name,
             text=(text or ""),
             reply_to_tg_id=(_tg_msg_id_str(reply_to) if reply_to is not None else None),
+            origin_gateway=config.own_gateway,
         )
         return {"message_ids": [tg_msg_id], "dc_message_id": dc_msg_id}
 

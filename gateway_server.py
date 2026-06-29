@@ -413,6 +413,17 @@ class GatewayServer:
         if self._poll_wakeup is not None:
             self._poll_wakeup.set()
 
+    async def enqueue_outbound(self, gateway: str, chat_id, event_json: str) -> None:
+        """Enqueue an outbound event for a gateway client to poll, and wake any
+        waiting long-poll. Called by the bot when a reply/reaction/deletion/edit
+        concerns a gateway-originated message. `gateway` is the destination
+        gateway name (the message's origin_gateway)."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, db.gateway_enqueue, str(gateway), str(chat_id), event_json
+        )
+        self._notify_poll_waiters()
+
     async def _delete_event_files(self, events: list) -> None:
         """Delete any gateway attachment files referenced by the given event
         dicts. Called at a terminal moment (non-ACK delivery, or ack), when the

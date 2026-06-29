@@ -393,9 +393,28 @@ class DashboardReporter:
                 poll_unhealthy = True
 
         overall     = override_status or self._compute_status(locked_min, poll_unhealthy)
+
+        # Burst circuit-breaker trips during this period → ERROR. Only consume
+        # the counter on a real periodic emit (reset_counters=True) so startup/
+        # shutdown emits don't swallow it.
+        cb_trips = 0
+        if reset_counters:
+            try:
+                import gateway_ratelimit
+                cb_trips = gateway_ratelimit.take_trip_count()
+            except Exception:
+                cb_trips = 0
+        if cb_trips > 0 and not override_status:
+            overall = "ERROR"
+
         summary     = override_summary or self._build_summary(
             overall, locked_min, poll_unhealthy, poll_ok, poll_err
         )
+        if cb_trips > 0 and not override_summary:
+            summary = (
+                f"BURST CIRCUIT BREAKER tripped {cb_trips} time(s) this period — "
+                f"messages were dropped; investigate (routing loop or errant client)"
+            )
 
         dc_str     = "connected" if s.dc_connected else "disconnected"
         sheets_str = "ok" if s.sheets_last_ok else "error"
@@ -420,6 +439,7 @@ class DashboardReporter:
             f"bridged_30m={s.bridged_30m} | "
             f"poll_ok={poll_str} | "
             f"gw={gw_str} | "
+            f"cb_trips={cb_trips} | "
             f"summary={summary}"
         )
 

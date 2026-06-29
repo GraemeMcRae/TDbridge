@@ -31,6 +31,8 @@ TEST_TELEGRAM_WEBHOOK_PORT=8088
 TEST_TELEGRAM_WEBHOOK_SECRET="<random-secret>"
 # Force polling mode instead of webhook mode (true/false; default is false on VPS Linux, default is true on Windows Gitbash or Windows WSL2).
 TEST_TELEGRAM_USE_POLLING=true
+# Max messages allowed in ~1 second per Telegram Group before the burst circuit breaker trips (0 = disabled). Curtails runaway loops.
+TEST_TELEGRAM_BURSTRATE=10
 # Name of the gateway this instance owns (acts as server for); empty = client-only. See TDbridge_Gateway_Protocol.md
 TEST_OWN_GATEWAY=""
 # Internal localhost port the gateway server binds (behind stunnel); external 8089 maps here. Server-side only.
@@ -94,6 +96,8 @@ PROD_TELEGRAM_WEBHOOK_PORT=8444
 PROD_TELEGRAM_WEBHOOK_SECRET="<random-secret>"
 # Force polling mode instead of webhook mode (true/false; default is false on VPS Linux, default is true on Windows Gitbash or Windows WSL2).
 PROD_TELEGRAM_USE_POLLING=true
+# Max messages allowed in ~1 second per Telegram Group before the burst circuit breaker trips (0 = disabled). Curtails runaway loops.
+PROD_TELEGRAM_BURSTRATE=10
 # Name of the gateway this instance owns (acts as server for); empty = client-only. See TDbridge_Gateway_Protocol.md
 PROD_OWN_GATEWAY="TDbridge_gw"
 # Internal localhost port the gateway server binds (behind stunnel); external 8445 maps here. Server-side only.

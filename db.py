@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS message_map (
     dc_message_id   TEXT    NOT NULL,
     root_tg_msg_id  TEXT    NOT NULL,
     dc_user_id      TEXT    NOT NULL DEFAULT '',
+    origin_gateway  TEXT    NOT NULL DEFAULT '',
     created_at      REAL    NOT NULL
 );
 """
@@ -144,6 +145,13 @@ def init_db() -> None:
         conn.execute(_CREATE_GATEWAY_QUEUE_INDEX_SQL)
         conn.execute(_CREATE_GATEWAY_FILES_TABLE_SQL)
         conn.execute(_CREATE_GATEWAY_FILES_TOKEN_INDEX_SQL)
+        # Migration: add origin_gateway to message_map if an older DB lacks it.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(message_map)").fetchall()}
+        if "origin_gateway" not in cols:
+            conn.execute(
+                "ALTER TABLE message_map ADD COLUMN origin_gateway TEXT NOT NULL DEFAULT ''"
+            )
+            logger.info("DB migration: added origin_gateway column to message_map")
     logger.info(f"SQLite message store initialised: {_DB_PATH}")
 
 
@@ -154,6 +162,7 @@ def store_message(
     dc_message_id: str,
     root_tg_msg_id: str,
     dc_user_id: str = "",
+    origin_gateway: str = "",
 ) -> None:
     """Store a Telegram ↔ Discord message ID mapping.
 
@@ -170,12 +179,15 @@ def store_message(
                         For a new (non-reply) message, pass tg_message_id here.
         dc_user_id:     Discord user ID for @mention attribution (may be empty
                         if the Telegram sender has no Discord mapping)
+        origin_gateway: Name of the gateway this message originated through (or
+                        inherited from its reply-parent), or "" if not gateway-
+                        originated. Drives outbound gateway event enqueueing.
     """
     sql = """
         INSERT OR REPLACE INTO message_map
             (tg_group_id, tg_message_id, dc_channel_id, dc_message_id,
-             root_tg_msg_id, dc_user_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+             root_tg_msg_id, dc_user_id, origin_gateway, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _connect() as conn:
         conn.execute(sql, (
@@ -185,10 +197,12 @@ def store_message(
             str(dc_message_id),
             str(root_tg_msg_id),
             str(dc_user_id),
+            str(origin_gateway),
             time.time(),
         ))
     logger.debug(
         f"DB store: tg({tg_group_id},{tg_message_id}) ↔ dc({dc_channel_id},{dc_message_id})"
+        + (f" [gw={origin_gateway}]" if origin_gateway else "")
     )
 
 
