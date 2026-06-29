@@ -1034,8 +1034,10 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ---- Burst circuit breaker (total throughput protection) ----
     if not gateway_ratelimit.check_and_record(tg_group_id, config.telegram_burstrate):
-        # Tripped: mark the group "Excessive Rate" in memory (suppresses all
-        # bridging + gateway-out until the next cache refresh re-reads it).
+        # Tripped. The breaker's own tripped-set is what suppresses subsequent
+        # messages (check_and_record returns False for this group until the next
+        # cache refresh calls reset_all_tripped). We also flag the group's
+        # in-memory T_Status as "Excessive Rate" for operator visibility.
         sheets_manager.set_group_status_in_memory(
             tg_group_id, gateway_ratelimit.STATUS_EXCESSIVE_RATE
         )
@@ -3077,6 +3079,20 @@ async def _startup(discord_client: discord.Client) -> None:
 
         Returns {"message_ids": [...], "dc_message_id": <str or None>}.
         """
+        # ---- Burst circuit breaker (total throughput protection) ----
+        # The gateway-inbound path counts toward, and respects, the same
+        # per-group rate limit as TG→DC and DC→TG. If tripped, suppress: do not
+        # echo to Telegram and do not bridge to Discord.
+        gid_str = _tg_group_id_str(chat_id)
+        if not gateway_ratelimit.check_and_record(gid_str, config.telegram_burstrate):
+            sheets_manager.set_group_status_in_memory(
+                gid_str, gateway_ratelimit.STATUS_EXCESSIVE_RATE
+            )
+            logger.warning(
+                f"Gateway send suppressed by burst circuit breaker for group {gid_str}"
+            )
+            return {"message_ids": [], "dc_message_id": None, "suppressed": True}
+
         # Step 1: obtain the Telegram message id.
         if echo:
             bot = _tg_app.bot if _tg_app else None
