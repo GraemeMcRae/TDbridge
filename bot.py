@@ -532,8 +532,13 @@ async def _warn_attachment_failure(
         dc_channel:  Discord channel to post warning in
         dc_msg_ref:  Discord message reference to reply to
     """
+    verb = (
+        "could not be received via gateway"
+        if direction.startswith("GW")
+        else "could not be bridged"
+    )
     warn_text = (
-        f"⚠️ Attachment could not be bridged ({direction}): {reason}. "
+        f"⚠️ Attachment {verb} ({direction}): {reason}. "
         f"File: {filename!r} (type: {attach_type})"
     )
     logger.warning(warn_text)
@@ -673,6 +678,7 @@ async def _send_attachments_to_telegram(
     reply_to_telegram_id: Optional[int],
     dc_channel: discord.TextChannel,
     dc_msg_ref: Optional[discord.MessageReference],
+    direction: str = "DC→TG",
 ) -> list[int]:
     """Upload all Discord attachments to Telegram, returning sent message IDs.
 
@@ -702,7 +708,7 @@ async def _send_attachments_to_telegram(
                 reason=f"file too large ({size // (1024*1024)} MB > {TG_MAX_BYTES // (1024*1024)} MB Telegram limit)",
                 filename=fname,
                 attach_type=ctype or "file",
-                direction="DC→TG",
+                direction=direction,
                 tg_bot=tg_bot,
                 tg_chat_id=chat_id,
                 tg_reply_to=reply_to_telegram_id,
@@ -718,7 +724,7 @@ async def _send_attachments_to_telegram(
                 reason=f"download failed: {e}",
                 filename=fname,
                 attach_type=ctype or "file",
-                direction="DC→TG",
+                direction=direction,
                 tg_bot=tg_bot,
                 tg_chat_id=chat_id,
                 tg_reply_to=reply_to_telegram_id,
@@ -779,7 +785,7 @@ async def _send_attachments_to_telegram(
                         reason=f"send failed: {e}",
                         filename=att.filename,
                         attach_type=ctype_att or "image/video",
-                        direction="DC→TG",
+                        direction=direction,
                         tg_bot=tg_bot, tg_chat_id=chat_id,
                         tg_reply_to=reply_to_telegram_id,
                         dc_channel=dc_channel, dc_msg_ref=dc_msg_ref,
@@ -815,7 +821,7 @@ async def _send_attachments_to_telegram(
                             reason=f"media group send failed: {e}",
                             filename=att.filename,
                             attach_type=att.content_type or "image/video",
-                            direction="DC→TG",
+                            direction=direction,
                             tg_bot=tg_bot, tg_chat_id=chat_id,
                             tg_reply_to=reply_to_telegram_id,
                             dc_channel=dc_channel, dc_msg_ref=dc_msg_ref,
@@ -855,7 +861,7 @@ async def _send_attachments_to_telegram(
                 reason=f"send failed: {e}",
                 filename=att.filename,
                 attach_type=att.content_type or "document",
-                direction="DC→TG",
+                direction=direction,
                 tg_bot=tg_bot, tg_chat_id=chat_id,
                 tg_reply_to=reply_to_telegram_id,
                 dc_channel=dc_channel, dc_msg_ref=dc_msg_ref,
@@ -3172,6 +3178,7 @@ async def _startup(discord_client: discord.Client) -> None:
                         reply_to_telegram_id=reply_to,
                         dc_channel=None,        # no Discord context for warnings here
                         dc_msg_ref=None,
+                        direction="GW→TG",
                     )
                     if not tg_msg_ids:
                         # Everything was skipped (e.g. too large) — fall back to

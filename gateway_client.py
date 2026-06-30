@@ -94,15 +94,29 @@ class GatewayClient:
     # ------------------------------------------------------------------ #
     # Events: send / poll / ack                                          #
     # ------------------------------------------------------------------ #
-    async def _post_envelope(self, endpoint: str, env: gp.Envelope) -> Tuple[int, dict]:
+    async def _post_envelope(
+        self, endpoint: str, env: gp.Envelope, *, read_timeout: Optional[float] = None
+    ) -> Tuple[int, dict]:
         """POST an envelope (secret included) to an event endpoint. Returns
-        (status_code, parsed_json)."""
+        (status_code, parsed_json).
+
+        read_timeout overrides the session's socket read timeout for this one
+        request — used by send, where the server does the full
+        upload→Telegram→Discord bridge inline (which, with attachments and
+        transient-retry, can take well over the poll-sized default).
+        """
         session = await self._ensure_session()
+        kwargs = {}
+        if read_timeout is not None:
+            kwargs["timeout"] = aiohttp.ClientTimeout(
+                total=None, connect=15, sock_read=read_timeout
+            )
         try:
             async with session.post(
                 self._url(endpoint),
                 data=env.to_json(include_secret=True),
                 headers={"Content-Type": "application/json"},
+                **kwargs,
             ) as resp:
                 try:
                     body = await resp.json()
@@ -121,9 +135,15 @@ class GatewayClient:
         reply_to: Optional[int] = None,
         attachments: Optional[List[gp.Attachment]] = None,
         edited: bool = False,
+        read_timeout: float = 120.0,
     ) -> dict:
         """Send a 'message' (or 'edited_message') event. Returns the server's
-        JSON response (which, for Echo=true, includes the real message_ids)."""
+        JSON response (which, for Echo=true, includes the real message_ids).
+
+        read_timeout defaults to 120 s because the server performs the full
+        upload→Telegram→Discord bridge inline; with attachments and transient
+        retries this can take much longer than a text-only send.
+        """
         env = gp.make_message(
             self._gw.name, chat_id,
             secret=self._gw.secret,
@@ -133,7 +153,7 @@ class GatewayClient:
             attachments=attachments,
             edited=edited,
         )
-        status, body = await self._post_envelope("send", env)
+        status, body = await self._post_envelope("send", env, read_timeout=read_timeout)
         if status != 200:
             raise GatewayClientError(f"send failed (HTTP {status}): {body}")
         return body
