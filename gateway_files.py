@@ -98,6 +98,38 @@ def resolve_token(download_token: str) -> Optional[dict]:
     return row
 
 
+def read_file_by_ref(file_ref: str) -> Optional[dict]:
+    """Load an inbound gateway file's bytes + metadata by file_ref.
+
+    Used by the inbound attachment path: the client uploaded the file to our
+    store (via /gateway/upload), then referenced it in a message event; we read
+    the bytes here to send to Telegram and bridge to Discord.
+
+    Returns {data, file_name, mime_type, size} or None if the ref is unknown or
+    the file is missing on disk.
+    """
+    row = db.gateway_file_by_ref(file_ref)
+    if not row:
+        logger.warning("Gateway file read: unknown file_ref %s", file_ref)
+        return None
+    path = row.get("path")
+    if not path or not os.path.isfile(path):
+        logger.warning("Gateway file read: missing file on disk for %s", file_ref)
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        logger.warning("Gateway file read: could not read %s: %s", path, e)
+        return None
+    return {
+        "data": data,
+        "file_name": row.get("file_name", "") or "",
+        "mime_type": row.get("mime_type", "") or "",
+        "size": row.get("size", len(data)) or len(data),
+    }
+
+
 def delete_file(file_ref: str) -> None:
     """Delete a gateway file (disk bytes + reference row). Called at the
     no-more-retry moment. Safe if already gone."""

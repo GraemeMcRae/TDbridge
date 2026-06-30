@@ -61,6 +61,7 @@ from gateway_server import GatewayServer
 from gateway_retry import with_retry, RetryGaveUp
 import gateway_protocol as gp
 import gateway_ratelimit
+import gateway_files
 
 # On Linux (server), Telegram updates are received via webhook — the bot runs
 # its own HTTPS server and Telegram POSTs updates to it.
@@ -644,6 +645,24 @@ async def _collect_tg_attachments(
         skip_notices.append("[Attachment could not be downloaded]")
 
     return dc_files, skip_notices
+
+
+class _GatewayAttachment:
+    """Adapter that presents gateway-file bytes with the same interface as a
+    discord.Attachment (.filename, .content_type, .size, async .read()), so the
+    existing _send_attachments_to_telegram() can be reused unchanged for the
+    inbound gateway path. The bytes are already local (read from our file store),
+    so read() just returns them.
+    """
+    def __init__(self, data: bytes, filename: str, content_type: str, size: int = 0):
+        self._data = data
+        self.filename = filename or "attachment"
+        self.content_type = content_type or ""
+        self.size = size or len(data)
+        self.url = ""  # gateway bytes are local; no CDN URL
+
+    async def read(self) -> bytes:
+        return self._data
 
 
 async def _send_attachments_to_telegram(
@@ -1514,6 +1533,7 @@ async def bridge_gateway_message_to_discord(
     text: str,
     reply_to_tg_id: Optional[str] = None,
     origin_gateway: str = "",
+    dc_files: Optional[list] = None,
 ) -> Optional[str]:
     """Bridge a gateway-originated message to Discord (Phase 6a, text-only).
 
@@ -1601,7 +1621,7 @@ async def bridge_gateway_message_to_discord(
             reference = None
 
     dc_msg = await _send_to_discord(
-        channel, webhook, sender_name, content, [], reference
+        channel, webhook, sender_name, content, (dc_files or []), reference
     )
     if dc_msg is None:
         return None
@@ -3076,17 +3096,25 @@ async def _startup(discord_client: discord.Client) -> None:
     # reflected accurately (no-op for a client-only instance).
     bot_status.gateway_expected = _gateway_server.enabled
 
-    async def _gateway_bridge(*, chat_id, text, reply_to, sender_name, echo, client_msg_id):
+    async def _gateway_bridge(*, chat_id, text, reply_to, sender_name, echo,
+                              client_msg_id, attachments=None):
         """The gateway's central function: place the message in Telegram
         (Echo=true) or accept the client-supplied id (Echo=false), then bridge
         it to Discord exactly as an incoming Telegram message would be.
 
-        Returns {"message_ids": [...], "dc_message_id": <str or None>}.
+        Phase 6d: inbound attachments. `attachments` is a list of dicts
+        {file_ref, file_name, mime_type, size} referencing files the client
+        uploaded to our store. We read the bytes, send them to Telegram (echo)
+        and bridge them to Discord, then delete the gateway files at the
+        terminal moment.
+
+        Returns {"message_ids": [...], "dc_message_id": <str or None>,
+                 "notes": [...]}.
         """
+        attachments = attachments or []
+        notes: list = []
+
         # ---- Burst circuit breaker (total throughput protection) ----
-        # The gateway-inbound path counts toward, and respects, the same
-        # per-group rate limit as TG→DC and DC→TG. If tripped, suppress: do not
-        # echo to Telegram and do not bridge to Discord.
         gid_str = _tg_group_id_str(chat_id)
         if not gateway_ratelimit.check_and_record(gid_str, config.telegram_burstrate):
             sheets_manager.set_group_status_in_memory(
@@ -3097,34 +3125,125 @@ async def _startup(discord_client: discord.Client) -> None:
             )
             return {"message_ids": [], "dc_message_id": None, "suppressed": True}
 
-        # Step 1: obtain the Telegram message id.
-        if echo:
-            bot = _tg_app.bot if _tg_app else None
-            if bot is None:
-                raise RuntimeError("Telegram app not available")
-            sent = await bot.send_message(
-                chat_id=chat_id,
-                text=(text or ""),
-                reply_to_message_id=reply_to,
+        # ---- Read attachment bytes from our file store (the client uploaded
+        # them to us). Collect the file_refs so we can delete them at the end. ----
+        loop = asyncio.get_running_loop()
+        loaded: list = []          # list of {data, file_name, mime_type, size}
+        file_refs: list = []       # file_refs to delete at the terminal moment
+        for a in attachments:
+            ref = a.get("file_ref")
+            if not ref:
+                continue
+            file_refs.append(ref)
+            info = await loop.run_in_executor(
+                None, gateway_files.read_file_by_ref, ref
             )
-            tg_msg_id = sent.message_id
-        else:
-            # Echo=false: the client asserts it posted the message itself and
-            # supplied the id. Nothing is sent to Telegram here.
-            if client_msg_id is None:
-                raise RuntimeError("Echo=false send requires a client-supplied message_id")
-            tg_msg_id = client_msg_id
+            if info is None:
+                notes.append(f"attachment {a.get('file_name','?')} unavailable (bad file_ref)")
+                continue
+            # Prefer the message's declared name/mime over the stored metadata.
+            info["file_name"] = a.get("file_name") or info["file_name"]
+            info["mime_type"] = a.get("mime_type") or info["mime_type"]
+            loaded.append(info)
 
-        # Step 2: bridge to Discord (text-only in Phase 6a).
+        tg_msg_id = None
+        tg_msg_ids: list = []
+        telegram_failed = False
+        try:
+            # ---- Step 1: place the message in Telegram (echo) ----
+            if echo:
+                bot = _tg_app.bot if _tg_app else None
+                if bot is None:
+                    raise RuntimeError("Telegram app not available")
+                if loaded:
+                    # Send attachments (with text as caption) via the reused
+                    # Telegram attachment sender, adapting gateway bytes.
+                    tg_attachments = [
+                        _GatewayAttachment(
+                            i["data"], i["file_name"], i["mime_type"], i["size"]
+                        )
+                        for i in loaded
+                    ]
+                    tg_msg_ids = await _send_attachments_to_telegram(
+                        attachments=tg_attachments,
+                        text=(text or ""),
+                        tg_bot=bot,
+                        tg_group_id=gid_str,
+                        reply_to_telegram_id=reply_to,
+                        dc_channel=None,        # no Discord context for warnings here
+                        dc_msg_ref=None,
+                    )
+                    if not tg_msg_ids:
+                        # Everything was skipped (e.g. too large) — fall back to
+                        # sending the text so the message isn't lost.
+                        sent = await bot.send_message(
+                            chat_id=chat_id,
+                            text=(text or "(attachment could not be sent)"),
+                            reply_to_message_id=reply_to,
+                        )
+                        tg_msg_ids = [sent.message_id]
+                    tg_msg_id = tg_msg_ids[0]
+                else:
+                    sent = await bot.send_message(
+                        chat_id=chat_id,
+                        text=(text or ""),
+                        reply_to_message_id=reply_to,
+                    )
+                    tg_msg_id = sent.message_id
+                    tg_msg_ids = [tg_msg_id]
+            else:
+                # Echo=false: the client asserts it posted the message itself.
+                if client_msg_id is None:
+                    raise RuntimeError("Echo=false send requires a client-supplied message_id")
+                tg_msg_id = client_msg_id
+                tg_msg_ids = [tg_msg_id]
+        except Exception:
+            telegram_failed = True
+            # Per design: if the Telegram side fails, there is nothing to bridge
+            # to Discord, so we do not attempt it. Delete the inbound files since
+            # nothing more can be done with them, then re-raise.
+            for ref in file_refs:
+                try:
+                    await loop.run_in_executor(None, gateway_files.delete_file, ref)
+                except Exception:
+                    pass
+            raise
+
+        # ---- Step 2: build Discord files (respecting Discord's size limit) and
+        # bridge to Discord. ----
+        dc_files = []
+        for i in loaded:
+            if i["size"] > DC_MAX_BYTES:
+                notes.append(
+                    f"attachment {i['file_name']} too large for Discord "
+                    f"({i['size'] // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB)"
+                )
+                continue
+            dc_files.append(discord.File(io.BytesIO(i["data"]), filename=i["file_name"]))
+
         dc_msg_id = await bridge_gateway_message_to_discord(
-            tg_group_id=_tg_group_id_str(chat_id),
+            tg_group_id=gid_str,
             tg_msg_id=_tg_msg_id_str(tg_msg_id),
             sender_name=sender_name,
             text=(text or ""),
             reply_to_tg_id=(_tg_msg_id_str(reply_to) if reply_to is not None else None),
             origin_gateway=config.own_gateway,
+            dc_files=dc_files,
         )
-        return {"message_ids": [tg_msg_id], "dc_message_id": dc_msg_id}
+
+        # ---- Step 3: terminal moment — both sends concluded. Delete the inbound
+        # gateway files (the bytes have been delivered as far as they can go). ----
+        for ref in file_refs:
+            try:
+                await loop.run_in_executor(None, gateway_files.delete_file, ref)
+            except Exception as e:
+                logger.warning(f"Could not delete inbound gateway file {ref}: {e}")
+
+        return {
+            "message_ids": tg_msg_ids or ([tg_msg_id] if tg_msg_id is not None else []),
+            "dc_message_id": dc_msg_id,
+            "notes": notes,
+        }
 
     _gateway_server.set_bridge_hook(_gateway_bridge)
     await _gateway_server.start()

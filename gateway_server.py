@@ -237,11 +237,6 @@ class GatewayServer:
 
         payload = env.payload   # MessagePayload
         notes = []
-        if payload.attachments:
-            notes.append(
-                f"{len(payload.attachments)} attachment(s) skipped "
-                f"(attachment support is Phase 4)"
-            )
 
         # Derive the sender name for Discord attribution: the gateway message's
         # from.first_name if present, else the gateway name (per design).
@@ -266,6 +261,7 @@ class GatewayServer:
                 sender_name=sender_name,
                 echo=echo,
                 client_msg_id=payload.message_id,
+                attachments=[a.to_dict() for a in payload.attachments],
             )
         except Exception as e:
             logger.warning("Gateway send/bridge failed: %s", e)
@@ -274,6 +270,7 @@ class GatewayServer:
                 "status": "error",
                 "note": f"send/bridge failed: {e}",
             }, status=502)
+        notes.extend(result.get("notes", []) or [])
         return web.json_response({
             "protocol_version": gp.PROTOCOL_VERSION,
             "status": ("sent" if echo else "accepted"),
