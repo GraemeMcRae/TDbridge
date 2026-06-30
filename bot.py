@@ -225,6 +225,10 @@ _discord_refresh_task: Optional[asyncio.Task] = None
 _dashboard_task: Optional[asyncio.Task] = None
 _t_group_flush_task: Optional[asyncio.Task] = None
 
+# Guard so _startup() runs only once even if Discord's on_ready fires again
+# after a reconnect (which it can). A reconnect should not re-initialize.
+_startup_done: bool = False
+
 # Dashboard reporter — emits Status Report log lines every 30 minutes
 _dashboard_reporter = DashboardReporter(config, bot_status)
 
@@ -3204,7 +3208,32 @@ def main() -> None:
 
     @client.event
     async def on_ready() -> None:
-        await _startup(client)
+        # on_ready can fire again after a Discord reconnect; only run startup
+        # once. A reconnect must not re-initialize tasks or re-run startup.
+        global _startup_done
+        if _startup_done:
+            logger.info("Discord on_ready fired again (reconnect) — startup already done")
+            return
+        # Startup must succeed fully or the process should exit non-zero so
+        # systemd restarts it (and eventually gives up if it keeps failing),
+        # rather than leaving the bot connected to Discord but half-initialized
+        # (e.g. a transient Telegram get_me() timeout during initialize()).
+        # discord.py swallows exceptions raised in event handlers, so we cannot
+        # rely on the exception propagating — we catch it and force-exit.
+        try:
+            await _startup(client)
+            _startup_done = True
+        except Exception as e:
+            logger.critical(
+                f"FATAL: startup failed ({type(e).__name__}: {e}). "
+                f"Exiting non-zero so the service manager can restart.",
+                exc_info=True,
+            )
+            # os._exit (not sys.exit) terminates immediately with a non-zero
+            # code; SystemExit would itself be swallowed by discord.py's event
+            # runner. There is nothing to clean up — the bot never became
+            # operational.
+            os._exit(1)
 
     async def runner() -> None:
         # Platform-aware shutdown signal handling.
