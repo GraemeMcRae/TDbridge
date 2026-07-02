@@ -510,7 +510,7 @@ async def _send_to_discord(
 # Attachment helpers
 # ===========================================================================
 
-DC_MAX_BYTES = 25 * 1024 * 1024   # Discord free-tier upload limit
+DC_MAX_BYTES = int(config.dc_filesize_mb) * 1024 * 1024   # Discord bot/webhook upload limit (configurable; default 10 MB)
 TG_MAX_BYTES = 50 * 1024 * 1024   # Telegram upload limit (sendDocument)
 # Telegram's sendPhoto method caps at 10 MB; larger images must be sent via
 # sendDocument (up to TG_MAX_BYTES). Routing a >10 MB image to send_photo fails

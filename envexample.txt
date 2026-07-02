@@ -43,6 +43,8 @@ TEST_GATEWAY_DEBUG_ENDPOINTS=false
 TEST_GATEWAY_FILES=gateway_files_test
 # Size limit of gateway files, in megabytes
 TEST_GATEWAY_FILESIZE=50
+# Max attachment size (MB) Discord accepts from a BOT/WEBHOOK upload. NOT the 25 MB user-upload limit — bot/webhook uploads are capped at 10 MB on a non-boosted server. Raise if the server is boosted (L2=50, L3=100). Larger TG→DC attachments are skipped with a notice.
+TEST_DC_FILESIZE=10
 # Dashboard polling-health: flag ERROR when polling active AND non-200 errors >= this count AND errors exceed the max rate below
 TEST_POLL_ERR_MIN_COUNT=9
 # Max fraction of polls that may be errors before ERROR (0.05 = 5%, i.e. success rate must be >= 95%)
@@ -108,6 +110,8 @@ PROD_GATEWAY_DEBUG_ENDPOINTS=false
 PROD_GATEWAY_FILES=gateway_files
 # Size limit of gateway files, in megabytes
 PROD_GATEWAY_FILESIZE=50
+# Max attachment size (MB) Discord accepts from a BOT/WEBHOOK upload. NOT the 25 MB user-upload limit — bot/webhook uploads are capped at 10 MB on a non-boosted server. Raise if the server is boosted (L2=50, L3=100). Larger TG→DC attachments are skipped with a notice.
+PROD_DC_FILESIZE=10
 # Dashboard polling-health: flag ERROR when polling active AND non-200 errors >= this count AND errors exceed the max rate below
 PROD_POLL_ERR_MIN_COUNT=9
 # Max fraction of polls that may be errors before ERROR (0.05 = 5%, i.e. success rate must be >= 95%)

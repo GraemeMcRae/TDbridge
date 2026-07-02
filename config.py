@@ -293,6 +293,17 @@ class Config:
             os.getenv(self.env_prefix + "GATEWAY_FILESIZE", "50") or "50"
         )
 
+        # Maximum attachment size Discord accepts from a BOT/WEBHOOK upload, in
+        # megabytes. NOTE: this is NOT the 25 MB limit for direct user uploads —
+        # bot/webhook uploads are capped lower (10 MB) on a non-boosted server.
+        # Raise this only if the Discord server's boost tier raises the limit
+        # (Level 2 → 50 MB, Level 3 → 100 MB). Attachments over this are skipped
+        # with a notice when bridging TG→DC (Discord has no send-as-document
+        # escape hatch — the ceiling applies to every attachment type).
+        self.dc_filesize_mb: int = int(
+            os.getenv(self.env_prefix + "DC_FILESIZE", "10") or "10"
+        )
+
         # ------------------------------------------------------------------ #
         # Polling-health check (reported via the Manager Dashboard)          #
         # ------------------------------------------------------------------ #
