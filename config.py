@@ -559,6 +559,19 @@ class Config:
         take_interval_counts() -> (ok, err)."""
         self._poll_counters = counters
 
+    @property
+    def relay_user_messages(self) -> bool:
+        """True if this instance owns a gateway whose relay_user_messages flag
+        is set — meaning ordinary user messages (with no gateway ancestry) are
+        also relayed outbound, not just gateway-originated ones and their reply
+        descendants. False when we own no gateway or the flag is off.
+        """
+        own = getattr(self, "own_gateway", "") or ""
+        if not own:
+            return False
+        gw = (getattr(self, "gateways", {}) or {}).get(own)
+        return bool(gw and gw.relay_user_messages)
+
     def gateway_config_summary(self) -> str:
         """Return a one-line human-readable summary of the loaded gateway
         configuration and this instance's derived role for each gateway. Used

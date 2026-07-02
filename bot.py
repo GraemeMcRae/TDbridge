@@ -1256,7 +1256,15 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
             parent_immediate_tg_id = parent_record["tg_message_id"]
         root_tg_msg_id = reply_to_tg_id or tg_msg_id
     else:
-        root_tg_msg_id = tg_msg_id  # this message IS the root
+        root_tg_msg_id = tg_msg_id
+
+    # relay_user_messages: if we own a gateway with that flag set, ordinary
+    # user messages (no gateway ancestry) are ALSO relayed outbound. Tag them
+    # with the owned gateway so they become gateway-eligible. A genuine
+    # inherited gateway (from a gateway-origin reply parent) always takes
+    # precedence and is never overridden.
+    if not inherited_origin_gateway and config.relay_user_messages:
+        inherited_origin_gateway = config.own_gateway
 
     # ---- Build text content ----
     # Determine whether this is a forwarded message and set attribution.
@@ -1445,6 +1453,11 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
     # If this Telegram message is a reply to a gateway-origin message, the reply
     # also flows back out the gateway to the client.
     if inherited_origin_gateway:
+        gw_attachments, gw_notes = await _gather_outbound_attachments(
+            inherited_origin_gateway, dc_files, direction="TG→GW"
+        )
+        for _n in gw_notes:
+            logger.warning(f"GW outbound attachment ({tg_group_id}): {_n}")
         await _gw_enqueue_outbound_message(
             origin_gateway=inherited_origin_gateway,
             tg_group_id=tg_group_id,
@@ -1452,16 +1465,141 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
             text=(msg.text or msg.caption or ""),
             sender_name=sender_name,
             reply_to_tg_id=parent_immediate_tg_id,
+            attachments=gw_attachments,
         )
+
+
+async def _gather_outbound_attachments(
+    origin_gateway: str, dc_files: list, direction: str,
+) -> tuple[list, list]:
+    """Store already-downloaded attachment bytes into the gateway file store so
+    an outbound event can reference them, and return (attachments, notes).
+
+    dc_files is a list of discord.File objects (the common currency both bridge
+    directions already produce) whose .fp is an io.BytesIO of the downloaded
+    bytes — we reuse those bytes rather than re-downloading. Files exceeding the
+    gateway's GATEWAY_FILESIZE limit are skipped with a note (the client learns
+    a file was attached but too large to relay).
+
+    `direction` is only used to tailor log/notice text (e.g. "TG→GW", "DC→GW"),
+    a lesson from Phase 6d: reused-code error messages must name their context.
+    """
+    attachments: list = []
+    notes: list = []
+    if not dc_files:
+        return attachments, notes
+
+    max_bytes = int(config.gateway_filesize_mb) * 1024 * 1024
+    loop = asyncio.get_running_loop()
+    for f in dc_files:
+        fname = getattr(f, "filename", None) or "attachment"
+        try:
+            fp = getattr(f, "fp", None)
+            if fp is None:
+                notes.append(f"attachment {fname} could not be relayed ({direction}: no data)")
+                continue
+            data = fp.getvalue() if hasattr(fp, "getvalue") else fp.read()
+            if hasattr(fp, "seek"):
+                fp.seek(0)   # rewind so the normal bridge send is unaffected
+        except Exception as e:
+            notes.append(f"attachment {fname} could not be relayed ({direction}: {e})")
+            continue
+
+        size = len(data)
+        if size > max_bytes:
+            notes.append(
+                f"attachment {fname} too large to relay via gateway "
+                f"({size // (1024*1024)} MB > {max_bytes // (1024*1024)} MB)"
+            )
+            continue
+
+        mime = _guess_mime_from_name(fname)
+        try:
+            stored = await loop.run_in_executor(
+                None, gateway_files.store_upload, origin_gateway, data, fname, mime
+            )
+        except Exception as e:
+            notes.append(f"attachment {fname} could not be relayed ({direction}: store failed: {e})")
+            continue
+
+        attachments.append(gp.Attachment(
+            file_ref=stored["file_ref"],
+            file_name=stored["file_name"],
+            mime_type=stored["mime_type"],
+            size=stored["size"],
+        ))
+    return attachments, notes
+
+
+def _guess_mime_from_name(filename: str) -> str:
+    """Best-effort MIME type from a filename extension for outbound attachments."""
+    import mimetypes
+    mime, _ = mimetypes.guess_type(filename)
+    return mime or "application/octet-stream"
+
+
+async def _gather_outbound_attachments_from_discord(
+    origin_gateway: str, discord_attachments: list,
+) -> tuple[list, list]:
+    """Like _gather_outbound_attachments but sourced from Discord attachment
+    objects (which expose async .read() from the Discord CDN, .filename,
+    .content_type, .size). Used on the DC→TG outbound path, where the bytes
+    were consumed by the Telegram sender and must be re-read from Discord.
+    """
+    attachments: list = []
+    notes: list = []
+    if not discord_attachments:
+        return attachments, notes
+
+    max_bytes = int(config.gateway_filesize_mb) * 1024 * 1024
+    for a in discord_attachments:
+        fname = getattr(a, "filename", None) or "attachment"
+        size = getattr(a, "size", 0) or 0
+        if size and size > max_bytes:
+            notes.append(
+                f"attachment {fname} too large to relay via gateway "
+                f"({size // (1024*1024)} MB > {max_bytes // (1024*1024)} MB)"
+            )
+            continue
+        try:
+            data = await a.read()
+        except Exception as e:
+            notes.append(f"attachment {fname} could not be relayed (DC→GW: read failed: {e})")
+            continue
+        if len(data) > max_bytes:
+            notes.append(
+                f"attachment {fname} too large to relay via gateway "
+                f"({len(data) // (1024*1024)} MB > {max_bytes // (1024*1024)} MB)"
+            )
+            continue
+        mime = getattr(a, "content_type", None) or _guess_mime_from_name(fname)
+        loop = asyncio.get_running_loop()
+        try:
+            stored = await loop.run_in_executor(
+                None, gateway_files.store_upload, origin_gateway, data, fname, mime
+            )
+        except Exception as e:
+            notes.append(f"attachment {fname} could not be relayed (DC→GW: store failed: {e})")
+            continue
+        attachments.append(gp.Attachment(
+            file_ref=stored["file_ref"],
+            file_name=stored["file_name"],
+            mime_type=stored["mime_type"],
+            size=stored["size"],
+        ))
+    return attachments, notes
 
 
 async def _gw_enqueue_outbound_message(
     origin_gateway: str, tg_group_id: str, tg_msg_id: str,
     text: str, sender_name: str, reply_to_tg_id: Optional[str],
     edited: bool = False,
+    attachments: Optional[list] = None,
 ) -> None:
     """Enqueue an outbound 'message' (or 'edited_message') event for the gateway
-    client — used when a reply to (or edit of) a gateway-origin message occurs."""
+    client — used when a reply to (or edit of) a gateway-origin message occurs.
+    `attachments` is an optional list of gp.Attachment referencing files already
+    stored in the gateway file store (see _gather_outbound_attachments)."""
     if not _gateway_server.is_serving():
         return
     try:
@@ -1482,6 +1620,7 @@ async def _gw_enqueue_outbound_message(
         reply_to=reply_to,
         from_user=gp.User(first_name=sender_name, is_synthetic=True),
         edited=edited,
+        attachments=(attachments or None),
     )
     await _gateway_server.enqueue_outbound(
         origin_gateway, gid, env.to_json(include_secret=False)
@@ -1490,7 +1629,8 @@ async def _gw_enqueue_outbound_message(
         f"GW outbound | gateway={origin_gateway} | type="
         f"{'edited_message' if edited else 'message'} | "
         f"tg_group={tg_group_id} | tg_msg={tg_msg_id} | "
-        f"reply_to={reply_to} | sender={sender_name!r}"
+        f"reply_to={reply_to} | sender={sender_name!r} | "
+        f"attachments={len(attachments) if attachments else 0}"
     )
 
 
@@ -2123,6 +2263,13 @@ class TDbridgeDiscordClient(discord.Client):
             )
             return
 
+        # relay_user_messages: if we own a gateway with that flag set, ordinary
+        # Discord-origin messages (no gateway ancestry) are ALSO relayed
+        # outbound. Tag with the owned gateway so they become gateway-eligible.
+        # A genuine inherited gateway always takes precedence.
+        if not inherited_origin_gateway and config.relay_user_messages:
+            inherited_origin_gateway = config.own_gateway
+
         # ---- Build message text ----
         # Resolve <@id> and <#id> Discord mention tokens to readable names
         # before sending to Telegram, where raw snowflake IDs are meaningless.
@@ -2246,6 +2393,11 @@ class TDbridgeDiscordClient(discord.Client):
                 # If this Discord message is a reply to a gateway-origin
                 # message, the reply also flows back out the gateway.
                 if inherited_origin_gateway and tg_msg_id:
+                    gw_attachments, gw_notes = await _gather_outbound_attachments_from_discord(
+                        inherited_origin_gateway, message.attachments
+                    )
+                    for _n in gw_notes:
+                        logger.warning(f"GW outbound attachment ({tg_group_id}): {_n}")
                     await _gw_enqueue_outbound_message(
                         origin_gateway=inherited_origin_gateway,
                         tg_group_id=tg_group_id,
@@ -2253,6 +2405,7 @@ class TDbridgeDiscordClient(discord.Client):
                         text=text,
                         sender_name=sender_name,
                         reply_to_tg_id=immediate_reply_tg_id,
+                        attachments=gw_attachments,
                     )
 
         except Exception as e:
