@@ -1425,80 +1425,93 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
     dc_msg = await _send_to_discord(
         channel, webhook, sender_name, content, dc_files, reference
     )
-    if dc_msg is None:
-        return
-    dc_msg_id = _dc_msg_id_str(dc_msg.id)
+    # A Discord send failure (e.g. 413) must NOT abort the handler: the
+    # gateway-outbound relay is an independent data path and should still run.
+    # We only skip the Discord-DEPENDENT bookkeeping (mapping store, notice
+    # replies, bridge log) when dc_msg is None.
+    dc_ok = dc_msg is not None
+    dc_msg_id = _dc_msg_id_str(dc_msg.id) if dc_ok else None
 
-    # Post Discord-side attachment warnings now that we have the message ref
-    if skip_notices:
-        dc_ref = dc_msg.to_reference(fail_if_not_exists=False)
-        for notice in skip_notices:
-            try:
-                await channel.send(
-                    content=f"⚠️ {notice.strip('[]')}",
-                    reference=dc_ref,
-                    mention_author=False,
-                )
-            except Exception as e:
-                logger.warning(f"Could not post attachment warning to Discord: {e}")
+    if dc_ok:
+        # Post Discord-side attachment warnings now that we have the message ref
+        if skip_notices:
+            dc_ref = dc_msg.to_reference(fail_if_not_exists=False)
+            for notice in skip_notices:
+                try:
+                    await channel.send(
+                        content=f"⚠️ {notice.strip('[]')}",
+                        reference=dc_ref,
+                        mention_author=False,
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not post attachment warning to Discord: {e}")
 
-    # ---- Store mapping ----
+    # ---- Store mapping ---- (only if Discord accepted the message; without a
+    # dc_msg_id there is nothing to link TG↔DC. The gateway relay below is
+    # independent and runs regardless.)
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None,
-        db.store_message,
-        tg_group_id,
-        tg_msg_id,
-        dc_channel_id,
-        dc_msg_id,
-        root_tg_msg_id,
-        dc_user_id,
-        inherited_origin_gateway,
-    )
-    # Detailed TG→DC bridge log — all key fields on one line for easy grep/research
-    _tg_raw_text = (msg.text or msg.caption or "").replace("\n", "\\n")
-    _dc_text_esc = content.replace("\n", "\\n")
-    _tg_attach = "none"
-    if msg.photo:
-        _tg_attach = f"photo(largest={msg.photo[-1].file_size or '?'}B)"
-    elif msg.video:
-        _tg_attach = f"video({msg.video.file_name or 'video.mp4'},{msg.video.file_size or '?'}B)"
-    elif msg.voice:
-        _tg_attach = f"voice({msg.voice.file_size or '?'}B)"
-    elif msg.audio:
-        _tg_attach = f"audio({msg.audio.file_name or 'audio'},{msg.audio.file_size or '?'}B)"
-    elif msg.document:
-        _tg_attach = f"document({msg.document.file_name or 'file'},{msg.document.file_size or '?'}B)"
-    elif msg.sticker:
-        _tg_attach = f"sticker({msg.sticker.emoji or '?'},animated={msg.sticker.is_animated})"
-    elif msg.poll:
-        _tg_attach = f"poll({msg.poll.question!r})"
-    _tg_reply_info = (
-        f"reply_to_tg={msg.reply_to_message.message_id}"
-        if msg.reply_to_message else "not_a_reply"
-    )
-    _dc_reply_info = (
-        f"reply_to_dc={discord_reply_to_id}"
-        if discord_reply_to_id else "new_message"
-    )
-    logger.info(
-        f"TG→DC bridged | "
-        f"tg_msg={tg_msg_id} | "
-        f"tg_group={tg_group_id}('{tg_chat.title}') | "
-        f"tg_sender={sender_name!r} | "
-        f"tg_text={_tg_raw_text!r} | "
-        f"tg_attach={_tg_attach} | "
-        f"{_tg_reply_info} | "
-        f"dc_msg={dc_msg_id} | "
-        f"dc_channel=#{channel.name}({dc_channel_id}) | "
-        f"dc_text={_dc_text_esc!r} | "
-        f"{_dc_reply_info}"
-    )
-    bot_status.bridged_30m += 1
-    try:
-        _dashboard_reporter.save_to_db()
-    except Exception:
-        pass
+    if dc_ok:
+        await loop.run_in_executor(
+            None,
+            db.store_message,
+            tg_group_id,
+            tg_msg_id,
+            dc_channel_id,
+            dc_msg_id,
+            root_tg_msg_id,
+            dc_user_id,
+            inherited_origin_gateway,
+        )
+    if dc_ok:
+        # Detailed TG→DC bridge log — all key fields on one line for easy grep/research
+        _tg_raw_text = (msg.text or msg.caption or "").replace("\n", "\\n")
+        _dc_text_esc = content.replace("\n", "\\n")
+        _tg_attach = "none"
+        if msg.photo:
+            _tg_attach = f"photo(largest={msg.photo[-1].file_size or '?'}B)"
+        elif msg.video:
+            _tg_attach = f"video({msg.video.file_name or 'video.mp4'},{msg.video.file_size or '?'}B)"
+        elif msg.voice:
+            _tg_attach = f"voice({msg.voice.file_size or '?'}B)"
+        elif msg.audio:
+            _tg_attach = f"audio({msg.audio.file_name or 'audio'},{msg.audio.file_size or '?'}B)"
+        elif msg.document:
+            _tg_attach = f"document({msg.document.file_name or 'file'},{msg.document.file_size or '?'}B)"
+        elif msg.sticker:
+            _tg_attach = f"sticker({msg.sticker.emoji or '?'},animated={msg.sticker.is_animated})"
+        elif msg.poll:
+            _tg_attach = f"poll({msg.poll.question!r})"
+        _tg_reply_info = (
+            f"reply_to_tg={msg.reply_to_message.message_id}"
+            if msg.reply_to_message else "not_a_reply"
+        )
+        _dc_reply_info = (
+            f"reply_to_dc={discord_reply_to_id}"
+            if discord_reply_to_id else "new_message"
+        )
+        logger.info(
+            f"TG→DC bridged | "
+            f"tg_msg={tg_msg_id} | "
+            f"tg_group={tg_group_id}('{tg_chat.title}') | "
+            f"tg_sender={sender_name!r} | "
+            f"tg_text={_tg_raw_text!r} | "
+            f"tg_attach={_tg_attach} | "
+            f"{_tg_reply_info} | "
+            f"dc_msg={dc_msg_id} | "
+            f"dc_channel=#{channel.name}({dc_channel_id}) | "
+            f"dc_text={_dc_text_esc!r} | "
+            f"{_dc_reply_info}"
+        )
+        bot_status.bridged_30m += 1
+        try:
+            _dashboard_reporter.save_to_db()
+        except Exception:
+            pass
+    else:
+        logger.warning(
+            f"TG→DC NOT bridged (Discord send failed) | tg_msg={tg_msg_id} | "
+            f"tg_group={tg_group_id} | continuing to gateway-outbound if eligible"
+        )
 
     # If this Telegram message is a reply to a gateway-origin message, the reply
     # also flows back out the gateway to the client.
