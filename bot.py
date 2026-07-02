@@ -574,107 +574,102 @@ async def _warn_attachment_failure(
             logger.warning(f"Could not post attachment warning to Discord: {e}")
 
 
+class _RawAttachment:
+    """A single Telegram attachment fetched once, holding raw bytes + metadata,
+    so both the Discord bridge and the gateway relay can each apply their own
+    size limit to the same fetched copy without re-downloading."""
+    __slots__ = ("data", "file_name", "mime_type", "size")
+
+    def __init__(self, data: bytes, file_name: str, mime_type: str, size: int):
+        self.data = data
+        self.file_name = file_name or "attachment"
+        self.mime_type = mime_type or "application/octet-stream"
+        self.size = size or len(data)
+
+
 async def _collect_tg_attachments(
     msg,
     tg_bot: TelegramBot,
-) -> tuple[list[discord.File], list[str]]:
-    """Download all attachments from a Telegram message.
+) -> tuple[list[discord.File], list[str], list]:
+    """Download all attachments from a Telegram message ONCE, and return them
+    for both consumers (the Discord bridge and the gateway relay), each of which
+    applies its OWN size limit to the single fetched copy — no refetch.
 
     Returns:
-        (dc_files, skip_notices) where dc_files is a list of discord.File
-        objects ready to upload, and skip_notices is a list of plain-text
-        descriptions of any attachments that were skipped (for appending to
-        the message content).
+        (dc_files, skip_notices, raw_attachments) where:
+          • dc_files       — discord.File objects within the DISCORD limit
+                             (DC_MAX_BYTES); larger ones are omitted here and
+                             noted in skip_notices.
+          • skip_notices   — plain-text descriptions of attachments too large
+                             for Discord (appended to the Discord message).
+          • raw_attachments — list of _RawAttachment (bytes+name+mime+size) for
+                             everything fetched within the GATEWAY limit
+                             (larger than Discord's, so a file too big for
+                             Discord can still be relayed to the gateway client).
+
+    A file larger than BOTH limits is skipped for Discord (notice) and omitted
+    from raw_attachments. The single download is bounded by the larger (gateway)
+    limit so we never fetch bytes no consumer can use.
 
     Handles: photo, video, voice, audio, document, sticker, poll.
-    A Telegram message can contain at most one media item (plus caption),
-    so this returns at most one file in normal usage.  The list form is used
-    for symmetry with the Discord side and for future compatibility.
     """
     dc_files: list[discord.File] = []
     skip_notices: list[str] = []
+    raw_attachments: list = []
+
+    dc_max = DC_MAX_BYTES
+    gw_max = int(config.gateway_filesize_mb) * 1024 * 1024
+    fetch_max = max(dc_max, gw_max)
+
+    async def _add(file_id: str, fname: str, mime: str, declared_size: int, label: str):
+        """Fetch once (bounded by the larger limit) and distribute to both
+        consumers by their own limits."""
+        # If the declared size already exceeds every limit, don't even fetch.
+        if declared_size and declared_size > fetch_max:
+            skip_notices.append(
+                f"[Attachment skipped — {label} too large "
+                f"({declared_size // (1024*1024)} MB > {fetch_max // (1024*1024)} MB max): {fname}]"
+            )
+            return
+        data = await _download_tg_file(tg_bot, file_id)
+        size = len(data)
+        # Gateway relay copy (up to the gateway limit).
+        if size <= gw_max:
+            raw_attachments.append(_RawAttachment(data, fname, mime, size))
+        # Discord copy (up to the Discord limit).
+        if size <= dc_max:
+            dc_files.append(discord.File(io.BytesIO(data), filename=fname))
+        else:
+            skip_notices.append(
+                f"[Attachment skipped — {label} too large "
+                f"({size // (1024*1024)} MB > {dc_max // (1024*1024)} MB Discord limit): {fname}]"
+            )
 
     try:
         if msg.photo:
             photo = msg.photo[-1]  # largest resolution
-            fsize = getattr(photo, "file_size", 0) or 0
-            if fsize and fsize > DC_MAX_BYTES:
-                skip_notices.append(
-                    f"[Attachment skipped — photo too large "
-                    f"({fsize // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit)]"
-                )
-            else:
-                data = await _download_tg_file(tg_bot, photo.file_id)
-                if len(data) > DC_MAX_BYTES:
-                    skip_notices.append(
-                        f"[Attachment skipped — photo too large "
-                        f"({len(data) // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit)]"
-                    )
-                else:
-                    dc_files.append(discord.File(io.BytesIO(data), filename="photo.jpg"))
+            await _add(photo.file_id, "photo.jpg", "image/jpeg",
+                       getattr(photo, "file_size", 0) or 0, "photo")
 
         elif msg.video:
             fname = _ensure_filename(
                 msg.video.file_name, msg.video.mime_type,
                 default_stem="video", default_ext=".mp4",
             )
-            fsize = getattr(msg.video, "file_size", 0) or 0
-            if fsize and fsize > DC_MAX_BYTES:
-                skip_notices.append(
-                    f"[Attachment skipped — video too large "
-                    f"({fsize // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit): "
-                    f"{fname}]"
-                )
-            else:
-                data = await _download_tg_file(tg_bot, msg.video.file_id)
-                if len(data) > DC_MAX_BYTES:
-                    skip_notices.append(
-                        f"[Attachment skipped — video too large "
-                        f"({len(data) // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit): "
-                        f"{fname}]"
-                    )
-                else:
-                    dc_files.append(discord.File(io.BytesIO(data), filename=fname))
+            await _add(msg.video.file_id, fname, msg.video.mime_type or "video/mp4",
+                       getattr(msg.video, "file_size", 0) or 0, "video")
 
         elif msg.voice:
-            fsize = getattr(msg.voice, "file_size", 0) or 0
-            if fsize and fsize > DC_MAX_BYTES:
-                skip_notices.append(
-                    f"[Attachment skipped — voice message too large "
-                    f"({fsize // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit)]"
-                )
-            else:
-                data = await _download_tg_file(tg_bot, msg.voice.file_id)
-                if len(data) > DC_MAX_BYTES:
-                    skip_notices.append(
-                        f"[Attachment skipped — voice message too large "
-                        f"({len(data) // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit)]"
-                    )
-                else:
-                    dc_files.append(discord.File(io.BytesIO(data), filename="voice.ogg"))
+            await _add(msg.voice.file_id, "voice.ogg", "audio/ogg",
+                       getattr(msg.voice, "file_size", 0) or 0, "voice message")
 
         elif msg.audio:
             fname = _ensure_filename(
                 msg.audio.file_name, msg.audio.mime_type,
                 default_stem="audio", default_ext=".mp3",
             )
-            fsize = getattr(msg.audio, "file_size", 0) or 0
-            if fsize and fsize > DC_MAX_BYTES:
-                skip_notices.append(
-                    f"[Attachment skipped — audio too large "
-                    f"({fsize // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit): "
-                    f"{fname}]"
-                )
-            else:
-                data = await _download_tg_file(tg_bot, msg.audio.file_id)
-                if len(data) > DC_MAX_BYTES:
-                    skip_notices.append(
-                        f"[Attachment skipped — audio too large "
-                        f"({len(data) // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit): "
-                        f"{fname}]"
-                    )
-                else:
-                    dc_files.append(discord.File(io.BytesIO(data), filename=fname))
+            await _add(msg.audio.file_id, fname, msg.audio.mime_type or "audio/mpeg",
+                       getattr(msg.audio, "file_size", 0) or 0, "audio")
 
         elif msg.document:
             # Forwarded videos frequently arrive as a Document with no
@@ -684,16 +679,9 @@ async def _collect_tg_attachments(
                 msg.document.file_name, msg.document.mime_type,
                 default_stem="file", default_ext="",
             )
-            fsize = msg.document.file_size or 0
-            if fsize > DC_MAX_BYTES:
-                skip_notices.append(
-                    f"[Attachment skipped — file too large "
-                    f"({fsize // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit): "
-                    f"{fname}]"
-                )
-            else:
-                data = await _download_tg_file(tg_bot, msg.document.file_id)
-                dc_files.append(discord.File(io.BytesIO(data), filename=fname))
+            await _add(msg.document.file_id, fname,
+                       msg.document.mime_type or "application/octet-stream",
+                       msg.document.file_size or 0, "file")
 
         elif msg.sticker:
             if msg.sticker.is_animated or msg.sticker.is_video:
@@ -701,8 +689,8 @@ async def _collect_tg_attachments(
                 skip_notices.append(f"[Sticker: {emoji}]")
             else:
                 try:
-                    data = await _download_tg_file(tg_bot, msg.sticker.file_id)
-                    dc_files.append(discord.File(io.BytesIO(data), filename="sticker.webp"))
+                    await _add(msg.sticker.file_id, "sticker.webp", "image/webp",
+                               getattr(msg.sticker, "file_size", 0) or 0, "sticker")
                 except Exception:
                     emoji = msg.sticker.emoji or "🎭"
                     skip_notices.append(f"[Sticker: {emoji}]")
@@ -715,7 +703,7 @@ async def _collect_tg_attachments(
         logger.warning(f"TG→DC attachment download failed: {e}")
         skip_notices.append("[Attachment could not be downloaded]")
 
-    return dc_files, skip_notices
+    return dc_files, skip_notices, raw_attachments
 
 
 class _GatewayAttachment:
@@ -1399,7 +1387,7 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ---- Attachments ----
     tg_bot: TelegramBot = context.bot
-    dc_files, skip_notices = await _collect_tg_attachments(msg, tg_bot)
+    dc_files, skip_notices, raw_attachments = await _collect_tg_attachments(msg, tg_bot)
 
     # Post a warning on Telegram for any skipped attachments, and append
     # a notice to the Discord message content.
@@ -1516,7 +1504,7 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
     # also flows back out the gateway to the client.
     if inherited_origin_gateway:
         gw_attachments, gw_notes = await _gather_outbound_attachments(
-            inherited_origin_gateway, dc_files, direction="TG→GW"
+            inherited_origin_gateway, raw_attachments, direction="TG→GW"
         )
         for _n in gw_notes:
             logger.warning(f"GW outbound attachment ({tg_group_id}): {_n}")
@@ -1532,50 +1520,41 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def _gather_outbound_attachments(
-    origin_gateway: str, dc_files: list, direction: str,
+    origin_gateway: str, raw_attachments: list, direction: str,
 ) -> tuple[list, list]:
     """Store already-downloaded attachment bytes into the gateway file store so
     an outbound event can reference them, and return (attachments, notes).
 
-    dc_files is a list of discord.File objects (the common currency both bridge
-    directions already produce) whose .fp is an io.BytesIO of the downloaded
-    bytes — we reuse those bytes rather than re-downloading. Files exceeding the
-    gateway's GATEWAY_FILESIZE limit are skipped with a note (the client learns
-    a file was attached but too large to relay).
+    raw_attachments is a list of _RawAttachment (bytes+name+mime+size) fetched
+    once by _collect_tg_attachments up to the gateway limit — so a file too big
+    for Discord (but within the gateway's larger limit) still relays to the
+    client. Files exceeding the gateway's GATEWAY_FILESIZE limit were already
+    excluded by the collector; we defensively re-check here.
 
-    `direction` is only used to tailor log/notice text (e.g. "TG→GW", "DC→GW"),
-    a lesson from Phase 6d: reused-code error messages must name their context.
+    `direction` tailors log/notice text (a Phase 6d lesson: reused-code error
+    messages must name their context).
     """
     attachments: list = []
     notes: list = []
-    if not dc_files:
+    if not raw_attachments:
         return attachments, notes
 
     max_bytes = int(config.gateway_filesize_mb) * 1024 * 1024
     loop = asyncio.get_running_loop()
-    for f in dc_files:
-        fname = getattr(f, "filename", None) or "attachment"
-        try:
-            fp = getattr(f, "fp", None)
-            if fp is None:
-                notes.append(f"attachment {fname} could not be relayed ({direction}: no data)")
-                continue
-            data = fp.getvalue() if hasattr(fp, "getvalue") else fp.read()
-            if hasattr(fp, "seek"):
-                fp.seek(0)   # rewind so the normal bridge send is unaffected
-        except Exception as e:
-            notes.append(f"attachment {fname} could not be relayed ({direction}: {e})")
+    for ra in raw_attachments:
+        fname = getattr(ra, "file_name", None) or "attachment"
+        data = getattr(ra, "data", None)
+        if data is None:
+            notes.append(f"attachment {fname} could not be relayed ({direction}: no data)")
             continue
-
-        size = len(data)
+        size = getattr(ra, "size", None) or len(data)
         if size > max_bytes:
             notes.append(
                 f"attachment {fname} too large to relay via gateway "
                 f"({size // (1024*1024)} MB > {max_bytes // (1024*1024)} MB)"
             )
             continue
-
-        mime = _guess_mime_from_name(fname)
+        mime = getattr(ra, "mime_type", None) or _guess_mime_from_name(fname)
         try:
             stored = await loop.run_in_executor(
                 None, gateway_files.store_upload, origin_gateway, data, fname, mime
@@ -1583,7 +1562,6 @@ async def _gather_outbound_attachments(
         except Exception as e:
             notes.append(f"attachment {fname} could not be relayed ({direction}: store failed: {e})")
             continue
-
         attachments.append(gp.Attachment(
             file_ref=stored["file_ref"],
             file_name=stored["file_name"],
