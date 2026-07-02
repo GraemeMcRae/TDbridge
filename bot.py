@@ -270,7 +270,13 @@ async def _download_tg_file(bot: TelegramBot, file_id: str) -> bytes:
     buf = io.BytesIO()
     await tg_file.download_to_memory(buf)
     buf.seek(0)
-    return buf.read()
+    data = buf.read()
+    logger.info(
+        f"TG file downloaded: file_id={file_id[:16]}… | "
+        f"bytes={len(data)} ({len(data) // (1024*1024)} MB) | "
+        f"tg_reported_size={getattr(tg_file, 'file_size', None)}"
+    )
+    return data
 
 
 # MIME types where Python's mimetypes.guess_extension() returns a less common
@@ -591,28 +597,84 @@ async def _collect_tg_attachments(
     try:
         if msg.photo:
             photo = msg.photo[-1]  # largest resolution
-            data = await _download_tg_file(tg_bot, photo.file_id)
-            dc_files.append(discord.File(io.BytesIO(data), filename="photo.jpg"))
+            fsize = getattr(photo, "file_size", 0) or 0
+            if fsize and fsize > DC_MAX_BYTES:
+                skip_notices.append(
+                    f"[Attachment skipped — photo too large "
+                    f"({fsize // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit)]"
+                )
+            else:
+                data = await _download_tg_file(tg_bot, photo.file_id)
+                if len(data) > DC_MAX_BYTES:
+                    skip_notices.append(
+                        f"[Attachment skipped — photo too large "
+                        f"({len(data) // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit)]"
+                    )
+                else:
+                    dc_files.append(discord.File(io.BytesIO(data), filename="photo.jpg"))
 
         elif msg.video:
-            data = await _download_tg_file(tg_bot, msg.video.file_id)
             fname = _ensure_filename(
                 msg.video.file_name, msg.video.mime_type,
                 default_stem="video", default_ext=".mp4",
             )
-            dc_files.append(discord.File(io.BytesIO(data), filename=fname))
+            fsize = getattr(msg.video, "file_size", 0) or 0
+            if fsize and fsize > DC_MAX_BYTES:
+                skip_notices.append(
+                    f"[Attachment skipped — video too large "
+                    f"({fsize // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit): "
+                    f"{fname}]"
+                )
+            else:
+                data = await _download_tg_file(tg_bot, msg.video.file_id)
+                if len(data) > DC_MAX_BYTES:
+                    skip_notices.append(
+                        f"[Attachment skipped — video too large "
+                        f"({len(data) // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit): "
+                        f"{fname}]"
+                    )
+                else:
+                    dc_files.append(discord.File(io.BytesIO(data), filename=fname))
 
         elif msg.voice:
-            data = await _download_tg_file(tg_bot, msg.voice.file_id)
-            dc_files.append(discord.File(io.BytesIO(data), filename="voice.ogg"))
+            fsize = getattr(msg.voice, "file_size", 0) or 0
+            if fsize and fsize > DC_MAX_BYTES:
+                skip_notices.append(
+                    f"[Attachment skipped — voice message too large "
+                    f"({fsize // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit)]"
+                )
+            else:
+                data = await _download_tg_file(tg_bot, msg.voice.file_id)
+                if len(data) > DC_MAX_BYTES:
+                    skip_notices.append(
+                        f"[Attachment skipped — voice message too large "
+                        f"({len(data) // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit)]"
+                    )
+                else:
+                    dc_files.append(discord.File(io.BytesIO(data), filename="voice.ogg"))
 
         elif msg.audio:
-            data = await _download_tg_file(tg_bot, msg.audio.file_id)
             fname = _ensure_filename(
                 msg.audio.file_name, msg.audio.mime_type,
                 default_stem="audio", default_ext=".mp3",
             )
-            dc_files.append(discord.File(io.BytesIO(data), filename=fname))
+            fsize = getattr(msg.audio, "file_size", 0) or 0
+            if fsize and fsize > DC_MAX_BYTES:
+                skip_notices.append(
+                    f"[Attachment skipped — audio too large "
+                    f"({fsize // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit): "
+                    f"{fname}]"
+                )
+            else:
+                data = await _download_tg_file(tg_bot, msg.audio.file_id)
+                if len(data) > DC_MAX_BYTES:
+                    skip_notices.append(
+                        f"[Attachment skipped — audio too large "
+                        f"({len(data) // (1024*1024)} MB > {DC_MAX_BYTES // (1024*1024)} MB Discord limit): "
+                        f"{fname}]"
+                    )
+                else:
+                    dc_files.append(discord.File(io.BytesIO(data), filename=fname))
 
         elif msg.document:
             # Forwarded videos frequently arrive as a Document with no
