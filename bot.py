@@ -505,7 +505,11 @@ async def _send_to_discord(
 # ===========================================================================
 
 DC_MAX_BYTES = 25 * 1024 * 1024   # Discord free-tier upload limit
-TG_MAX_BYTES = 50 * 1024 * 1024   # Telegram upload limit
+TG_MAX_BYTES = 50 * 1024 * 1024   # Telegram upload limit (sendDocument)
+# Telegram's sendPhoto method caps at 10 MB; larger images must be sent via
+# sendDocument (up to TG_MAX_BYTES). Routing a >10 MB image to send_photo fails
+# with "File ... too big for a photo; the maximum size is 10485760 bytes".
+TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024
 
 
 async def _warn_attachment_failure(
@@ -739,7 +743,12 @@ async def _send_attachments_to_telegram(
         # having an InputFile available for send_document which needs filename.
         input_file = InputFile(io.BytesIO(data), filename=fname)
 
-        if ctype.startswith("image/"):
+        # Images/videos over Telegram's 10 MB sendPhoto/sendVideo limit must be
+        # sent as documents (sendDocument allows up to 50 MB). Smaller ones go
+        # through the photo/video (media-group-capable) path.
+        if size > TG_PHOTO_MAX_BYTES:
+            documents.append((input_file, att))
+        elif ctype.startswith("image/"):
             photos_videos.append((data, att))   # (bytes, discord.Attachment)
         elif ctype.startswith("video/"):
             photos_videos.append((data, att))
@@ -3162,34 +3171,62 @@ async def _startup(discord_client: discord.Client) -> None:
                 if bot is None:
                     raise RuntimeError("Telegram app not available")
                 if loaded:
-                    # Send attachments (with text as caption) via the reused
-                    # Telegram attachment sender, adapting gateway bytes.
-                    tg_attachments = [
-                        _GatewayAttachment(
-                            i["data"], i["file_name"], i["mime_type"], i["size"]
+                    # Distinguish attachments that are too large for Telegram
+                    # (a deliberate POLICY skip) from ones we will attempt to
+                    # send. Only when EVERY attachment is policy-skipped do we
+                    # fall back to a text-only message. We must NOT send a text
+                    # fallback merely because a send attempt failed/timed out —
+                    # that produced a duplicate (text + a late-arriving photo)
+                    # when the upload was slow but ultimately succeeded.
+                    sendable = [i for i in loaded if i["size"] <= TG_MAX_BYTES]
+                    too_big_tg = [i for i in loaded if i["size"] > TG_MAX_BYTES]
+                    for i in too_big_tg:
+                        notes.append(
+                            f"attachment {i['file_name']} too large for Telegram "
+                            f"({i['size'] // (1024*1024)} MB > {TG_MAX_BYTES // (1024*1024)} MB)"
                         )
-                        for i in loaded
-                    ]
-                    tg_msg_ids = await _send_attachments_to_telegram(
-                        attachments=tg_attachments,
-                        text=(text or ""),
-                        tg_bot=bot,
-                        tg_group_id=gid_str,
-                        reply_to_telegram_id=reply_to,
-                        dc_channel=None,        # no Discord context for warnings here
-                        dc_msg_ref=None,
-                        direction="GW→TG",
-                    )
-                    if not tg_msg_ids:
-                        # Everything was skipped (e.g. too large) — fall back to
-                        # sending the text so the message isn't lost.
+
+                    if sendable:
+                        # Send attachments (with text as caption) via the reused
+                        # Telegram attachment sender, adapting gateway bytes.
+                        tg_attachments = [
+                            _GatewayAttachment(
+                                i["data"], i["file_name"], i["mime_type"], i["size"]
+                            )
+                            for i in sendable
+                        ]
+                        tg_msg_ids = await _send_attachments_to_telegram(
+                            attachments=tg_attachments,
+                            text=(text or ""),
+                            tg_bot=bot,
+                            tg_group_id=gid_str,
+                            reply_to_telegram_id=reply_to,
+                            dc_channel=None,    # no Discord context for warnings here
+                            dc_msg_ref=None,
+                            direction="GW→TG",
+                        )
+                        if not tg_msg_ids:
+                            # The send(s) were ATTEMPTED but returned no message
+                            # ids — a genuine delivery failure (e.g. Telegram
+                            # timeout that exhausted retries). Do NOT send a text
+                            # fallback (that risks a duplicate if the upload is
+                            # merely slow). Report it and treat as a Telegram
+                            # failure so Discord is not bridged.
+                            raise RuntimeError(
+                                "Telegram attachment send returned no message ids"
+                            )
+                        tg_msg_id = tg_msg_ids[0]
+                    else:
+                        # Every attachment was too large for Telegram: send the
+                        # text (with the over-size notes) so the message isn't
+                        # lost.
                         sent = await bot.send_message(
                             chat_id=chat_id,
-                            text=(text or "(attachment could not be sent)"),
+                            text=(text or "(attachment too large to send)"),
                             reply_to_message_id=reply_to,
                         )
                         tg_msg_ids = [sent.message_id]
-                    tg_msg_id = tg_msg_ids[0]
+                        tg_msg_id = tg_msg_ids[0]
                 else:
                     sent = await bot.send_message(
                         chat_id=chat_id,
