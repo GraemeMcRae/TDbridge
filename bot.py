@@ -2277,6 +2277,9 @@ class TDbridgeDiscordClient(discord.Client):
         text = f"{attribution} {resolved_content}".strip()
 
         # ---- Send to Telegram ----
+        if _tg_app is None:
+            logger.debug("Skipping Discord event: Telegram app not ready yet (startup window)")
+            return
         tg_bot: TelegramBot = _tg_app.bot
 
         reply_to_telegram_id: Optional[int] = None
@@ -2453,6 +2456,9 @@ class TDbridgeDiscordClient(discord.Client):
         resolved_edit = _resolve_discord_mentions(data.get("content", ""))
         new_text      = f"✏️ EDIT — 👤 {sender_name} (Discord): {resolved_edit}"
 
+        if _tg_app is None:
+            logger.debug("Skipping Discord event: Telegram app not ready yet (startup window)")
+            return
         tg_bot: TelegramBot = _tg_app.bot
 
         async def _enqueue_edit_outbound():
@@ -2514,6 +2520,9 @@ class TDbridgeDiscordClient(discord.Client):
         chan = self.get_channel(payload.channel_id)
         dc_channel_name = getattr(chan, "name", str(payload.channel_id))
 
+        if _tg_app is None:
+            logger.debug("Skipping Discord event: Telegram app not ready yet (startup window)")
+            return
         tg_bot: TelegramBot = _tg_app.bot
         # dc_msg_delete_behavior: "delete" | "ignore" | "<any other string>"
         # Any string other than "delete" or "ignore" is posted as a TG reply.
@@ -2652,6 +2661,9 @@ class TDbridgeDiscordClient(discord.Client):
             )
             return
 
+        if _tg_app is None:
+            logger.debug("Skipping Discord event: Telegram app not ready yet (startup window)")
+            return
         tg_bot: TelegramBot = _tg_app.bot
         native_ok = False
         reply_ok  = False

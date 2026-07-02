@@ -397,6 +397,31 @@ def gateway_peek(gateway: str, limit: int = 100) -> list:
     return [{"id": r["id"], "chat_id": r["chat_id"], "event_json": r["event_json"]} for r in rows]
 
 
+def gateway_queue_all() -> list:
+    """Return ALL queued events (any gateway), as dicts {id, gateway, chat_id,
+    event_json}. Used by the stale-attachment sweep to find events referencing
+    an expiring file."""
+    sql = "SELECT id, gateway, chat_id, event_json FROM gateway_queue ORDER BY id ASC"
+    with _connect() as conn:
+        rows = conn.execute(sql).fetchall()
+    return [
+        {"id": r["id"], "gateway": r["gateway"], "chat_id": r["chat_id"],
+         "event_json": r["event_json"]}
+        for r in rows
+    ]
+
+
+def gateway_update_event(event_id: int, event_json: str) -> None:
+    """Replace a queued event's serialized envelope (by row id). Used to rewrite
+    an event when its attachment expires, so the message still makes sense when
+    polled."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE gateway_queue SET event_json = ? WHERE id = ?",
+            (str(event_json), int(event_id)),
+        )
+
+
 def gateway_mark_delivered(ids: list) -> None:
     """Mark the given queue row ids as delivered (sets delivered_at=now).
     Used for RequireACK gateways, which retain rows until acked."""
