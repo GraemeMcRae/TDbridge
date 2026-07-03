@@ -472,31 +472,50 @@ async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
 
     # -------- REACTION --------
     if etype == "reaction":
-        # Bridge as a reply-note (mirrors the native reaction-as-reply behavior),
-        # keeping the client side simple. Resolve the parent Discord message.
         tg_mid = payload.get("message_id")
         emoji_list = payload.get("emoji") or []
         emoji_str = " ".join(emoji_list) if isinstance(emoji_list, list) else str(emoji_list)
+        sender = (payload.get("from", {}) or {}).get("first_name") or gateway_name
         rec = await loop.run_in_executor(
             None, db.find_by_tg, tg_group_id, _tg_msg_id_str(tg_mid)
         ) if tg_mid is not None else None
-        try:
-            webhook = await _get_discord_webhook(channel)
-            ref = None
-            if rec and rec.get("dc_message_id"):
+
+        behavior = config.reactions_dtot  # react / reply / both / neither
+        applied = "none"
+        target_msg = None
+        if rec and rec.get("dc_message_id"):
+            try:
+                target_msg = await channel.fetch_message(int(rec["dc_message_id"]))
+            except Exception:
+                target_msg = None
+
+        # Apply the actual reaction to the corresponding Discord message.
+        if target_msg is not None and behavior in ("react", "both"):
+            for e in (emoji_list if isinstance(emoji_list, list) else [emoji_str]):
                 try:
-                    parent = await channel.fetch_message(int(rec["dc_message_id"]))
-                    ref = parent.to_reference(fail_if_not_exists=False)
-                except Exception:
-                    ref = None
-            sender = payload.get("from_user", {}).get("first_name") or gateway_name
-            await channel.send(content=f"{sender} reacted: {emoji_str}",
-                               reference=ref, mention_author=False)
-        except Exception as e:
-            logger.warning(f"Gateway client [{gateway_name}] reaction bridge failed: {e}")
+                    await target_msg.add_reaction(e)
+                    applied = "reacted"
+                except Exception as ex:
+                    logger.warning(
+                        f"Gateway client [{gateway_name}] add_reaction failed "
+                        f"({e!r}): {ex}"
+                    )
+        # Optionally also post a reply-note (attribution is clearer this way).
+        if behavior in ("reply", "both"):
+            try:
+                ref = target_msg.to_reference(fail_if_not_exists=False) if target_msg else None
+                await channel.send(
+                    content=f"{sender} reacted: {emoji_str}",
+                    reference=ref, mention_author=False,
+                )
+                applied = "reply" if applied == "none" else "both"
+            except Exception as ex:
+                logger.warning(f"Gateway client [{gateway_name}] reaction note failed: {ex}")
+
         logger.info(
             f"GW client→DC reaction | gateway={gateway_name} | tg_group={tg_group_id} | "
-            f"tg_msg={tg_mid} | emoji={emoji_str}"
+            f"tg_msg={tg_mid} | emoji={emoji_str} | sender={sender!r} | "
+            f"dc_msg={rec.get('dc_message_id') if rec else None} | applied={applied}"
         )
         await _ack()
         return
@@ -504,7 +523,7 @@ async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
     # -------- MESSAGE / EDITED_MESSAGE --------
     tg_msg_id = _tg_msg_id_str(payload.get("message_id"))
     text = payload.get("text") or ""
-    sender_name = (payload.get("from_user", {}) or {}).get("first_name") or gateway_name
+    sender_name = (payload.get("from", {}) or {}).get("first_name") or gateway_name
     reply_to_tg = payload.get("reply_to")
 
     # Reply threading via our own SQLite: find the Discord parent of the TG
