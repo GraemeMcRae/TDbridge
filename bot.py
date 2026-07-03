@@ -2505,9 +2505,25 @@ class TDbridgeDiscordClient(discord.Client):
                 root_tg_msg_id = parent_record["root_tg_msg_id"]
                 immediate_reply_tg_id = parent_record["tg_message_id"]
                 inherited_origin_gateway = parent_record.get("origin_gateway", "") or ""
-                # The reply should travel back out the SAME gateway the parent
-                # came through (its origin_gateway). Blank → native send.
-                target_gateway = inherited_origin_gateway
+                # HOP 1 (native delivery of THIS reply) is governed by THIS
+                # message's own D_User row for (sender, target group) — i.e. the
+                # gateway THIS instance uses to reach that group — NOT by the
+                # parent's inherited gateway. For prod replying in #2026-party
+                # that row is blank-gateway (Telegram). HOP 2 (relaying the
+                # reply back out because its root came through a gateway) is a
+                # SEPARATE, additional step driven by inherited_origin_gateway,
+                # handled later via the outbound-relay enqueue — it must not
+                # hijack this first-hop routing decision.
+                _self_row = sheets_manager.get_user_by_discord_id(str(message.author.id))
+                if _self_row and str(_self_row.get("T_GroupID", "")).strip() == str(tg_group_id).strip():
+                    target_gateway = str(_self_row.get("T_Gateway", "") or "").strip()
+                elif sheets_manager.get_user_by_gateway_and_group("", tg_group_id):
+                    # A native (blank-gateway) row maps this group for us: prod
+                    # reaches its own groups natively.
+                    target_gateway = ""
+                else:
+                    # No native row; fall back to the inherited gateway.
+                    target_gateway = inherited_origin_gateway
 
         # Case 2: First tagged user OR role (left-to-right in message text)
         # that is Active, has a T_GroupID, and has a D_ChannelID matching
