@@ -159,11 +159,19 @@ class GatewayClient:
         return body
 
     async def send_reaction(
-        self, chat_id: int, message_id: int, emoji: List[str]
+        self, chat_id: int, message_id: int, emoji: List[str],
+        *, sender_name: Optional[str] = None,
     ) -> dict:
-        """Send a 'reaction' event."""
+        """Send a 'reaction' event. sender_name, when given, is carried as the
+        reactor's display name so the receiving side can attribute it correctly
+        (otherwise the receiver falls back to the gateway name)."""
+        from_user = (
+            gp.User(first_name=sender_name, is_synthetic=True)
+            if sender_name else None
+        )
         env = gp.make_reaction(
-            self._gw.name, chat_id, message_id, emoji, secret=self._gw.secret
+            self._gw.name, chat_id, message_id, emoji,
+            secret=self._gw.secret, from_user=from_user,
         )
         status, body = await self._post_envelope("send", env)
         if status != 200:

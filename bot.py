@@ -3137,6 +3137,7 @@ class TDbridgeDiscordClient(discord.Client):
                 try:
                     await client.send_reaction(
                         int(tg_group_id), tg_msg_id, [emoji_str],
+                        sender_name=user_name,
                     )
                     logger.info(
                         f"DC→GW reaction | gateway={record_gateway} | "
