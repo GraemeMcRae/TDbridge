@@ -119,6 +119,11 @@ _lock = threading.RLock()
 
 user_by_discord_id: dict[str, dict]  = {}
 user_by_tg_group_id: dict[str, dict] = {}
+# Composite (T_GroupID, T_Gateway) → Active D_User row. The canonical key for
+# routing a message to Discord: the source determines the gateway value (blank
+# for native Telegram, a gateway name for gateway-sourced), and the SAME lookup
+# is used in both cases — no T_GroupID-only special case.
+user_by_group_gateway: dict[tuple[str, str], dict] = {}
 channel_by_id: dict[str, dict]       = {}
 group_by_id: dict[str, dict]         = {}
 # Composite-keyed group cache: (T_GroupID, T_Gateway) → T_Group row.
@@ -233,20 +238,18 @@ def get_client_gateway_names() -> set:
 
 
 def get_user_by_gateway_and_group(gateway_name: str, tg_group_id: str) -> Optional[dict]:
-    """Return the ACTIVE D_User row matching BOTH a gateway name (T_Gateway) and
-    a Telegram group id (T_GroupID). Used to route an inbound event received as
-    a gateway CLIENT to the correct Discord user+channel (Design Q3). Returns
-    None if no active row matches both."""
-    gw = str(gateway_name or "").strip()
+    """Return the ACTIVE D_User row for a (T_Gateway, T_GroupID) pair, or None.
+
+    This is the CANONICAL lookup for routing a message to Discord, used for
+    BOTH sources with no special case:
+      • Native Telegram message  → gateway_name = "" (blank)
+      • Gateway-sourced message  → gateway_name = the originating gateway
+    A blank gateway is simply one value of the composite key.
+    """
     gid = _normalise_id(tg_group_id)
+    gw = _norm_gateway(gateway_name)
     with _lock:
-        for row in user_by_discord_id.values():
-            if not _is_active(row.get("D_UserStatus", "")):
-                continue
-            if (_normalise_id(row.get("T_GroupID", "")) == gid
-                    and str(row.get("T_Gateway", "") or "").strip() == gw):
-                return row
-    return None
+        return user_by_group_gateway.get((gid, gw))
 
 
 def get_active_channels() -> list[dict]:
@@ -298,6 +301,7 @@ def _build_caches(
     """Rebuild in-memory routing caches from supplied record lists."""
     new_user_by_id: dict[str, dict]   = {}
     new_user_by_tg: dict[str, dict]   = {}
+    new_user_by_combo: dict[tuple[str, str], dict] = {}
     new_channel: dict[str, dict]      = {}
     new_group: dict[str, dict]        = {}
     new_group_by_combo: dict[tuple[str, str], dict] = {}
@@ -321,6 +325,14 @@ def _build_caches(
             )
             if active:
                 new_user_by_tg[tgid] = row
+                # Composite (T_GroupID, T_Gateway) D_User cache — the canonical
+                # key for bridging to Discord. Blank gateway is simply one value
+                # of the key (native Telegram source); a gateway name is another
+                # (gateway source). First active row for a combo wins.
+                gw = _norm_gateway(row.get("T_Gateway", ""))
+                combo = (tgid, gw)
+                if combo not in new_user_by_combo:
+                    new_user_by_combo[combo] = row
                 cb_added += 1
             else:
                 cb_skipped += 1
@@ -344,11 +356,12 @@ def _build_caches(
                 new_group_by_combo[combo] = row
 
     global user_by_discord_id, user_by_tg_group_id, channel_by_id, group_by_id
-    global group_by_id_gateway
+    global group_by_id_gateway, user_by_group_gateway
     global _last_refresh_time
     with _lock:
         user_by_discord_id  = new_user_by_id
         user_by_tg_group_id = new_user_by_tg
+        user_by_group_gateway = new_user_by_combo
         channel_by_id       = new_channel
         group_by_id         = new_group
         group_by_id_gateway = new_group_by_combo

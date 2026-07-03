@@ -1527,10 +1527,12 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ---- Determine target Discord channel ----
     # TG→DC routing — three cases in priority order:
-    #   Case 1: Active D_User row matching T_GroupID → normal user/role tag
+    #   Case 1: Active D_User row matching (T_GroupID, blank gateway) → user tag
     #   Case 2: Inactive D_User row matching T_GroupID → normal tag + ERRMSG
     #   Case 3: No row at all → first Active channel + pseudo-tag + ERRMSG
-    user_row = sheets_manager.get_user_by_tg_group(tg_group_id)
+    # Native Telegram source → gateway is blank; the canonical (gateway, group)
+    # lookup is used, with "" as the gateway value (no special case).
+    user_row = sheets_manager.get_user_by_gateway_and_group("", tg_group_id)
     _inactive_row: Optional[dict] = None
     if not user_row:
         _inactive_row = sheets_manager.get_user_by_tg_group_inactive(tg_group_id)
@@ -2108,7 +2110,12 @@ async def bridge_gateway_message_to_discord(
     )
 
     # ---- Determine target Discord channel (same cases as TG→DC) ----
-    user_row = sheets_manager.get_user_by_tg_group(tg_group_id)
+    # The server bridges an inbound gateway message into ITS OWN Discord, which
+    # reaches this group via its own D_User row. That row's gateway value is
+    # used as the lookup key (blank when the server reaches the group natively,
+    # as prod does). Canonical (gateway, group) lookup — no T_GroupID-only case.
+    _own_gw_for_group = ""  # server's own row is native for the echoed group
+    user_row = sheets_manager.get_user_by_gateway_and_group(_own_gw_for_group, tg_group_id)
     _inactive_row: Optional[dict] = None
     if not user_row:
         _inactive_row = sheets_manager.get_user_by_tg_group_inactive(tg_group_id)
@@ -2498,9 +2505,9 @@ class TDbridgeDiscordClient(discord.Client):
                 root_tg_msg_id = parent_record["root_tg_msg_id"]
                 immediate_reply_tg_id = parent_record["tg_message_id"]
                 inherited_origin_gateway = parent_record.get("origin_gateway", "") or ""
-                _grow = sheets_manager.get_user_by_tg_group(tg_group_id)
-                if _grow:
-                    target_gateway = str(_grow.get("T_Gateway", "") or "").strip()
+                # The reply should travel back out the SAME gateway the parent
+                # came through (its origin_gateway). Blank → native send.
+                target_gateway = inherited_origin_gateway
 
         # Case 2: First tagged user OR role (left-to-right in message text)
         # that is Active, has a T_GroupID, and has a D_ChannelID matching
@@ -3075,6 +3082,7 @@ class TDbridgeDiscordClient(discord.Client):
         tg_group_id = record["tg_group_id"]
         tg_msg_id   = int(record["tg_message_id"])
         emoji_str   = str(payload.emoji)
+        record_gateway = record.get("origin_gateway", "") or ""
 
         behavior = config.reactions_dtot
         if behavior == "neither":
@@ -3084,6 +3092,30 @@ class TDbridgeDiscordClient(discord.Client):
                 f"result=IGNORED | reason=REACTIONS_DTOT=neither"
             )
             return
+
+        # If the message this reaction targets is gateway-origin AND we are a
+        # CLIENT for that gateway, the reaction travels OUT via the gateway
+        # (not a native Telegram call — this instance isn't in that TG group).
+        if record_gateway:
+            client = _get_gateway_client(record_gateway)
+            if client is not None:
+                try:
+                    await client.send_reaction(
+                        int(tg_group_id), tg_msg_id, [emoji_str],
+                    )
+                    logger.info(
+                        f"DC→GW reaction | gateway={record_gateway} | "
+                        f"tg_group={tg_group_id} | tg_msg={tg_msg_id} | "
+                        f"emoji={emoji_str} | user={user_name!r}"
+                    )
+                except GatewayClientError as e:
+                    logger.error(
+                        f"DC→GW reaction failed | gateway={record_gateway} | "
+                        f"tg_msg={tg_msg_id} | emoji={emoji_str} | {e}"
+                    )
+                return
+            # record_gateway set but we're not its client → fall through to
+            # native (we own/serve that gateway, so native TG is correct).
 
         if _tg_app is None:
             logger.debug("Skipping Discord event: Telegram app not ready yet (startup window)")
