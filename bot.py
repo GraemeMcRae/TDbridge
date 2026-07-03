@@ -3926,7 +3926,108 @@ async def _startup(discord_client: discord.Client) -> None:
             "notes": notes,
         }
 
+    async def _gateway_reaction(*, chat_id, message_id, emoji, sender_name):
+        """Inbound reaction from a gateway client. Apply it to the real Telegram
+        message natively (this server is in that TG group), and bridge it to our
+        Discord as a reply-note — mirroring native reaction behavior. Returns
+        {"notes": [...]}. Also relays onward as an outbound event so OTHER
+        clients of this gateway see it (the reaction's message is gateway-origin
+        from their perspective too)."""
+        notes = []
+        gid_str = _tg_group_id_str(chat_id)
+        emoji_str = " ".join(emoji) if isinstance(emoji, list) else str(emoji)
+        bot = _tg_app.bot if _tg_app else None
+        if bot is None:
+            return {"notes": ["telegram app not ready"]}
+
+        behavior = config.reactions_dtot
+        # Native apply to Telegram (react) and/or reply, per config.
+        if behavior in ("react", "both"):
+            try:
+                from telegram import ReactionTypeEmoji
+                await bot.set_message_reaction(
+                    chat_id=int(chat_id), message_id=int(message_id),
+                    reaction=[ReactionTypeEmoji(emoji=e) for e in (emoji or [])],
+                )
+            except Exception as e:
+                logger.warning(f"GW→TG reaction (native apply) failed: {e}")
+                notes.append(f"native reaction failed: {e}")
+        if behavior in ("reply", "both"):
+            try:
+                await bot.send_message(
+                    chat_id=int(chat_id),
+                    text=f"{emoji_str} {sender_name} (via gateway) reacted to this message",
+                    reply_to_message_id=int(message_id),
+                )
+            except Exception as e:
+                logger.warning(f"GW→TG reaction (reply) failed: {e}")
+
+        # Bridge to our Discord: post a reply-note under the mapped Discord msg.
+        loop = asyncio.get_running_loop()
+        rec = await loop.run_in_executor(
+            None, db.find_by_tg, gid_str, _tg_msg_id_str(message_id)
+        )
+        if rec and rec.get("dc_channel_id"):
+            channel = await _get_discord_channel(rec["dc_channel_id"])
+            if channel is not None:
+                try:
+                    ref = None
+                    if rec.get("dc_message_id"):
+                        pm = await channel.fetch_message(int(rec["dc_message_id"]))
+                        ref = pm.to_reference(fail_if_not_exists=False)
+                    await channel.send(
+                        content=f"{sender_name} reacted: {emoji_str}",
+                        reference=ref, mention_author=False,
+                    )
+                except Exception as e:
+                    logger.warning(f"GW→DC reaction bridge failed: {e}")
+
+        logger.info(
+            f"GW→TG/DC reaction applied | tg_group={gid_str} | tg_msg={message_id} | "
+            f"emoji={emoji_str} | sender={sender_name!r}"
+        )
+        return {"notes": notes}
+
+    async def _gateway_deletion(*, chat_id, message_ids, sender_name):
+        """Inbound deletion from a gateway client. Delete the real Telegram
+        message(s) natively and the mapped Discord message(s). Returns
+        {"notes": [...]}."""
+        notes = []
+        gid_str = _tg_group_id_str(chat_id)
+        bot = _tg_app.bot if _tg_app else None
+        loop = asyncio.get_running_loop()
+        for mid in message_ids:
+            # Delete from Telegram.
+            if bot is not None:
+                try:
+                    await bot.delete_message(chat_id=int(chat_id), message_id=int(mid))
+                except Exception as e:
+                    logger.warning(f"GW→TG deletion failed for {mid}: {e}")
+                    notes.append(f"tg delete failed for {mid}: {e}")
+            # Delete mapped Discord message.
+            rec = await loop.run_in_executor(
+                None, db.find_by_tg, gid_str, _tg_msg_id_str(mid)
+            )
+            if rec and rec.get("dc_channel_id") and rec.get("dc_message_id"):
+                channel = await _get_discord_channel(rec["dc_channel_id"])
+                if channel is not None:
+                    try:
+                        dm = await channel.fetch_message(int(rec["dc_message_id"]))
+                        await dm.delete()
+                    except Exception as e:
+                        logger.warning(f"GW→DC deletion failed for {mid}: {e}")
+                await loop.run_in_executor(
+                    None, db.delete_by_dc, rec["dc_channel_id"], rec["dc_message_id"]
+                )
+        logger.info(
+            f"GW→TG/DC deletion applied | tg_group={gid_str} | tg_msgs={list(message_ids)} | "
+            f"sender={sender_name!r}"
+        )
+        return {"notes": notes}
+
     _gateway_server.set_bridge_hook(_gateway_bridge)
+    _gateway_server.set_reaction_hook(_gateway_reaction)
+    _gateway_server.set_deletion_hook(_gateway_deletion)
     await _gateway_server.start()
     bot_status.gateway_serving = _gateway_server.is_serving()
 

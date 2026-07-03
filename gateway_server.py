@@ -66,6 +66,12 @@ class GatewayServer:
         #                    echo: bool, client_msg_id: Optional[int]) -> dict
         # Returns {"message_ids": [...], "dc_message_id": <str or None>}.
         self._bridge_hook = None
+        # Hooks for inbound reaction/deletion events (client → server). Each is
+        # an async callable; None means "not wired" (accepted but no-op).
+        #   reaction_hook(chat_id, message_id, emoji: list, sender_name) -> dict
+        #   deletion_hook(chat_id, message_ids: list, sender_name) -> dict
+        self._reaction_hook = None
+        self._deletion_hook = None
         # asyncio.Event used to wake long-poll waiters when an event is queued.
         # Created lazily in start() on the running loop.
         self._poll_wakeup = None
@@ -73,6 +79,14 @@ class GatewayServer:
     def set_bridge_hook(self, hook) -> None:
         """Inject the async send-and-bridge hook (the gateway's central function)."""
         self._bridge_hook = hook
+
+    def set_reaction_hook(self, hook) -> None:
+        """Inject the async inbound-reaction hook."""
+        self._reaction_hook = hook
+
+    def set_deletion_hook(self, hook) -> None:
+        """Inject the async inbound-deletion hook."""
+        self._deletion_hook = hook
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                          #
@@ -227,6 +241,73 @@ class GatewayServer:
         auth_err = self._check_secret(env)
         if auth_err is not None:
             return auth_err
+
+        # ---- Inbound reaction ----
+        if env.event_type == gp.EVENT_REACTION:
+            payload = env.payload   # ReactionPayload
+            from_user = getattr(payload, "from_user", None)
+            sender_name = (
+                from_user.first_name if (from_user and from_user.first_name)
+                else self._own_gateway
+            )
+            if self._reaction_hook is None:
+                return web.json_response({
+                    "protocol_version": gp.PROTOCOL_VERSION,
+                    "status": "not_implemented",
+                    "note": "reaction hook not available",
+                })
+            try:
+                result = await self._reaction_hook(
+                    chat_id=payload.chat_id,
+                    message_id=payload.message_id,
+                    emoji=list(payload.emoji or []),
+                    sender_name=sender_name,
+                ) or {}
+            except Exception as e:
+                logger.warning("Gateway reaction bridge failed: %s", e)
+                return web.json_response({
+                    "protocol_version": gp.PROTOCOL_VERSION,
+                    "status": "error",
+                    "note": f"reaction bridge failed: {e}",
+                }, status=502)
+            return web.json_response({
+                "protocol_version": gp.PROTOCOL_VERSION,
+                "status": "applied",
+                "chat": {"id": payload.chat_id},
+                "notes": result.get("notes", []) or [],
+            })
+
+        # ---- Inbound deletion ----
+        if env.event_type == gp.EVENT_DELETION:
+            payload = env.payload   # IdsPayload
+            ids = list(getattr(payload, "message_ids", None) or [])
+            if not ids and getattr(payload, "message_id", None) is not None:
+                ids = [payload.message_id]
+            if self._deletion_hook is None:
+                return web.json_response({
+                    "protocol_version": gp.PROTOCOL_VERSION,
+                    "status": "not_implemented",
+                    "note": "deletion hook not available",
+                })
+            try:
+                result = await self._deletion_hook(
+                    chat_id=payload.chat_id,
+                    message_ids=ids,
+                    sender_name=self._own_gateway,
+                ) or {}
+            except Exception as e:
+                logger.warning("Gateway deletion bridge failed: %s", e)
+                return web.json_response({
+                    "protocol_version": gp.PROTOCOL_VERSION,
+                    "status": "error",
+                    "note": f"deletion bridge failed: {e}",
+                }, status=502)
+            return web.json_response({
+                "protocol_version": gp.PROTOCOL_VERSION,
+                "status": "deleted",
+                "chat": {"id": payload.chat_id},
+                "notes": result.get("notes", []) or [],
+            })
 
         if env.event_type not in (gp.EVENT_MESSAGE, gp.EVENT_EDITED_MESSAGE):
             return web.json_response({
