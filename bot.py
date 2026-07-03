@@ -551,14 +551,13 @@ async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
         )
         edited_ok = False
         if rec and rec.get("dc_message_id"):
-            try:
-                webhook = await _get_discord_webhook(channel)
-                await webhook.edit_message(int(rec["dc_message_id"]), content=f"✏️ {text}")
-                edited_ok = True
-            except Exception as e:
+            edited_ok = await _edit_discord_message(
+                channel, int(rec["dc_message_id"]), f"✏️ {text}"
+            )
+            if not edited_ok:
                 logger.warning(
                     f"Gateway client [{gateway_name}] edit failed for "
-                    f"dc_msg={rec.get('dc_message_id')}: {e}"
+                    f"dc_msg={rec.get('dc_message_id')}"
                 )
         logger.info(
             f"GW client→DC edit | gateway={gateway_name} | tg_group={tg_group_id} | "
@@ -861,6 +860,37 @@ async def _get_discord_webhook(channel: discord.TextChannel) -> Optional[discord
     except Exception as e:
         logger.error(f"Failed to get/create webhook in #{channel.name}: {e}")
         return None
+
+
+async def _edit_discord_message(
+    channel: discord.TextChannel,
+    dc_message_id: int,
+    new_content: str,
+) -> bool:
+    """Edit a bridged Discord message in place, whichever way it was posted.
+
+    Bridged NEW messages are posted via the webhook (editable only through
+    webhook.edit_message); bridged REPLIES are posted via channel.send as the
+    bot (editable only through Message.edit — webhook.edit_message raises
+    10008 Unknown Message on them). We try the webhook first, then fall back
+    to fetching the message and editing it directly. Returns True on success.
+    """
+    webhook = await _get_discord_webhook(channel)
+    if webhook is not None:
+        try:
+            await webhook.edit_message(int(dc_message_id), content=new_content)
+            return True
+        except discord.NotFound:
+            pass  # not a webhook message — fall back to direct edit
+        except Exception as e:
+            logger.debug(f"webhook edit_message fell through for {dc_message_id}: {e}")
+    try:
+        msg = await channel.fetch_message(int(dc_message_id))
+        await msg.edit(content=new_content)
+        return True
+    except Exception as e:
+        logger.warning(f"Direct edit failed for dc_msg={dc_message_id}: {e}")
+        return False
 
 
 async def _send_to_discord(
@@ -2348,24 +2378,14 @@ async def route_tg_edit_to_discord(update: Update, context: ContextTypes.DEFAULT
                 edited=True,
             )
 
-    # Cascade 1: try to edit the original Discord message
-    try:
-        dc_msg = await channel.fetch_message(dc_msg_id)
-        await with_retry(
-            f"DC edit #{channel.name}",
-            lambda: dc_msg.edit(content=edit_prefix + new_text),
-            platform="discord",
-        )
+    # Cascade 1: try to edit the original Discord message in place (helper
+    # handles both webhook-posted and bot channel.send messages).
+    edited_ok = await _edit_discord_message(channel, dc_msg_id, edit_prefix + new_text)
+    if edited_ok:
         logger.info(f"Edited Discord message {dc_msg_id} for TG edit {tg_msg_id}")
         await _enqueue_tg_edit_outbound()
         return
-    except discord.NotFound:
-        pass
-    except discord.Forbidden:
-        # Webhooks create messages owned by the webhook; they can be edited via webhook
-        pass
-    except Exception as e:
-        logger.warning(f"Could not edit Discord message {dc_msg_id}: {e}")
+    logger.debug(f"In-place edit failed for {dc_msg_id}; falling back to new message")
 
     # Cascade 2: post a new reply with the edited content.
     # Always use channel.send() here since we always want a reply reference.
@@ -3947,19 +3967,17 @@ async def _startup(discord_client: discord.Client) -> None:
                 except Exception as e:
                     logger.warning(f"GW→TG edit failed for {client_msg_id}: {e}")
                     notes.append(f"tg edit failed: {e}")
-            # Edit the mapped Discord message (webhook messages can be edited).
+            # Edit the mapped Discord message (new msgs via webhook, replies via
+            # direct edit — the helper handles both).
             dc_msg_id = rec.get("dc_message_id") if rec else None
             if rec and rec.get("dc_channel_id") and dc_msg_id:
                 channel = await _get_discord_channel(rec["dc_channel_id"])
                 if channel is not None:
-                    try:
-                        webhook = await _get_discord_webhook(channel)
-                        # Preserve the attribution prefix used on bridged msgs.
-                        new_content = f"✏️ {edit_text}"
-                        await webhook.edit_message(int(dc_msg_id), content=new_content)
-                    except Exception as e:
-                        logger.warning(f"GW→DC edit failed for {dc_msg_id}: {e}")
-                        notes.append(f"dc edit failed: {e}")
+                    ok = await _edit_discord_message(
+                        channel, int(dc_msg_id), f"✏️ {edit_text}"
+                    )
+                    if not ok:
+                        notes.append("dc edit failed")
             logger.info(
                 f"GW→TG/DC edit applied | tg_group={gid_str} | tg_msg={client_msg_id} | "
                 f"dc_msg={dc_msg_id} | sender={sender_name!r}"
