@@ -574,6 +574,24 @@ async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
     sender_name = (payload.get("from", {}) or {}).get("first_name") or gateway_name
     reply_to_tg = payload.get("reply_to")
 
+    # Dedupe: if we ALREADY have a mapping for this (group, tg_msg), we either
+    # originated this message (it was sent from our side via the gateway client,
+    # and the server echoed it back to us) or we already bridged it. Re-posting
+    # would create a duplicate Discord message AND overwrite the existing
+    # mapping — which later breaks deletion (the original copy is orphaned).
+    # Skip and ack.
+    _existing = await loop.run_in_executor(
+        None, db.find_by_tg, tg_group_id, tg_msg_id
+    )
+    if _existing:
+        logger.info(
+            f"GW client→DC message SKIPPED (already mapped — own echo or "
+            f"duplicate) | gateway={gateway_name} | tg_group={tg_group_id} | "
+            f"tg_msg={tg_msg_id} | existing_dc_msg={_existing.get('dc_message_id')}"
+        )
+        await _ack()
+        return
+
     # Reply threading via our own SQLite: find the Discord parent of the TG
     # message being replied to.
     discord_ref = None
