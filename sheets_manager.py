@@ -217,6 +217,21 @@ def get_all_user_rows_in_table_order() -> list[dict]:
         return list(user_by_discord_id.values())
 
 
+def get_client_gateway_names() -> set:
+    """Return the distinct, non-blank T_Gateway values appearing in ACTIVE
+    D_User rows. These are the gateways this instance may need to act as a
+    CLIENT for (per the design: poll every gateway named in the T_Gateway column
+    of an active row that exists in the gateways file and is not OWN_GATEWAY —
+    the file/own-gateway filtering is applied by the caller)."""
+    names: set = set()
+    with _lock:
+        for row in user_by_tg_group_id.values():
+            gw = str(row.get("T_Gateway", "") or "").strip()
+            if gw:
+                names.add(gw)
+    return names
+
+
 def get_active_channels() -> list[dict]:
     """Return all D_Channel rows with D_ChannelStatus == 'Active'."""
     with _lock:

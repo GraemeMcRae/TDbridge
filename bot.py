@@ -58,6 +58,7 @@ import db
 import sheets_manager
 from dashboard_reporter import DashboardReporter, status as bot_status
 from gateway_server import GatewayServer
+from gateway_client import GatewayClient, GatewayClientError
 from gateway_retry import with_retry, RetryGaveUp
 import gateway_protocol as gp
 import gateway_ratelimit
@@ -235,6 +236,169 @@ _dashboard_reporter = DashboardReporter(config, bot_status)
 
 # Gateway server — serves this instance's OWN_GATEWAY (no-op if client-only).
 _gateway_server = GatewayServer(config)
+
+# Gateway CLIENT registry — GatewayClient instances for every gateway this
+# instance is a client for (i.e. referenced in the T_Gateway column of the sheet
+# and not our own). Populated at startup from the gateways file. The bot acts as
+# BOTH server and client simultaneously; this is the client half. Keyed by
+# gateway name. See _build_gateway_clients().
+_gateway_clients: dict = {}
+# Background poll tasks for each client gateway (Half 2).
+_gateway_poll_tasks: list = []
+
+
+def _get_gateway_client(name: str):
+    """Return the GatewayClient for a gateway name, or None if we're not a
+    client for it (e.g. it's our own, or not in the file)."""
+    return _gateway_clients.get(name)
+
+
+def _build_gateway_clients() -> None:
+    """Populate the client registry with a GatewayClient for every gateway that:
+      (a) is named in the T_Gateway column of an ACTIVE D_User row, AND
+      (b) exists in the gateways file, AND
+      (c) is not this instance's OWN_GATEWAY.
+    (Per the design Q2.) Called at startup after the sheet cache is loaded.
+    Safe to call again on a sheet refresh to pick up newly-referenced gateways.
+    """
+    own = getattr(config, "own_gateway", "") or ""
+    gws = getattr(config, "gateways", {}) or {}
+    referenced = sheets_manager.get_client_gateway_names()
+    for name in referenced:
+        if name == own:
+            continue  # we are the SERVER for this one, not a client
+        if name in _gateway_clients:
+            continue  # already built
+        gwdef = gws.get(name)
+        if gwdef is None:
+            logger.warning(
+                f"Gateway client: T_Gateway {name!r} referenced in the sheet but "
+                f"not present in the gateways file — cannot act as its client."
+            )
+            continue
+        _gateway_clients[name] = GatewayClient(gwdef)
+        logger.info(f"Gateway client registered for {name!r} (url={gwdef.url})")
+    if not _gateway_clients:
+        logger.info("Gateway client: no client gateways referenced; client role inactive.")
+
+
+def _start_gateway_poll_loops() -> None:
+    """Start a background poll task for each registered client gateway (Half 2).
+    Each task long-polls its gateway and bridges inbound events into this
+    instance's environment. Poll errors (e.g. concurrent polling by another
+    client) are logged and retried, not fatal."""
+    for name, client in _gateway_clients.items():
+        task = asyncio.create_task(_gateway_client_poll_loop(name, client))
+        _gateway_poll_tasks.append(task)
+        logger.info(f"Gateway client poll loop started for {name!r}")
+
+
+async def _gateway_client_poll_loop(gateway_name: str, client) -> None:
+    """Long-poll a client gateway and bridge inbound events into this instance.
+
+    Delegates to the client library's resilient run_poll_loop (which handles
+    transient poll errors with backoff — expected when another client, e.g.
+    Tim's, polls the same gateway concurrently).
+
+    Half 1 status: the handler logs received events (proving outbound
+    round-trips arrive). Full inbound bridging into Discord is wired in Half 2
+    (_bridge_gateway_client_event).
+    """
+    async def _on_events(events: list) -> None:
+        for ev in events:
+            try:
+                await _bridge_gateway_client_event(gateway_name, ev)
+            except Exception as e:
+                logger.error(
+                    f"Gateway client [{gateway_name}]: error bridging inbound event: {e}"
+                )
+    try:
+        await client.run_poll_loop(_on_events)
+    except asyncio.CancelledError:
+        logger.info(f"Gateway client [{gateway_name}]: poll loop cancelled")
+        raise
+
+
+async def _send_via_gateway_client(
+    client, gateway_name: str, tg_group_id: str, text: str, message,
+    immediate_reply_tg_id, dc_channel_id: str, dc_msg_id: str,
+) -> None:
+    """Send a Discord-origin message to Telegram VIA the gateway (as a client).
+
+    The server instance echoes it into Telegram and returns the real Telegram
+    message id(s). We store the DC↔TG mapping in our OWN SQLite (Design Q4) so
+    replies on our side thread correctly. Attachments are uploaded to the
+    gateway first (file_ref), then referenced in the send.
+    """
+    try:
+        chat_id = int(tg_group_id)
+    except (ValueError, TypeError):
+        logger.warning(f"DC→GW: invalid tg_group_id {tg_group_id!r}; not sending")
+        return
+
+    reply_to = None
+    if immediate_reply_tg_id:
+        try:
+            reply_to = int(immediate_reply_tg_id)
+        except (ValueError, TypeError):
+            reply_to = None
+
+    # Upload attachments to the gateway (reuse the DC→GW gather → file_refs).
+    gw_attachments = []
+    if message.attachments:
+        gw_attachments, gw_notes = await _gather_outbound_attachments_from_discord(
+            gateway_name, message.attachments
+        )
+        for _n in gw_notes:
+            logger.warning(f"DC→GW client send ({tg_group_id}): {_n}")
+
+    try:
+        resp = await client.send_message(
+            chat_id, text=text, reply_to=reply_to,
+            attachments=(gw_attachments or None),
+        )
+    except GatewayClientError as e:
+        logger.error(
+            f"DC→GW client send failed | gateway={gateway_name} | tg_group={tg_group_id} | {e}"
+        )
+        return
+
+    msg_ids = resp.get("message_ids") or []
+    logger.info(
+        f"DC→GW client send | gateway={gateway_name} | tg_group={tg_group_id} | "
+        f"reply_to={reply_to} | attachments={len(gw_attachments)} | "
+        f"tg_msgs={msg_ids} | status={resp.get('status')}"
+    )
+
+    # Store DC↔TG mapping in our own SQLite so replies thread (Q4). Echo returns
+    # the real Telegram ids the server created; map each back to this DC message.
+    if msg_ids:
+        loop = asyncio.get_running_loop()
+        root = _tg_msg_id_str(msg_ids[0])
+        for mid in msg_ids:
+            await loop.run_in_executor(
+                None, db.store_message,
+                tg_group_id, _tg_msg_id_str(mid), dc_channel_id, dc_msg_id,
+                root, str(message.author.id),
+                gateway_name,   # origin_gateway = the gateway we sent through
+            )
+
+
+async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
+    """Bridge one inbound gateway event (received as a CLIENT) into this
+    instance's environment. Half 1: log only (proves the round-trip). Half 2
+    will resolve the (gateway_name, chat_id) → D_User row and post to the
+    corresponding Discord channel, thread via the local SQLite, etc."""
+    payload = ev.get("payload", {}) or {}
+    etype = ev.get("event_type", "?")
+    chat = payload.get("chat", {}) or {}
+    logger.info(
+        f"Gateway client [{gateway_name}] inbound {etype} | "
+        f"chat={chat.get('id')} | msg={payload.get('message_id')} | "
+        f"text={payload.get('text')!r} | "
+        f"attachments={len(payload.get('attachments') or [])} "
+        f"(Half 1: logged, not yet bridged to Discord)"
+    )
 
 
 # ===========================================================================
@@ -2129,6 +2293,10 @@ class TDbridgeDiscordClient(discord.Client):
 
         # ---- Determine target Telegram group ----
         tg_group_id: Optional[str] = None
+        # If the resolved D_User row has a non-empty T_Gateway, this message is
+        # sent to Telegram VIA THAT GATEWAY (as a client), not natively. Blank
+        # → native send as before. (Design Q1.)
+        target_gateway: str = ""
         root_tg_msg_id: Optional[str] = None
         # The Telegram message id to reply to: the IMMEDIATE parent's own id, so
         # the reply tree is preserved faithfully (not flattened to the root).
@@ -2152,6 +2320,9 @@ class TDbridgeDiscordClient(discord.Client):
                 root_tg_msg_id = parent_record["root_tg_msg_id"]
                 immediate_reply_tg_id = parent_record["tg_message_id"]
                 inherited_origin_gateway = parent_record.get("origin_gateway", "") or ""
+                _grow = sheets_manager.get_user_by_tg_group(tg_group_id)
+                if _grow:
+                    target_gateway = str(_grow.get("T_Gateway", "") or "").strip()
 
         # Case 2: First tagged user OR role (left-to-right in message text)
         # that is Active, has a T_GroupID, and has a D_ChannelID matching
@@ -2197,6 +2368,7 @@ class TDbridgeDiscordClient(discord.Client):
                     )
                     continue
                 tg_group_id = tgid
+                target_gateway = str(row.get("T_Gateway", "") or "").strip()
                 logger.info(
                     f"DC→TG routing: routing to tagged {'role' if key.startswith('&') else 'user'} "
                     f"{key!r} → TG group {tg_group_id} via channel {incoming_channel_id}"
@@ -2228,6 +2400,7 @@ class TDbridgeDiscordClient(discord.Client):
                     )
                 else:
                     tg_group_id = tgid
+                    target_gateway = str(sender_row.get("T_Gateway", "") or "").strip()
                     logger.info(
                         f"DC→TG routing: routing to sender user {sender_uid} "
                         f"→ TG group {tg_group_id} via channel {incoming_channel_id}"
@@ -2329,7 +2502,27 @@ class TDbridgeDiscordClient(discord.Client):
         resolved_content = _resolve_discord_mentions(message.content)
         text = f"{attribution} {resolved_content}".strip()
 
-        # ---- Send to Telegram ----
+        # ---- Client-send branch (Design Q1) ----
+        # If the resolved D_User row names a T_Gateway we are a CLIENT for, this
+        # message goes to Telegram VIA THAT GATEWAY (the server instance places
+        # it in Telegram and bridges it there), NOT via a native sendMessage
+        # (which would fail — this instance's bot isn't in that Telegram group).
+        if target_gateway:
+            client = _get_gateway_client(target_gateway)
+            if client is None:
+                logger.warning(
+                    f"DC→TG: row names T_Gateway {target_gateway!r} but no client is "
+                    f"registered for it (not in gateways file, or it's our own). "
+                    f"Message not sent."
+                )
+                return
+            await _send_via_gateway_client(
+                client, target_gateway, tg_group_id, text, message,
+                immediate_reply_tg_id, dc_channel_id, dc_msg_id,
+            )
+            return
+
+        # ---- Send to Telegram (native) ----
         if _tg_app is None:
             logger.debug("Skipping Discord event: Telegram app not ready yet (startup window)")
             return
@@ -3510,6 +3703,11 @@ async def _startup(discord_client: discord.Client) -> None:
     _gateway_server.set_bridge_hook(_gateway_bridge)
     await _gateway_server.start()
     bot_status.gateway_serving = _gateway_server.is_serving()
+
+    # Build the gateway CLIENT registry and start polling the gateways we are a
+    # client for (Half 2). The bot runs as both server and client at once.
+    _build_gateway_clients()
+    _start_gateway_poll_loops()
 
     # Emit startup Status Report and start the 30-minute reporting loop
     _dashboard_reporter.emit_startup()
