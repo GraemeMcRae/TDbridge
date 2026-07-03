@@ -1338,6 +1338,7 @@ async def _handle_tg_delete_command(
 
     dc_channel_id = record["dc_channel_id"]
     dc_msg_id     = record["dc_message_id"]
+    _origin_gateway = record.get("origin_gateway", "") or ""
 
     # ── Step 2: delete parent TG message ─────────────────────────────────────
     try:
@@ -1347,6 +1348,14 @@ async def _handle_tg_delete_command(
             f"parent_tg_msg={tg_parent_msg_id} | tg_group={tg_group_id} | "
             f"step=TG_DELETE | result=ok"
         )
+        # If the deleted message was gateway-origin and we serve that gateway,
+        # relay the deletion out to clients (mirrors the DC→TG delete path).
+        if _origin_gateway:
+            await _gw_enqueue_outbound_deletion(
+                origin_gateway=_origin_gateway,
+                tg_group_id=str(tg_group_id),
+                tg_msg_ids=[int(tg_parent_msg_id)],
+            )
     except Exception as e:
         logger.warning(
             f"TG delete command | cmd_msg={tg_cmd_msg_id} | "
@@ -2927,6 +2936,27 @@ class TDbridgeDiscordClient(discord.Client):
             return
         tg_bot: TelegramBot = _tg_app.bot
 
+        # If the message is gateway-origin AND we are a CLIENT for that gateway,
+        # the edit travels OUT via the gateway client (we can't edit natively —
+        # not in that Telegram group). Mirrors the delete/reaction routing.
+        _client = _get_gateway_client(origin_gateway) if origin_gateway else None
+        if _client is not None:
+            try:
+                await _client.send_message(
+                    int(tg_group_id), text=resolved_edit,
+                    message_id=int(tg_msg_id), edited=True,
+                )
+                logger.info(
+                    f"DC→GW edit | gateway={origin_gateway} | tg_group={tg_group_id} | "
+                    f"tg_msg={tg_msg_id} | sender={sender_name!r}"
+                )
+            except GatewayClientError as e:
+                logger.error(
+                    f"DC→GW edit failed | gateway={origin_gateway} | "
+                    f"tg_msg={tg_msg_id} | {e}"
+                )
+            return
+
         async def _enqueue_edit_outbound():
             # An edit of a gateway-origin message flows back out the gateway as
             # an edited_message carrying the new (resolved) text.
@@ -3022,6 +3052,40 @@ class TDbridgeDiscordClient(discord.Client):
         # "delete": attempt to delete every Telegram message produced by this
         # Discord message.
 
+        # If these messages are gateway-origin AND we are a CLIENT for that
+        # gateway, the deletion travels OUT via the gateway client (we can't
+        # delete natively — this instance isn't in that Telegram group). This
+        # mirrors the reaction/message client-routing. Determine the origin
+        # gateway from the records (all share one).
+        _origin_gateway = ""
+        for r in records:
+            og = r.get("origin_gateway", "") or ""
+            if og:
+                _origin_gateway = og
+                break
+
+        _client = _get_gateway_client(_origin_gateway) if _origin_gateway else None
+        if _client is not None:
+            try:
+                await _client.send_deletion(int(tg_group_id), [int(m) for m in tg_msg_ids])
+                logger.info(
+                    f"DC→GW deletion | gateway={_origin_gateway} | "
+                    f"tg_group={tg_group_id} | tg_msgs={tg_msg_ids}"
+                )
+            except GatewayClientError as e:
+                logger.error(
+                    f"DC→GW deletion failed | gateway={_origin_gateway} | "
+                    f"tg_group={tg_group_id} | tg_msgs={tg_msg_ids} | {e}"
+                )
+            # Remove local DB records and stop — no native delete, no server enqueue.
+            rows_removed = await loop.run_in_executor(
+                None, db.delete_by_dc, dc_channel_id, dc_msg_id
+            )
+            logger.info(
+                f"DC→GW delete | db_rows_removed={rows_removed} for dc_msg={dc_msg_id}"
+            )
+            return
+
         deleted_tg = []
         failed_tg  = []
         for tg_msg_id in tg_msg_ids:
@@ -3057,15 +3121,9 @@ class TDbridgeDiscordClient(discord.Client):
             f"tg_msgs_failed={[t for t, _ in failed_tg]}"
         )
 
-        # If any of the deleted messages were gateway-origin, the deletion also
-        # flows back out the gateway. (All records share one origin_gateway, set
-        # when the message was bridged / inherited down its reply tree.)
-        _origin_gateway = ""
-        for r in records:
-            og = r.get("origin_gateway", "") or ""
-            if og:
-                _origin_gateway = og
-                break
+        # If any of the deleted messages were gateway-origin AND we SERVE that
+        # gateway (owner), the deletion also flows back out via the server
+        # enqueue mechanism so clients see it.
         if _origin_gateway:
             await _gw_enqueue_outbound_deletion(
                 origin_gateway=_origin_gateway,
