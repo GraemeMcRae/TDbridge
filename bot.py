@@ -386,19 +386,197 @@ async def _send_via_gateway_client(
 
 async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
     """Bridge one inbound gateway event (received as a CLIENT) into this
-    instance's environment. Half 1: log only (proves the round-trip). Half 2
-    will resolve the (gateway_name, chat_id) → D_User row and post to the
-    corresponding Discord channel, thread via the local SQLite, etc."""
+    instance's environment, then ACK it (RequireACK gateways dequeue on ack;
+    without the ack the server redelivers forever).
+
+    Routing (Design Q3): resolve the (gateway_name, chat_id) pair to an ACTIVE
+    D_User row and post into that row's Discord channel. Reply threading uses
+    this instance's OWN SQLite (Q4). Handles message (with attachments),
+    edited_message, deletion, and reaction events.
+    """
     payload = ev.get("payload", {}) or {}
     etype = ev.get("event_type", "?")
     chat = payload.get("chat", {}) or {}
-    logger.info(
-        f"Gateway client [{gateway_name}] inbound {etype} | "
-        f"chat={chat.get('id')} | msg={payload.get('message_id')} | "
-        f"text={payload.get('text')!r} | "
-        f"attachments={len(payload.get('attachments') or [])} "
-        f"(Half 1: logged, not yet bridged to Discord)"
+    chat_id = chat.get("id")
+    tg_group_id = str(chat_id) if chat_id is not None else ""
+
+    client = _get_gateway_client(gateway_name)
+
+    # Helper: ack the event so the server dequeues it (RequireACK). We ack by the
+    # message_ids the event carries (deletion/reaction carry a list; message
+    # carries a single id).
+    async def _ack():
+        if client is None or chat_id is None:
+            return
+        ids = payload.get("message_ids")
+        if not ids:
+            single = payload.get("message_id")
+            ids = [single] if single is not None else []
+        ids = [int(i) for i in ids if i is not None]
+        if ids:
+            try:
+                await client.ack(int(chat_id), ids)
+            except Exception as e:
+                logger.warning(f"Gateway client [{gateway_name}]: ack failed: {e}")
+
+    # Resolve the destination D_User row by (gateway, group) — Q3.
+    row = sheets_manager.get_user_by_gateway_and_group(gateway_name, tg_group_id)
+    if not row:
+        logger.warning(
+            f"Gateway client [{gateway_name}] inbound {etype}: no active D_User row "
+            f"matches (gateway={gateway_name}, tg_group={tg_group_id}); acking and dropping."
+        )
+        await _ack()
+        return
+
+    dc_channel_id = str(row.get("D_ChannelID", "")).strip()
+    dc_user_id    = str(row.get("D_ID", "")).strip()
+    channel = await _get_discord_channel(dc_channel_id)
+    if channel is None:
+        logger.error(
+            f"Gateway client [{gateway_name}] inbound {etype}: Discord channel "
+            f"{dc_channel_id} not found; acking and dropping."
+        )
+        await _ack()
+        return
+
+    loop = asyncio.get_running_loop()
+
+    # -------- DELETION --------
+    if etype == "deletion":
+        ids = payload.get("message_ids") or ([payload.get("message_id")] if payload.get("message_id") else [])
+        deleted = []
+        for tg_mid in ids:
+            rec = await loop.run_in_executor(
+                None, db.find_by_tg, tg_group_id, _tg_msg_id_str(tg_mid)
+            )
+            if rec and rec.get("dc_message_id"):
+                try:
+                    dc_m = await channel.fetch_message(int(rec["dc_message_id"]))
+                    await dc_m.delete()
+                    deleted.append(rec["dc_message_id"])
+                    await loop.run_in_executor(
+                        None, db.delete_by_dc, dc_channel_id, rec["dc_message_id"]
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Gateway client [{gateway_name}] deletion: could not delete "
+                        f"Discord msg {rec.get('dc_message_id')}: {e}"
+                    )
+        logger.info(
+            f"GW client→DC deletion | gateway={gateway_name} | tg_group={tg_group_id} | "
+            f"tg_msgs={ids} | dc_deleted={deleted}"
+        )
+        await _ack()
+        return
+
+    # -------- REACTION --------
+    if etype == "reaction":
+        # Bridge as a reply-note (mirrors the native reaction-as-reply behavior),
+        # keeping the client side simple. Resolve the parent Discord message.
+        tg_mid = payload.get("message_id")
+        emoji_list = payload.get("emoji") or []
+        emoji_str = " ".join(emoji_list) if isinstance(emoji_list, list) else str(emoji_list)
+        rec = await loop.run_in_executor(
+            None, db.find_by_tg, tg_group_id, _tg_msg_id_str(tg_mid)
+        ) if tg_mid is not None else None
+        try:
+            webhook = await _get_discord_webhook(channel)
+            ref = None
+            if rec and rec.get("dc_message_id"):
+                try:
+                    parent = await channel.fetch_message(int(rec["dc_message_id"]))
+                    ref = parent.to_reference(fail_if_not_exists=False)
+                except Exception:
+                    ref = None
+            sender = payload.get("from_user", {}).get("first_name") or gateway_name
+            await channel.send(content=f"{sender} reacted: {emoji_str}",
+                               reference=ref, mention_author=False)
+        except Exception as e:
+            logger.warning(f"Gateway client [{gateway_name}] reaction bridge failed: {e}")
+        logger.info(
+            f"GW client→DC reaction | gateway={gateway_name} | tg_group={tg_group_id} | "
+            f"tg_msg={tg_mid} | emoji={emoji_str}"
+        )
+        await _ack()
+        return
+
+    # -------- MESSAGE / EDITED_MESSAGE --------
+    tg_msg_id = _tg_msg_id_str(payload.get("message_id"))
+    text = payload.get("text") or ""
+    sender_name = (payload.get("from_user", {}) or {}).get("first_name") or gateway_name
+    reply_to_tg = payload.get("reply_to")
+
+    # Reply threading via our own SQLite: find the Discord parent of the TG
+    # message being replied to.
+    discord_ref = None
+    root_tg = tg_msg_id
+    if reply_to_tg is not None:
+        parent = await loop.run_in_executor(
+            None, db.find_by_tg, tg_group_id, _tg_msg_id_str(reply_to_tg)
+        )
+        if parent:
+            root_tg = parent.get("root_tg_msg_id") or tg_msg_id
+            if parent.get("dc_message_id"):
+                try:
+                    pm = await channel.fetch_message(int(parent["dc_message_id"]))
+                    discord_ref = pm.to_reference(fail_if_not_exists=False)
+                except Exception:
+                    discord_ref = None
+
+    # Download any attachments from the gateway store into discord.File objects.
+    dc_files = []
+    skip_notices = []
+    atts = payload.get("attachments") or []
+    for a in atts:
+        try:
+            data = await client.download_file(a["file_ref"])
+        except Exception as e:
+            skip_notices.append(f"[Attachment '{a.get('file_name','?')}' unavailable: {e}]")
+            continue
+        if len(data) > DC_MAX_BYTES:
+            skip_notices.append(
+                f"[Attachment '{a.get('file_name','?')}' too large for Discord "
+                f"({len(data)//(1024*1024)} MB > {DC_MAX_BYTES//(1024*1024)} MB)]"
+            )
+            continue
+        dc_files.append(discord.File(io.BytesIO(data), filename=a.get("file_name", "attachment")))
+
+    # Compose Discord content with attribution + a user tag (so the driver sees
+    # who it's for), mirroring the server-side gateway bridge.
+    user_tag = f"<@{dc_user_id}>" if dc_user_id else ""
+    body = text
+    if skip_notices:
+        body = (body + "\n" + "\n".join(skip_notices)).strip()
+    content = f"{user_tag}\n{body}".strip() if user_tag else body
+
+    webhook = await _get_discord_webhook(channel)
+    dc_msg = await _send_to_discord(
+        channel, webhook, sender_name, content, dc_files, discord_ref
     )
+    if dc_msg is None:
+        logger.warning(
+            f"GW client→DC message NOT posted | gateway={gateway_name} | "
+            f"tg_group={tg_group_id} | tg_msg={tg_msg_id}"
+        )
+        await _ack()
+        return
+
+    dc_msg_id = _dc_msg_id_str(dc_msg.id)
+    # Store mapping in our own SQLite (Q4) so subsequent replies thread.
+    await loop.run_in_executor(
+        None, db.store_message,
+        tg_group_id, tg_msg_id, dc_channel_id, dc_msg_id,
+        root_tg, dc_user_id, gateway_name,
+    )
+    logger.info(
+        f"GW client→DC {etype} | gateway={gateway_name} | tg_group={tg_group_id} | "
+        f"tg_msg={tg_msg_id} | sender={sender_name!r} | "
+        f"attachments={len(dc_files)} | dc_msg={dc_msg_id} | "
+        f"dc_channel=#{channel.name}({dc_channel_id}) | "
+        f"{'reply' if discord_ref else 'new_message'}"
+    )
+    await _ack()
 
 
 # ===========================================================================

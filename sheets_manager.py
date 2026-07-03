@@ -232,6 +232,23 @@ def get_client_gateway_names() -> set:
     return names
 
 
+def get_user_by_gateway_and_group(gateway_name: str, tg_group_id: str) -> Optional[dict]:
+    """Return the ACTIVE D_User row matching BOTH a gateway name (T_Gateway) and
+    a Telegram group id (T_GroupID). Used to route an inbound event received as
+    a gateway CLIENT to the correct Discord user+channel (Design Q3). Returns
+    None if no active row matches both."""
+    gw = str(gateway_name or "").strip()
+    gid = _normalise_id(tg_group_id)
+    with _lock:
+        for row in user_by_discord_id.values():
+            if not _is_active(row.get("D_UserStatus", "")):
+                continue
+            if (_normalise_id(row.get("T_GroupID", "")) == gid
+                    and str(row.get("T_Gateway", "") or "").strip() == gw):
+                return row
+    return None
+
+
 def get_active_channels() -> list[dict]:
     """Return all D_Channel rows with D_ChannelStatus == 'Active'."""
     with _lock:
