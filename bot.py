@@ -246,6 +246,27 @@ _gateway_clients: dict = {}
 # Background poll tasks for each client gateway (Half 2).
 _gateway_poll_tasks: list = []
 
+# Discord message IDs the bot is about to delete ITSELF (because it received a
+# deletion from the gateway or the TG delete-command workaround). on_raw_message_delete
+# checks this set and skips re-relaying such deletions, preventing the deletion
+# "echo" where a bridged deletion bounces back out the gateway as if it were a
+# fresh user-initiated delete. IDs are added just before the programmatic delete
+# and discarded when the raw event is seen (or after a short TTL sweep).
+_suppress_dc_delete_relay: set = set()
+
+
+def _mark_dc_delete_suppressed(dc_message_id) -> None:
+    """Mark a Discord message id so its imminent bot-initiated deletion is not
+    re-relayed out the gateway by on_raw_message_delete."""
+    try:
+        # Bound the set: if a marker's raw event never arrives, it would linger.
+        # These are best-effort; dropping an old one just risks one benign echo.
+        if len(_suppress_dc_delete_relay) > 500:
+            _suppress_dc_delete_relay.clear()
+        _suppress_dc_delete_relay.add(str(dc_message_id))
+    except Exception:
+        pass
+
 
 def _get_gateway_client(name: str):
     """Return the GatewayClient for a gateway name, or None if we're not a
@@ -452,6 +473,7 @@ async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
             )
             if rec and rec.get("dc_message_id"):
                 try:
+                    _mark_dc_delete_suppressed(rec["dc_message_id"])
                     dc_m = await channel.fetch_message(int(rec["dc_message_id"]))
                     await dc_m.delete()
                     deleted.append(rec["dc_message_id"])
@@ -1423,6 +1445,7 @@ async def _handle_tg_delete_command(
         if dc_channel:
             try:
                 dc_msg_obj = await dc_channel.fetch_message(int(dc_msg_id))
+                _mark_dc_delete_suppressed(dc_msg_id)
                 await with_retry(
                     f"DC delete #{dc_channel.name}",
                     lambda: dc_msg_obj.delete(),
@@ -3031,6 +3054,18 @@ class TDbridgeDiscordClient(discord.Client):
         dc_channel_id = str(payload.channel_id)
         dc_msg_id     = str(payload.message_id)
 
+        # Echo suppression: if WE initiated this deletion (because we received a
+        # deletion from the gateway or via the TG delete-command workaround),
+        # do not treat it as a fresh user delete and re-relay it. Consume the
+        # marker and return.
+        if dc_msg_id in _suppress_dc_delete_relay:
+            _suppress_dc_delete_relay.discard(dc_msg_id)
+            logger.debug(
+                f"DC→TG delete suppressed (bot-initiated, echo prevention) for "
+                f"dc_msg={dc_msg_id}"
+            )
+            return
+
         loop = asyncio.get_running_loop()
         records = await loop.run_in_executor(
             None, db.find_all_by_dc, dc_channel_id, dc_msg_id
@@ -4162,6 +4197,7 @@ async def _startup(discord_client: discord.Client) -> None:
                 channel = await _get_discord_channel(rec["dc_channel_id"])
                 if channel is not None:
                     try:
+                        _mark_dc_delete_suppressed(rec["dc_message_id"])
                         dm = await channel.fetch_message(int(rec["dc_message_id"]))
                         await dm.delete()
                     except Exception as e:
