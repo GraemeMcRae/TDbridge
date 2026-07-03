@@ -343,6 +343,7 @@ class GatewayServer:
                 echo=echo,
                 client_msg_id=payload.message_id,
                 attachments=[a.to_dict() for a in payload.attachments],
+                edited=(env.event_type == gp.EVENT_EDITED_MESSAGE),
             )
         except Exception as e:
             logger.warning("Gateway send/bridge failed: %s", e)

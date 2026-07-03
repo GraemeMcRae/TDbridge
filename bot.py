@@ -520,7 +520,33 @@ async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
         await _ack()
         return
 
-    # -------- MESSAGE / EDITED_MESSAGE --------
+    # -------- EDITED_MESSAGE: edit the mapped Discord message in place --------
+    if etype == "edited_message":
+        tg_msg_id = _tg_msg_id_str(payload.get("message_id"))
+        text = payload.get("text") or ""
+        rec = await loop.run_in_executor(
+            None, db.find_by_tg, tg_group_id, tg_msg_id
+        )
+        edited_ok = False
+        if rec and rec.get("dc_message_id"):
+            try:
+                webhook = await _get_discord_webhook(channel)
+                await webhook.edit_message(int(rec["dc_message_id"]), content=f"✏️ {text}")
+                edited_ok = True
+            except Exception as e:
+                logger.warning(
+                    f"Gateway client [{gateway_name}] edit failed for "
+                    f"dc_msg={rec.get('dc_message_id')}: {e}"
+                )
+        logger.info(
+            f"GW client→DC edit | gateway={gateway_name} | tg_group={tg_group_id} | "
+            f"tg_msg={tg_msg_id} | dc_msg={rec.get('dc_message_id') if rec else None} | "
+            f"edited={edited_ok}"
+        )
+        await _ack()
+        return
+
+    # -------- MESSAGE --------
     tg_msg_id = _tg_msg_id_str(payload.get("message_id"))
     text = payload.get("text") or ""
     sender_name = (payload.get("from", {}) or {}).get("first_name") or gateway_name
@@ -3827,10 +3853,15 @@ async def _startup(discord_client: discord.Client) -> None:
     bot_status.gateway_expected = _gateway_server.enabled
 
     async def _gateway_bridge(*, chat_id, text, reply_to, sender_name, echo,
-                              client_msg_id, attachments=None):
+                              client_msg_id, attachments=None, edited=False):
         """The gateway's central function: place the message in Telegram
         (Echo=true) or accept the client-supplied id (Echo=false), then bridge
         it to Discord exactly as an incoming Telegram message would be.
+
+        When `edited` is True this is an edit of an existing gateway-origin
+        message: instead of sending a new Telegram/Discord message, edit the
+        message identified by client_msg_id in place (falling back to a new
+        message only if the original can't be found).
 
         Phase 6d: inbound attachments. `attachments` is a list of dicts
         {file_ref, file_name, mime_type, size} referencing files the client
@@ -3842,6 +3873,47 @@ async def _startup(discord_client: discord.Client) -> None:
                  "notes": [...]}.
         """
         attachments = attachments or []
+
+        # ---- Edit branch: edit the existing TG + DC messages in place ----
+        if edited and client_msg_id is not None:
+            gid_str = _tg_group_id_str(chat_id)
+            notes: list = []
+            bot = _tg_app.bot if _tg_app else None
+            loop = asyncio.get_running_loop()
+            rec = await loop.run_in_executor(
+                None, db.find_by_tg, gid_str, _tg_msg_id_str(client_msg_id)
+            )
+            edit_text = text or ""
+            # Edit the Telegram message.
+            if bot is not None:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=int(chat_id), message_id=int(client_msg_id),
+                        text=edit_text,
+                    )
+                except Exception as e:
+                    logger.warning(f"GW→TG edit failed for {client_msg_id}: {e}")
+                    notes.append(f"tg edit failed: {e}")
+            # Edit the mapped Discord message (webhook messages can be edited).
+            dc_msg_id = rec.get("dc_message_id") if rec else None
+            if rec and rec.get("dc_channel_id") and dc_msg_id:
+                channel = await _get_discord_channel(rec["dc_channel_id"])
+                if channel is not None:
+                    try:
+                        webhook = await _get_discord_webhook(channel)
+                        # Preserve the attribution prefix used on bridged msgs.
+                        new_content = f"✏️ {edit_text}"
+                        await webhook.edit_message(int(dc_msg_id), content=new_content)
+                    except Exception as e:
+                        logger.warning(f"GW→DC edit failed for {dc_msg_id}: {e}")
+                        notes.append(f"dc edit failed: {e}")
+            logger.info(
+                f"GW→TG/DC edit applied | tg_group={gid_str} | tg_msg={client_msg_id} | "
+                f"dc_msg={dc_msg_id} | sender={sender_name!r}"
+            )
+            return {"message_ids": [int(client_msg_id)],
+                    "dc_message_id": dc_msg_id, "notes": notes}
+
         notes: list = []
 
         # ---- Burst circuit breaker (total throughput protection) ----
