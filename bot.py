@@ -2337,6 +2337,7 @@ async def bridge_gateway_message_to_discord(
     reply_to_tg_id: Optional[str] = None,
     origin_gateway: str = "",
     dc_files: Optional[list] = None,
+    extra_tg_msg_ids: Optional[list] = None,
 ) -> Optional[str]:
     """Bridge a gateway-originated message to Discord (Phase 6a, text-only).
 
@@ -2444,6 +2445,20 @@ async def bridge_gateway_message_to_discord(
         tg_group_id, tg_msg_id, dc_channel_id, dc_msg_id, root_tg_msg_id, dc_user_id,
         origin_gateway,
     )
+    # Media groups produce multiple Telegram messages for ONE Discord message.
+    # Map EVERY TG msg id to the same Discord message (same root), so a later
+    # deletion/edit of the Discord message affects all of them — not just the
+    # first. (Without this, only tg_msg_id would be deleted, orphaning the rest.)
+    if extra_tg_msg_ids:
+        for _mid in extra_tg_msg_ids:
+            _mid_s = _tg_msg_id_str(_mid)
+            if _mid_s == _tg_msg_id_str(tg_msg_id):
+                continue
+            await loop.run_in_executor(
+                None, db.store_message,
+                tg_group_id, _mid_s, dc_channel_id, dc_msg_id, root_tg_msg_id,
+                dc_user_id, origin_gateway,
+            )
 
     _dc_text_esc = content.replace("\n", "\\n")
     logger.info(
@@ -4259,6 +4274,7 @@ async def _startup(discord_client: discord.Client) -> None:
             reply_to_tg_id=(_tg_msg_id_str(reply_to) if reply_to is not None else None),
             origin_gateway=config.own_gateway,
             dc_files=dc_files,
+            extra_tg_msg_ids=tg_msg_ids,
         )
 
         # ---- Step 3: terminal moment — both sends concluded. Delete the inbound
