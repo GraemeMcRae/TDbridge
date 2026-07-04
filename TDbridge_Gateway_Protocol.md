@@ -1,11 +1,20 @@
 # TDbridge Gateway Protocol — Specification v1
 
-**Status:** Draft for review
+**Status:** Implemented and validated. The interface below is in production use
+between TDbridge instances (server and client roles) and has been exercised
+end-to-end for messages, replies, attachments (including multi-attachment media
+groups), reactions, edits, and deletions.
 **License:** MIT — see `LICENSE_TDbridge.md`
 **Audience:** Shareable. This document fully describes the gateway interface and
 may be shared with partner organizations (e.g. Forward Relay) as the interface
 contract. TDbridge-specific implementation notes are isolated in the final
-section and may be stripped before sharing if desired.
+section and may be stripped before sharing if desired. For a practical,
+example-driven walkthrough aimed at a partner's programmer, see the companion
+`TDbridge_Gateway_Integration_Guide.md`.
+
+> Copyright (c) 2026 Squadron Trucking. Released under the MIT License. The
+> copyright notice and permission notice shall be included in all copies or
+> substantial portions. For the full license text, see `LICENSE_TDbridge.md`.
 
 ---
 
@@ -170,9 +179,14 @@ A new message. Payload is a Telegram-`Message`-shaped object:
 }
 ```
 
-- `chat.id` — the Telegram **`T_GroupID`**. **This is the sole routing key.**
-  The receiver determines which conversation (in the dispatch example, which
-  driver) the message belongs to entirely from `chat.id`.
+- `chat.id` — the Telegram **`T_GroupID`**. **This is the sole routing key
+  within a gateway.** The receiver determines which conversation (in the dispatch
+  example, which driver) the message belongs to entirely from `chat.id`, together
+  with the identity of the gateway the event arrived on (the envelope's `gateway`
+  field, §4). A receiver that participates in more than one gateway therefore
+  keys on the pair (gateway, `chat.id`); a receiver on a single gateway can treat
+  `chat.id` alone as the key. Either way, no separate synthetic routing id is
+  introduced.
 - `message_id` — the correlation ID for this message (see §7). For Echo=true
   server sends, this is the real Telegram message id and is assigned by the
   server. For Echo=false, it is supplied by the client.

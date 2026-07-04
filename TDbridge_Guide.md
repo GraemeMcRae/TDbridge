@@ -1,5 +1,9 @@
 # TDbridge Guide
 
+> Copyright (c) 2026 Squadron Trucking. Released under the MIT License. The
+> copyright notice and permission notice shall be included in all copies or
+> substantial portions. For the full license text, see `LICENSE_TDbridge.md`.
+
 ## What is TDbridge?
 
 TDbridge is a message bridge between Telegram groups and a Discord server.
@@ -9,7 +13,20 @@ People on Telegram send messages in their own group, and TDbridge delivers
 those messages to the appropriate Discord channel.
 
 Both sides see a continuous conversation as if they were in the same chat.
-Replies, edits, reactions, and attachments are all bridged in both directions.
+Replies, edits, reactions, attachments, and deletions are all bridged in both
+directions.
+
+**The Gateway (advanced).** TDbridge also includes an optional **Gateway**: an
+authenticated HTTPS side channel that lets a *second* system exchange messages
+with a Telegram group without being able to see your bot's messages directly.
+This exists because Telegram bots cannot see one another's messages — so if a
+partner organization runs its own bot in the same group, the gateway is how its
+messages reach the bridge (and how replies reach it back). Most operators do not
+need the gateway; it is documented separately in
+`TDbridge_Gateway_Protocol.md` (the wire specification) and
+`TDbridge_Gateway_Integration_Guide.md` (a how-to for a partner's programmer).
+This Guide covers ordinary bridging; the gateway is noted only where an operator
+setting touches it.
 
 ---
 
@@ -114,9 +131,17 @@ git pull origin main
 git stash pop      # re-apply your local changes on top of the update
 ```
 
-The repository includes `bot.py`, `config.py`, `db.py`, `sheets_manager.py`,
-`dashboard_reporter.py`, `google_sheets_connection.py`, `table_manager.py`,
-`requirements.txt`, `envexample.txt`, `TDbridge_icon.png`, and this Guide.
+The repository includes the core modules (`bot.py`, `config.py`, `db.py`,
+`sheets_manager.py`, `dashboard_reporter.py`), the shared Sheets helpers
+(`google_sheets_connection.py`, `table_manager.py`), the gateway subsystem
+(`gateway_config.py`, `gateway_protocol.py`, `gateway_server.py`,
+`gateway_client.py`, `gateway_files.py`, `gateway_retry.py`,
+`gateway_ratelimit.py`), `requirements.txt`, `envexample.txt`,
+`telegram_gateways.example.json`, `cert_renew.sh`, `TDbridge_icon.png`, and the
+documentation set (this Guide plus `TDbridge_Project_Structure.md`,
+`TDbridge_Gateway_Protocol.md`, `TDbridge_Gateway_Integration_Guide.md`,
+`TDbridge_TLS.md`, and `LICENSE_TDbridge.md`). The gateway modules are inert
+unless you configure a gateway, so you can ignore them for a basic setup.
 
 ---
 
@@ -224,10 +249,12 @@ snowflake IDs.
 
 **Sheet: D_User_Sheet**
 
-| D_ID | D_UserName | D_Nickname | D_DisplayName | D_LastFound | D_ChannelID | D_ChannelName | D_UserStatus | T_GroupID | T_Title | T_LastFound | Unlocked |
-|---|---|---|---|---|---|---|---|---|---|---|---|
+| D_ID | D_UserName | D_Nickname | D_DisplayName | D_LastFound | D_ChannelID | D_ChannelName | D_UserStatus | T_Gateway | T_GroupID | T_Title | T_LastFound | Unlocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
 
-`D_ID`, `D_ChannelID`, `T_GroupID` — format as Plain Text.
+`D_ID`, `D_ChannelID`, `T_GroupID` — format as Plain Text. Leave `T_Gateway`
+**blank** for normal (native Telegram) operation; it is only set when using the
+optional Gateway.
 
 **Sheet: D_Channel_Sheet**
 
@@ -238,10 +265,11 @@ snowflake IDs.
 
 **Sheet: T_Group_Sheet**
 
-| T_GroupID | T_Title | T_Type | T_LastFound | T_Status | Unlocked |
-|---|---|---|---|---|---|
+| T_GroupID | T_Title | T_Type | T_Gateway | T_LastFound | T_Status | Unlocked |
+|---|---|---|---|---|---|---|
 
-`T_GroupID` — format as Plain Text.
+`T_GroupID` — format as Plain Text. Leave `T_Gateway` **blank** for normal
+operation.
 
 The `Unlocked` column is a user-managed lock. Rename it to `Locked` (or any
 name starting with "lock", case-insensitive) to prevent TDbridge from writing
@@ -587,6 +615,15 @@ TDbridge will post a warning in the group if it detects it is not an administrat
 
 ## How messages are routed
 
+> **A note on the routing key.** Every routing-to-Discord lookup is keyed on the
+> pair **(gateway, T_GroupID)**, not the T_GroupID alone. For an ordinary setup
+> the gateway is always blank (native Telegram), so you can read "(gateway,
+> T_GroupID)" as just "T_GroupID" throughout. The gateway part only matters if
+> you use the optional Gateway, in which case the same real Telegram group can
+> appear in more than one row — once for native reach and once per gateway — and
+> each resolves independently. The `T_Gateway` column in D_User_Sheet and
+> T_Group_Sheet holds this value; leave it blank for normal operation.
+
 ### Telegram → Discord
 
 TDbridge applies these routing cases in order, stopping at the first match.
@@ -662,15 +699,32 @@ separate messages, bridged as 20 individual Discord messages. Each is
 independently tracked, so replies, reactions, and deletions work at the
 individual photo level.
 
-**Discord → Telegram:** Discord allows up to 10 attachments per message.
-TDbridge sends photos and videos as a Telegram media group (native collage)
-of up to 10 items. Documents are sent individually. All resulting Telegram
-message IDs are stored in the database so deletions from Discord remove every
-corresponding Telegram message.
+**Discord → Telegram:** Discord allows multiple attachments per message.
+TDbridge sends photos and videos as a Telegram media group (native collage);
+documents are sent individually. **All** resulting Telegram message IDs are
+stored against the one Discord message, so an edit or deletion from Discord
+affects every corresponding Telegram message. Conversely, when the members of a
+media group are deleted one at a time on Telegram, the Discord message is removed
+only when the **last** member is gone.
 
-**Attachment size limits:** Discord has a 25 MB per-file limit (free tier)
-and Telegram has a 50 MB limit. Files exceeding the target platform's limit
-are skipped with a warning posted on both platforms.
+**Attachment size limits.** The limits are applied *independently per
+destination* to a single fetched copy of the file, so an attachment may reach one
+side and be skipped (with a note) on another:
+
+- **Discord (bot/webhook uploads): 10 MB** on a non-boosted server — *not* the
+  25 MB figure quoted for direct user uploads. Server boost levels 2 and 3 raise
+  this to 50 MB and 100 MB. Controlled by `DC_FILESIZE`.
+- **Telegram:** photos up to 10 MB (larger images are sent as a document); other
+  files up to 50 MB.
+- **Gateway:** up to `GATEWAY_FILESIZE` (default 50 MB) when the optional gateway
+  is in use.
+
+**Deleting a Telegram message.** Telegram does not tell bots when a user deletes
+a message through the app, so TDbridge cannot see native deletions. To delete a
+bridged message from the Telegram side, **reply to it** with the configured
+delete command (see `TG_MSG_DELETE_REGEX`); TDbridge treats that reply as a
+deletion and removes the corresponding Discord message (and, for a media group,
+the correct member). Deleting on the Discord side works directly.
 
 ### User-locking a table
 
@@ -686,11 +740,16 @@ done. The lock duration is tracked and reported in the 30-minute Status Report.
 TDbridge writes a `Status Report` line to the log every 30 minutes. Each line
 contains the current environment, overall status (OK / WARN / ERROR), Discord
 connectivity, minutes since the last Telegram update, Google Sheets health,
-lock duration, and message count for the period.
+lock duration, the message count for the period, and — when the gateway is in
+use — gateway health and circuit-breaker trips.
 
 ```
-2026-06-01 10:00:01 PDT - INFO - TDbridge: Status Report | env=prod | status=OK | dc=connected | tg_idle_min=2 | sheets=ok | locked_min=0 | bridged_30m=47 | summary=47 bridged, all systems nominal
+2026-07-03 10:00:01 PDT - INFO - TDbridge: Status Report | env=prod | status=OK | dc=connected | tg_idle_min=2 | sheets=ok | locked_min=0 | bridged_30m=47 | poll_ok=yes | gw=ok | cb_trips=0 | summary=47 bridged, all systems nominal
 ```
+
+The `poll_ok`, `gw`, and `cb_trips` fields report Telegram poll health, gateway
+server/client health, and per-group burst circuit-breaker trips respectively;
+they read `n/a` when not applicable.
 
 Every organization will want to monitor these reports in their own way. At
 Squadron Trucking, we use an iPhone app called **iSH** (a bash-like shell)
@@ -740,3 +799,25 @@ openssl x509 -noout -subject -dates -in /etc/letsencrypt/live/your.domain/fullch
 ```
 
 If this fails, re-run the `chgrp`/`chmod` commands from Step 5.
+
+### Telegram delivery is unreliable in webhook mode
+
+If webhook delivery is flaky on your server — messages arriving late, large
+messages not arriving at all — the cause may be a network path issue (for
+example, an MTU/black-hole problem that drops larger inbound packets) rather than
+anything in TDbridge. You can switch that instance to **polling** mode by setting
+`TELEGRAM_USE_POLLING=true` for the environment; polling makes only outbound
+connections and sidesteps inbound-delivery problems. (Squadron Trucking's
+production instance currently runs in polling mode for this reason.) Note that
+after a cold start the first media send over a fresh connection can be slow; this
+is expected and the code allows for it.
+
+### Gateway messages not bridging (advanced)
+
+Only relevant if you use the optional Gateway. Check that the `T_Gateway` value
+in the D_User and T_Group rows exactly matches the configured gateway name; that
+both sides share the same `secret`; that the server instance has `OWN_GATEWAY`
+set and its port is reachable through stunnel; and that the `echo`,
+`require_ack`, and `relay_user_messages` flags in `telegram_gateways.json` match
+the intended behavior. See `TDbridge_Gateway_Protocol.md` and
+`TDbridge_Gateway_Integration_Guide.md`.
