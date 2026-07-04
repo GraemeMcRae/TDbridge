@@ -364,11 +364,12 @@ async def _send_via_gateway_client(
         except (ValueError, TypeError):
             reply_to = None
 
-    # Upload attachments to the gateway (reuse the DC→GW gather → file_refs).
+    # Upload attachments to the SERVER's gateway store over the wire, then
+    # reference them in the send (the server's bridge reads them from its store).
     gw_attachments = []
     if message.attachments:
-        gw_attachments, gw_notes = await _gather_outbound_attachments_from_discord(
-            gateway_name, message.attachments
+        gw_attachments, gw_notes = await _upload_outbound_attachments_via_client(
+            client, message.attachments
         )
         for _n in gw_notes:
             logger.warning(f"DC→GW client send ({tg_group_id}): {_n}")
@@ -2132,6 +2133,57 @@ def _guess_mime_from_name(filename: str) -> str:
     import mimetypes
     mime, _ = mimetypes.guess_type(filename)
     return mime or "application/octet-stream"
+
+
+async def _upload_outbound_attachments_via_client(
+    client, discord_attachments: list,
+) -> tuple[list, list]:
+    """Client-send variant: read Discord attachment bytes and UPLOAD them to
+    the SERVER's gateway store over the wire (client.upload_file), returning
+    gp.Attachment references whose file_ref is valid ON THE SERVER. This is the
+    inverse of _gather_outbound_attachments_from_discord, which stores locally
+    (correct only for the server-relay path). On the client-send path the bytes
+    must live in the server's store so the server's bridge hook can read them.
+    """
+    attachments: list = []
+    notes: list = []
+    if not discord_attachments:
+        return attachments, notes
+
+    max_bytes = int(config.gateway_filesize_mb) * 1024 * 1024
+    for a in discord_attachments:
+        fname = getattr(a, "filename", None) or "attachment"
+        size = getattr(a, "size", 0) or 0
+        if size and size > max_bytes:
+            notes.append(
+                f"attachment {fname} too large to relay via gateway "
+                f"({size // (1024*1024)} MB > {max_bytes // (1024*1024)} MB)"
+            )
+            continue
+        try:
+            data = await a.read()
+        except Exception as e:
+            notes.append(f"attachment {fname} could not be relayed (DC→GW: read failed: {e})")
+            continue
+        if len(data) > max_bytes:
+            notes.append(
+                f"attachment {fname} too large to relay via gateway "
+                f"({len(data) // (1024*1024)} MB > {max_bytes // (1024*1024)} MB)"
+            )
+            continue
+        mime = getattr(a, "content_type", None) or _guess_mime_from_name(fname)
+        try:
+            uploaded = await client.upload_file(data, fname, mime)
+        except GatewayClientError as e:
+            notes.append(f"attachment {fname} could not be relayed (DC→GW: upload failed: {e})")
+            continue
+        attachments.append(gp.Attachment(
+            file_ref=uploaded["file_ref"],
+            file_name=uploaded.get("file_name", fname),
+            mime_type=uploaded.get("mime_type", mime),
+            size=uploaded.get("size", len(data)),
+        ))
+    return attachments, notes
 
 
 async def _gather_outbound_attachments_from_discord(
