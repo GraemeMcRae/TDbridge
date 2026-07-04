@@ -862,6 +862,80 @@ async def _get_discord_webhook(channel: discord.TextChannel) -> Optional[discord
         return None
 
 
+async def _discord_attribution_name(
+    guild,
+    user_id,
+    member=None,
+    user=None,
+    fallback_name=None,
+) -> str:
+    """Return the attribution name for a Discord user, per the project rule:
+        server nickname  →  display name (global_name)  →  username (last resort).
+
+    Prefers the cached D_User row (D_Nickname → D_DisplayName → D_UserName),
+    which is refreshed periodically by the Discord→Sheets sync, avoiding a live
+    Discord query on every message/edit/reaction. Falls back to whatever live
+    Member/User objects are on hand (and finally the raw fallback_name) only
+    when the user isn't in the cache. `guild` is retained for the rare live
+    lookup path.
+    """
+    # Preferred: cached D_User row (fast, in-memory; slight staleness is fine
+    # for an attribution label).
+    if user_id is not None:
+        try:
+            row = sheets_manager.get_user_by_discord_id(str(user_id))
+        except Exception:
+            row = None
+        if row:
+            nick = str(row.get("D_Nickname", "") or "").strip()
+            if nick:
+                return nick
+            disp = str(row.get("D_DisplayName", "") or "").strip()
+            if disp:
+                return disp
+            uname = str(row.get("D_UserName", "") or "").strip()
+            if uname:
+                return uname
+
+    # Fallbacks (user not in cache): use live objects, then raw fallback name.
+    # 1) server nickname
+    if member is not None and getattr(member, "nick", None):
+        return member.nick
+    if member is None and guild is not None and user_id is not None:
+        try:
+            m = guild.get_member(int(user_id))
+            if m is None:
+                m = await guild.fetch_member(int(user_id))
+            if m is not None:
+                member = m
+                if getattr(m, "nick", None):
+                    return m.nick
+        except Exception:
+            pass
+    # 2) display name (discord.py: global_name or username)
+    if member is not None and getattr(member, "display_name", None):
+        return member.display_name
+    if user is not None and getattr(user, "display_name", None):
+        return user.display_name
+    if user is None and user_id is not None and _discord_client is not None:
+        try:
+            u = _discord_client.get_user(int(user_id))
+            if u is not None:
+                user = u
+                if getattr(u, "display_name", None):
+                    return u.display_name
+        except Exception:
+            pass
+    # 3) last resort: the Discord username
+    if member is not None and getattr(member, "name", None):
+        return member.name
+    if user is not None and getattr(user, "name", None):
+        return user.name
+    if fallback_name:
+        return fallback_name
+    return "Discord user"
+
+
 async def _edit_discord_message(
     channel: discord.TextChannel,
     dc_message_id: int,
@@ -2583,10 +2657,10 @@ class TDbridgeDiscordClient(discord.Client):
 
         dc_channel_id = str(message.channel.id)
         dc_msg_id     = str(message.id)
-        sender_name   = (
-            message.author.nick
-            or message.author.display_name
-            or message.author.name
+        sender_name   = await _discord_attribution_name(
+            message.guild, message.author.id,
+            member=message.author if isinstance(message.author, discord.Member) else None,
+            user=message.author,
         )
 
         attribution = f"👤 {sender_name} (Discord):"
@@ -3001,10 +3075,14 @@ class TDbridgeDiscordClient(discord.Client):
 
         dc_channel_id = str(payload.channel_id)
         dc_msg_id     = str(payload.message_id)
-        sender_name   = (
-            author.get("global_name")
-            or author.get("username")
-            or "Discord user"
+        # The raw edit payload's author dict carries no server nickname, so
+        # resolve attribution through the guild (nick → display_name → id) to
+        # stay consistent with new-message attribution.
+        _chan = self.get_channel(payload.channel_id)
+        _guild = getattr(_chan, "guild", None)
+        sender_name = await _discord_attribution_name(
+            _guild, author.get("id"),
+            fallback_name=author.get("username"),
         )
 
         loop = asyncio.get_running_loop()
@@ -3251,20 +3329,18 @@ class TDbridgeDiscordClient(discord.Client):
 
         dc_channel_id = str(payload.channel_id)
         dc_msg_id     = str(payload.message_id)
-        # payload.member is present for guild reactions; fall back to fetching
-        # the user if needed.
+        # payload.member is present for guild reactions; otherwise resolve via
+        # the guild/user. Attribution rule: nick → display_name → id.
         member = payload.member
+        _chan = self.get_channel(payload.channel_id)
+        _guild = getattr(_chan, "guild", None)
         if member is not None:
             user_id   = member.id
-            user_name = (
-                getattr(member, "nick", None)
-                or member.display_name
-                or member.name
-            )
         else:
             user_id   = payload.user_id
-            fetched   = self.get_user(payload.user_id)
-            user_name = (fetched.display_name if fetched else str(payload.user_id))
+        user_name = await _discord_attribution_name(
+            _guild, user_id, member=member,
+        )
 
         loop = asyncio.get_running_loop()
         record = await loop.run_in_executor(None, db.find_by_dc, dc_channel_id, dc_msg_id)
