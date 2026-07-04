@@ -1362,6 +1362,8 @@ async def _send_attachments_to_telegram(
                             video=InputFile(io.BytesIO(raw), filename=_fname),
                             caption=chunk_caption or None,
                             reply_to_message_id=reply_to_telegram_id,
+                            read_timeout=180, write_timeout=180,
+                            connect_timeout=60, pool_timeout=60,
                         )
                     else:
                         sent = await tg_bot.send_photo(
@@ -1369,6 +1371,8 @@ async def _send_attachments_to_telegram(
                             photo=InputFile(io.BytesIO(raw), filename=_fname),
                             caption=chunk_caption or None,
                             reply_to_message_id=reply_to_telegram_id,
+                            read_timeout=180, write_timeout=180,
+                            connect_timeout=60, pool_timeout=60,
                         )
                     tg_msg_ids.append(sent.message_id)
                 except Exception as e:
@@ -1404,6 +1408,8 @@ async def _send_attachments_to_telegram(
                         chat_id=chat_id,
                         media=media_list,
                         reply_to_message_id=reply_to_telegram_id,
+                        read_timeout=180, write_timeout=180,
+                        connect_timeout=60, pool_timeout=60,
                     )
                     tg_msg_ids.extend(m.message_id for m in sent_list)
                 except Exception as e:
@@ -1443,6 +1449,8 @@ async def _send_attachments_to_telegram(
                 document=input_file,
                 caption=text if text else None,
                 reply_to_message_id=reply_to_telegram_id,
+                read_timeout=180, write_timeout=180,
+                connect_timeout=60, pool_timeout=60,
             )
             tg_msg_ids.append(sent.message_id)
             text = ""  # caption only on first
@@ -3332,13 +3340,19 @@ class TDbridgeDiscordClient(discord.Client):
 
         deleted_tg = []
         failed_tg  = []
-        for tg_msg_id in tg_msg_ids:
+        # Delete highest id first. For media-group (album) messages this order
+        # is more robust than first-first, and it's harmless for single msgs.
+        for tg_msg_id in sorted(tg_msg_ids, reverse=True):
             try:
-                await tg_bot.delete_message(
+                _result = await tg_bot.delete_message(
                     chat_id=int(tg_group_id),
                     message_id=tg_msg_id,
                 )
                 deleted_tg.append(tg_msg_id)
+                logger.info(
+                    f"DC→TG delete: deleteMessage(chat={tg_group_id}, "
+                    f"msg={tg_msg_id}) returned {_result!r}"
+                )
             except Exception as e:
                 failed_tg.append((tg_msg_id, str(e)))
                 logger.warning(
