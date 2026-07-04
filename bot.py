@@ -468,27 +468,41 @@ async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
     if etype == "deletion":
         ids = payload.get("message_ids") or ([payload.get("message_id")] if payload.get("message_id") else [])
         deleted = []
+        disassociated = []
         for tg_mid in ids:
+            mid_s = _tg_msg_id_str(tg_mid)
             rec = await loop.run_in_executor(
-                None, db.find_by_tg, tg_group_id, _tg_msg_id_str(tg_mid)
+                None, db.find_by_tg, tg_group_id, mid_s
             )
-            if rec and rec.get("dc_message_id"):
-                try:
-                    _mark_dc_delete_suppressed(rec["dc_message_id"])
-                    dc_m = await channel.fetch_message(int(rec["dc_message_id"]))
-                    await dc_m.delete()
-                    deleted.append(rec["dc_message_id"])
-                    await loop.run_in_executor(
-                        None, db.delete_by_dc, dc_channel_id, rec["dc_message_id"]
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Gateway client [{gateway_name}] deletion: could not delete "
-                        f"Discord msg {rec.get('dc_message_id')}: {e}"
-                    )
+            if not rec or not rec.get("dc_message_id"):
+                # Unknown TG id (already gone, or never mapped) — nothing to do.
+                continue
+            dc_message_id = rec["dc_message_id"]
+            # A media group maps N TG ids → ONE Discord message. Remove only
+            # THIS TG id's row; delete the Discord message only when this was
+            # the LAST sibling (mirrors the TG delete-command workaround, so a
+            # single Discord message isn't nuked on the first sibling delete).
+            await loop.run_in_executor(None, db.delete_by_tg, tg_group_id, mid_s)
+            siblings = await loop.run_in_executor(
+                None, db.find_all_by_dc, dc_channel_id, dc_message_id
+            )
+            if siblings:
+                disassociated.append((mid_s, len(siblings)))
+                continue
+            # Last sibling gone → delete the Discord message.
+            try:
+                _mark_dc_delete_suppressed(dc_message_id)
+                dc_m = await channel.fetch_message(int(dc_message_id))
+                await dc_m.delete()
+                deleted.append(dc_message_id)
+            except Exception as e:
+                logger.warning(
+                    f"Gateway client [{gateway_name}] deletion: could not delete "
+                    f"Discord msg {dc_message_id}: {e}"
+                )
         logger.info(
             f"GW client→DC deletion | gateway={gateway_name} | tg_group={tg_group_id} | "
-            f"tg_msgs={ids} | dc_deleted={deleted}"
+            f"tg_msgs={ids} | dc_deleted={deleted} | disassociated={disassociated}"
         )
         await _ack()
         return
@@ -4369,13 +4383,15 @@ async def _startup(discord_client: discord.Client) -> None:
 
     async def _gateway_deletion(*, chat_id, message_ids, sender_name):
         """Inbound deletion from a gateway client. Delete the real Telegram
-        message(s) natively and the mapped Discord message(s). Returns
-        {"notes": [...]}."""
+        message(s) natively and, for the mapped Discord message, delete it only
+        when the LAST Telegram sibling of its media group is removed (a media
+        group maps N TG ids → one Discord message). Returns {"notes": [...]}."""
         notes = []
         gid_str = _tg_group_id_str(chat_id)
         bot = _tg_app.bot if _tg_app else None
         loop = asyncio.get_running_loop()
         for mid in message_ids:
+            mid_s = _tg_msg_id_str(mid)
             # Delete from Telegram.
             if bot is not None:
                 try:
@@ -4383,22 +4399,29 @@ async def _startup(discord_client: discord.Client) -> None:
                 except Exception as e:
                     logger.warning(f"GW→TG deletion failed for {mid}: {e}")
                     notes.append(f"tg delete failed for {mid}: {e}")
-            # Delete mapped Discord message.
             rec = await loop.run_in_executor(
-                None, db.find_by_tg, gid_str, _tg_msg_id_str(mid)
+                None, db.find_by_tg, gid_str, mid_s
             )
-            if rec and rec.get("dc_channel_id") and rec.get("dc_message_id"):
-                channel = await _get_discord_channel(rec["dc_channel_id"])
-                if channel is not None:
-                    try:
-                        _mark_dc_delete_suppressed(rec["dc_message_id"])
-                        dm = await channel.fetch_message(int(rec["dc_message_id"]))
-                        await dm.delete()
-                    except Exception as e:
-                        logger.warning(f"GW→DC deletion failed for {mid}: {e}")
-                await loop.run_in_executor(
-                    None, db.delete_by_dc, rec["dc_channel_id"], rec["dc_message_id"]
-                )
+            if not rec or not rec.get("dc_channel_id") or not rec.get("dc_message_id"):
+                continue
+            dc_channel_id = rec["dc_channel_id"]
+            dc_message_id = rec["dc_message_id"]
+            # Remove only THIS TG id's row; delete the Discord message only when
+            # no siblings remain (media-group-aware, matches the workaround).
+            await loop.run_in_executor(None, db.delete_by_tg, gid_str, mid_s)
+            siblings = await loop.run_in_executor(
+                None, db.find_all_by_dc, dc_channel_id, dc_message_id
+            )
+            if siblings:
+                continue
+            channel = await _get_discord_channel(dc_channel_id)
+            if channel is not None:
+                try:
+                    _mark_dc_delete_suppressed(dc_message_id)
+                    dm = await channel.fetch_message(int(dc_message_id))
+                    await dm.delete()
+                except Exception as e:
+                    logger.warning(f"GW→DC deletion failed for {mid}: {e}")
         logger.info(
             f"GW→TG/DC deletion applied | tg_group={gid_str} | tg_msgs={list(message_ids)} | "
             f"sender={sender_name!r}"
