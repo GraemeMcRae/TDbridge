@@ -34,7 +34,7 @@ TEST_TELEGRAM_USE_POLLING=true
 # Max messages allowed in ~1 second per Telegram Group before the burst circuit breaker trips (0 = disabled). Curtails runaway loops.
 TEST_TELEGRAM_BURSTRATE=10
 # Name of the gateway this instance owns (acts as server for); empty = client-only. See TDbridge_Gateway_Protocol.md
-TEST_OWN_GATEWAY=""
+TEST_OWN_GATEWAY="Userbot_gw_test"
 # PIN_GATEWAY=true means even when a Telegram message was bridged natively, treat it as if its origin was the OWN_GATEWAY so that replies, reactions, etc. go out through the gateway
 TEST_PIN_GATEWAY=false
 # Internal localhost port the gateway server binds (behind stunnel); external 8089 maps here. Server-side only.
@@ -86,6 +86,7 @@ TEST_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, 
 # These parameters are only used by userbot_main.py; the core TDbridge bot ignores them.
 # Telethon API credentials (obtain once at https://my.telegram.org > API development tools).
 # Shared value is fine, but kept prefixed so test/prod may differ.
+TEST_USERBOT_APP_NAME="TDbridgeUserbotTest"
 TEST_USERBOT_API_ID="<api-id>"
 TEST_USERBOT_API_HASH="<api-hash>"
 # The dedicated account's phone number (used only at first login / re-login; the saved session is used thereafter).
@@ -93,7 +94,7 @@ TEST_USERBOT_PHONE="+16619434409"
 # Optional two-step-verification password (only if the account has 2SV enabled). Distinct from the per-login code.
 TEST_USERBOT_2FA_PASSWORD=""
 # Telethon session file (resolved from the project root). Created by the first login; reused thereafter.
-TEST_USERBOT_SESSION_FILE=tdbridge_test_userbot.session
+TEST_USERBOT_SESSION_FILE=TDbridge_test_userbot.session
 # Relay messages from ANY bot in the group EXCEPT this one (our own sibling TDbridge bot, whose
 # messages are already on the bridge). Matched against the sender's Telegram username (no leading @).
 TEST_USERBOT_GW_BOT="TDbridgeTestBot"
@@ -196,6 +197,7 @@ PROD_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, 
 # back as the user account. Run with: python userbot_main.py --env prod
 # These parameters are only used by userbot_main.py; the core TDbridge bot ignores them.
 # Telethon API credentials (obtain once at https://my.telegram.org > API development tools).
+PROD_USERBOT_APP_NAME="TDbridgeUserbotProd"
 PROD_USERBOT_API_ID="<api-id>"
 PROD_USERBOT_API_HASH="<api-hash>"
 # The dedicated account's phone number (used only at first login / re-login; the saved session is used thereafter).
@@ -203,7 +205,7 @@ PROD_USERBOT_PHONE="+16618167186"
 # Optional two-step-verification password (only if the account has 2SV enabled). Distinct from the per-login code.
 PROD_USERBOT_2FA_PASSWORD=""
 # Telethon session file (resolved from the project root). Created by the first login; reused thereafter.
-PROD_USERBOT_SESSION_FILE=tdbridge_prod_userbot.session
+PROD_USERBOT_SESSION_FILE=TDbridge_prod_userbot.session
 # Relay messages from ANY bot in the group EXCEPT this one (our own sibling TDbridge bot, whose
 # messages are already on the bridge). Matched against the sender's Telegram username (no leading @).
 # In production this is TDbridgeProdBot; the bot we DO relay is the partner's (e.g. SquadronDispatchBot).

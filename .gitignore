@@ -36,8 +36,9 @@ google_credentials*.json
 google_oauth_client*.json
 google_oauth_token*.json
 
-# TDbridge gateways (contain secrets)
+# TDbridge gateways and sessions (contain secrets)
 [Tt]elegram_[Gg]ateways.json
+TDbridge*.session
 
 # HCF_login_status.json - keeps track of logged in users across bot restarts
 *login_status*.json
