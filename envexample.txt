@@ -89,7 +89,7 @@ TEST_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, 
 TEST_USERBOT_API_ID="<api-id>"
 TEST_USERBOT_API_HASH="<api-hash>"
 # The dedicated account's phone number (used only at first login / re-login; the saved session is used thereafter).
-TEST_USERBOT_PHONE="+1XXXXXXXXXX"
+TEST_USERBOT_PHONE="+16619434409"
 # Optional two-step-verification password (only if the account has 2SV enabled). Distinct from the per-login code.
 TEST_USERBOT_2FA_PASSWORD=""
 # Telethon session file (resolved from the project root). Created by the first login; reused thereafter.
@@ -110,6 +110,7 @@ TEST_USERBOT_FLOOD_RETRY_MAX_SEC=120
 # Telegram group id whose bridged Discord channel receives the "enter the login code" prompt during a
 # gateway-mediated login. The human reads the code sent to the account and replies on Discord.
 # Leave empty to use the terminal login prompt instead.
+# Primary group -5102793369 is "Graeme McRae Prod | Group" which contains as members both TDbridgeProdBot (acting as SquadronDispatchBot) and this bot which is TDbridgeTestBot.
 TEST_USERBOT_PRIMARY_GROUP="-5102793369"
 # Minutes to wait for the human's code reply before re-requesting a fresh code (codes expire in minutes).
 TEST_USERBOT_LOGIN_CODE_WAIT_MIN=15
@@ -198,7 +199,7 @@ PROD_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, 
 PROD_USERBOT_API_ID="<api-id>"
 PROD_USERBOT_API_HASH="<api-hash>"
 # The dedicated account's phone number (used only at first login / re-login; the saved session is used thereafter).
-PROD_USERBOT_PHONE="+1XXXXXXXXXX"
+PROD_USERBOT_PHONE="+16618167186"
 # Optional two-step-verification password (only if the account has 2SV enabled). Distinct from the per-login code.
 PROD_USERBOT_2FA_PASSWORD=""
 # Telethon session file (resolved from the project root). Created by the first login; reused thereafter.
@@ -220,7 +221,8 @@ PROD_USERBOT_FLOOD_RETRY_MAX_SEC=120
 # Telegram group id whose bridged Discord channel receives the "enter the login code" prompt during a
 # gateway-mediated login. The human reads the code sent to the account and replies on Discord.
 # Leave empty to use the terminal login prompt instead.
-PROD_USERBOT_PRIMARY_GROUP=""
+# Primary group -5102793369 is "Graeme McRae Prod | Group"
+PROD_USERBOT_PRIMARY_GROUP="-5102793369"
 # Minutes to wait for the human's code reply before re-requesting a fresh code (codes expire in minutes).
 PROD_USERBOT_LOGIN_CODE_WAIT_MIN=15
 # How many times to re-request a code after a timeout/expired code before giving up (restart to retry).

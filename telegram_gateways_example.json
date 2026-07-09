@@ -1,0 +1,41 @@
+{
+  "_comment": "TDbridge gateway definitions. Copy to telegram_gateways.json and fill in real secrets. NEVER commit the real file with secrets to git. See TDbridge_Gateway_Protocol.md for field meanings. A gateway's role (server vs client) is NOT stored here; an instance is the server for the gateway whose name equals its OWN_GATEWAY, and a client for all others. The echo/require_ack/relay_user_messages flags are owner-side semantics. The url is the client-facing address; for remote clients it is the external stunnel address, but for a co-located (loopback) client such as the Option-E userbot it is the server's INTERNAL http://127.0.0.1:<GATEWAY_LISTEN_PORT> address (plain HTTP is permitted only for loopback). Here's my idea: When echo: true, if the Telegram message id is specified, don't echo. Another change: add a parameter in .env PIN_GATEWAY=TRUE that routes all messages from Discord through the gateway. That way nothing will be invisible to Tim's bot. That's it. Keep them in mind for the future.",
+  "gateways": [
+    {
+      "_comment": "Owned by TDbridge --env prod during self-testing (PROD_OWN_GATEWAY=TDbridge_gw). External port 8445 -> internal 8446 via stunnel. Echo=true: the server posts the client's messages into the real Telegram group, since the test client is not a member of those groups. relay_user_messages=false for testing.",
+      "name": "TDbridge_gw",
+      "url": "https://hcf.squadrontrucking.com:8445/gateway/TDbridge_gw",
+      "secret": "<regenerate-secret>",
+      "echo": true,
+      "require_ack": true,
+      "relay_user_messages": false
+    },
+    {
+      "_comment": "Production gateway for the partner dispatch bot. Not used during TDbridge self-testing. When testing is complete, set PROD_OWN_GATEWAY=SquadronDispatchBot_gw and restart so the partner can develop against it at their own pace. Flags are a starting point and may be adjusted with the partner.",
+      "name": "SquadronDispatchBot_gw",
+      "url": "https://hcf.squadrontrucking.com:8445/gateway/SquadronDispatchBot_gw",
+      "secret": "<regenerate-secret>",
+      "echo": true,
+      "require_ack": false,
+      "relay_user_messages": false
+    },
+    {
+      "_comment": "Option-E userbot gateway for the TEST instance. The userbot (userbot_main.py --env test) connects as a CLIENT over LOOPBACK to test TDbridge's internal gateway port (TEST_GATEWAY_LISTEN_PORT=8090), bypassing stunnel — hence plain http://127.0.0.1 (permitted only for loopback). To use it, set TEST_OWN_GATEWAY=Userbot_gw_test so test TDbridge serves it. echo=false: the userbot already posted (well, observed) the message in Telegram and supplies its real message_id, so the server must NOT repost — it only bridges to Discord and records the mapping. require_ack=true so a crash before ack redelivers.",
+      "name": "Userbot_gw_test",
+      "url": "http://127.0.0.1:8090/gateway/Userbot_gw_test",
+      "secret": "<regenerate-secret>",
+      "echo": false,
+      "require_ack": true,
+      "relay_user_messages": false
+    },
+    {
+      "_comment": "Option-E userbot gateway for the PROD instance. The userbot (userbot_main.py --env prod) connects as a CLIENT over LOOPBACK to prod TDbridge's internal gateway port (PROD_GATEWAY_LISTEN_PORT=8446), bypassing stunnel — hence plain http://127.0.0.1. To use it, set PROD_OWN_GATEWAY=Userbot_gw_prod so prod TDbridge serves it (this REPLACES TDbridge_gw as prod's owned gateway when Option E is the chosen production path). echo=false and require_ack=true as above.",
+      "name": "Userbot_gw_prod",
+      "url": "http://127.0.0.1:8446/gateway/Userbot_gw_prod",
+      "secret": "<regenerate-secret>",
+      "echo": false,
+      "require_ack": true,
+      "relay_user_messages": false
+    }
+  ]
+}
