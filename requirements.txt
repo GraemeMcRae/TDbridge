@@ -7,6 +7,10 @@ discord.py>=2.3.2
 # Telegram bot (async, supports webhook mode)
 python-telegram-bot[webhooks]>=21.0
 
+# Telegram USER client (MTProto) for the Option-E userbot (userbot_*.py).
+# Only needed to run the userbot; the core TDbridge bot does not import it.
+telethon>=1.36.0
+
 # Google Sheets
 gspread>=6.0.0
 oauth2client>=4.1.3

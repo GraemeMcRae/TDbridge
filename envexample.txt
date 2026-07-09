@@ -35,6 +35,8 @@ TEST_TELEGRAM_USE_POLLING=true
 TEST_TELEGRAM_BURSTRATE=10
 # Name of the gateway this instance owns (acts as server for); empty = client-only. See TDbridge_Gateway_Protocol.md
 TEST_OWN_GATEWAY=""
+# PIN_GATEWAY=true means even when a Telegram message was bridged natively, treat it as if its origin was the OWN_GATEWAY so that replies, reactions, etc. go out through the gateway
+TEST_PIN_GATEWAY=false
 # Internal localhost port the gateway server binds (behind stunnel); external 8089 maps here. Server-side only.
 TEST_GATEWAY_LISTEN_PORT=8090
 # Expose debug-only gateway endpoints (e.g. /gateway/debug/enqueue) for testing the queue; MUST be false in normal use
@@ -77,6 +79,47 @@ TEST_TG_MSG_DELETE_ERRMSG="! Delete failed."
 # Emojis -- the following parameter isn't in use for TDbridge, but it is used in HCF to discern the sentiment driving the use of certain emojis
 TEST_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, ok_hand, white_check_mark, pray, sunglasses, muscle, 100, checkered_flag, raised_hands"
 
+# ---- Userbot (Option E) configuration - TEST ----
+# The userbot is a thin Telethon USER client that relays another bot's Telegram
+# messages to TDbridge over the loopback gateway, and posts replies/reactions
+# back as the user account. Run with: python userbot_main.py --env test
+# These parameters are only used by userbot_main.py; the core TDbridge bot ignores them.
+# Telethon API credentials (obtain once at https://my.telegram.org > API development tools).
+# Shared value is fine, but kept prefixed so test/prod may differ.
+TEST_USERBOT_API_ID="<api-id>"
+TEST_USERBOT_API_HASH="<api-hash>"
+# The dedicated account's phone number (used only at first login / re-login; the saved session is used thereafter).
+TEST_USERBOT_PHONE="+1XXXXXXXXXX"
+# Optional two-step-verification password (only if the account has 2SV enabled). Distinct from the per-login code.
+TEST_USERBOT_2FA_PASSWORD=""
+# Telethon session file (resolved from the project root). Created by the first login; reused thereafter.
+TEST_USERBOT_SESSION_FILE=tdbridge_test_userbot.session
+# Relay messages from ANY bot in the group EXCEPT this one (our own sibling TDbridge bot, whose
+# messages are already on the bridge). Matched against the sender's Telegram username (no leading @).
+TEST_USERBOT_GW_BOT="TDbridgeTestBot"
+# The gateway (defined in telegram_gateways.json) that the userbot connects to as a CLIENT.
+# Its serving TDbridge instance must have OWN_GATEWAY set to this same name.
+TEST_USERBOT_GATEWAY="Userbot_gw_test"
+# Minimum spacing (ms) between OUTBOUND Telegram actions (posts/reactions/edits/deletions), to stay
+# under Telegram's user-account rate limits. Inbound reading is never metered. Primary FLOOD defense.
+TEST_USERBOT_METERING_MILLISEC=2000
+# On a FLOOD_WAIT beyond the retry ceiling: "retry" (honor the wait, then retry) or "save" (defer, retry later).
+TEST_USERBOT_FLOOD=retry
+# Ceiling (seconds) for "retry": waits longer than this are still re-queued, just retried later.
+TEST_USERBOT_FLOOD_RETRY_MAX_SEC=120
+# Telegram group id whose bridged Discord channel receives the "enter the login code" prompt during a
+# gateway-mediated login. The human reads the code sent to the account and replies on Discord.
+# Leave empty to use the terminal login prompt instead.
+TEST_USERBOT_PRIMARY_GROUP="-5102793369"
+# Minutes to wait for the human's code reply before re-requesting a fresh code (codes expire in minutes).
+TEST_USERBOT_LOGIN_CODE_WAIT_MIN=15
+# How many times to re-request a code after a timeout/expired code before giving up (restart to retry).
+TEST_USERBOT_LOGIN_CODE_MAX_RETRIES=3
+# Userbot local SQLite state (persistent outbound-action queue; survives restart). Covered by .gitignore TDbridge*.db*
+TEST_USERBOT_SQLITE_DB_FILE=TDbridge_test_userbot.db
+# Userbot log file.
+TEST_USERBOT_LOGFILENAME=TDbridge_test_userbot.log
+
 # Prod Bot configuration - Discord
 PROD_DISCORD_BOT_TOKEN="<bot-token>"
 PROD_DISCORD_BOT_NAME=TDbridge
@@ -102,6 +145,8 @@ PROD_TELEGRAM_USE_POLLING=true
 PROD_TELEGRAM_BURSTRATE=10
 # Name of the gateway this instance owns (acts as server for); empty = client-only. See TDbridge_Gateway_Protocol.md
 PROD_OWN_GATEWAY="TDbridge_gw"
+# PIN_GATEWAY=true means even when a Telegram message was bridged natively, treat it as if its origin was the OWN_GATEWAY so that replies, reactions, etc. go out through the gateway
+PROD_PIN_GATEWAY=false
 # Internal localhost port the gateway server binds (behind stunnel); external 8445 maps here. Server-side only.
 PROD_GATEWAY_LISTEN_PORT=8446
 # Expose debug-only gateway endpoints (e.g. /gateway/debug/enqueue) for testing the queue; MUST be false in normal use
@@ -143,6 +188,47 @@ PROD_TG_MSG_DELETE_REGEX="(?i)delete\s*"
 PROD_TG_MSG_DELETE_ERRMSG="! Delete failed."
 # Emojis -- the following parameter isn't in use for TDbridge, but it is used in HCF to discern the sentiment driving the use of certain emojis
 PROD_EMOJIS_INDICATING_AGREEMENT="thumbsup, saluting_face, heart, purple_heart, ok_hand, white_check_mark, pray, sunglasses, muscle, 100, checkered_flag, raised_hands"
+
+# ---- Userbot (Option E) configuration - PROD ----
+# The userbot is a thin Telethon USER client that relays another bot's Telegram
+# messages to TDbridge over the loopback gateway, and posts replies/reactions
+# back as the user account. Run with: python userbot_main.py --env prod
+# These parameters are only used by userbot_main.py; the core TDbridge bot ignores them.
+# Telethon API credentials (obtain once at https://my.telegram.org > API development tools).
+PROD_USERBOT_API_ID="<api-id>"
+PROD_USERBOT_API_HASH="<api-hash>"
+# The dedicated account's phone number (used only at first login / re-login; the saved session is used thereafter).
+PROD_USERBOT_PHONE="+1XXXXXXXXXX"
+# Optional two-step-verification password (only if the account has 2SV enabled). Distinct from the per-login code.
+PROD_USERBOT_2FA_PASSWORD=""
+# Telethon session file (resolved from the project root). Created by the first login; reused thereafter.
+PROD_USERBOT_SESSION_FILE=tdbridge_prod_userbot.session
+# Relay messages from ANY bot in the group EXCEPT this one (our own sibling TDbridge bot, whose
+# messages are already on the bridge). Matched against the sender's Telegram username (no leading @).
+# In production this is TDbridgeProdBot; the bot we DO relay is the partner's (e.g. SquadronDispatchBot).
+PROD_USERBOT_GW_BOT="TDbridgeProdBot"
+# The gateway (defined in telegram_gateways.json) that the userbot connects to as a CLIENT.
+# Its serving TDbridge instance must have OWN_GATEWAY set to this same name.
+PROD_USERBOT_GATEWAY="Userbot_gw_prod"
+# Minimum spacing (ms) between OUTBOUND Telegram actions (posts/reactions/edits/deletions), to stay
+# under Telegram's user-account rate limits. Inbound reading is never metered. Primary FLOOD defense.
+PROD_USERBOT_METERING_MILLISEC=2000
+# On a FLOOD_WAIT beyond the retry ceiling: "retry" (honor the wait, then retry) or "save" (defer, retry later).
+PROD_USERBOT_FLOOD=retry
+# Ceiling (seconds) for "retry": waits longer than this are still re-queued, just retried later.
+PROD_USERBOT_FLOOD_RETRY_MAX_SEC=120
+# Telegram group id whose bridged Discord channel receives the "enter the login code" prompt during a
+# gateway-mediated login. The human reads the code sent to the account and replies on Discord.
+# Leave empty to use the terminal login prompt instead.
+PROD_USERBOT_PRIMARY_GROUP=""
+# Minutes to wait for the human's code reply before re-requesting a fresh code (codes expire in minutes).
+PROD_USERBOT_LOGIN_CODE_WAIT_MIN=15
+# How many times to re-request a code after a timeout/expired code before giving up (restart to retry).
+PROD_USERBOT_LOGIN_CODE_MAX_RETRIES=3
+# Userbot local SQLite state (persistent outbound-action queue; survives restart). Covered by .gitignore TDbridge*.db*
+PROD_USERBOT_SQLITE_DB_FILE=TDbridge_prod_userbot.db
+# Userbot log file.
+PROD_USERBOT_LOGFILENAME=TDbridge_prod_userbot.log
 
 # Time Zone
 LOCAL_TIMEZONE="America/Los_Angeles"

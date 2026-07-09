@@ -70,6 +70,34 @@ def _as_bool(value, default: bool) -> bool:
     return default
 
 
+# Hosts for which plain HTTP is acceptable: a same-host (loopback) connection
+# never leaves the machine, so TLS would add nothing. Used by the co-located
+# userbot (Option E), which reaches its owned gateway over http://127.0.0.1.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
+
+
+def _url_transport_ok(url: str) -> bool:
+    """True if `url` uses an acceptable transport.
+
+    HTTPS is always accepted. Plain HTTP is accepted ONLY for a loopback host
+    (127.0.0.1 / localhost / ::1), where the connection stays on the same
+    machine and TLS is unnecessary. Any other http:// url is rejected, so a
+    remote gateway accidentally configured as http:// still fails loudly.
+    """
+    lower = url.lower()
+    if lower.startswith("https://"):
+        return True
+    if lower.startswith("http://"):
+        host = lower[len("http://"):]
+        # Strip anything after the host[:port] (path, query).
+        host = host.split("/", 1)[0]
+        # Compare against loopback hosts, allowing an optional :port suffix.
+        for lb in _LOOPBACK_HOSTS:
+            if host == lb or host.startswith(lb + ":"):
+                return True
+    return False
+
+
 def load_gateways(path: str) -> Dict[str, GatewayDef]:
     """
     Load and validate the gateways JSON file at `path`.
@@ -109,9 +137,11 @@ def load_gateways(path: str) -> Dict[str, GatewayDef]:
             raise GatewayConfigError(f"Gateway entry #{i} is missing 'name'.")
         if not url:
             raise GatewayConfigError(f"Gateway '{name}' is missing 'url'.")
-        if not url.lower().startswith("https://"):
+        if not _url_transport_ok(url):
             raise GatewayConfigError(
-                f"Gateway '{name}' url must be HTTPS (got: {url})."
+                f"Gateway '{name}' url must be HTTPS, or HTTP to a loopback "
+                f"host (127.0.0.1/localhost/::1) for a same-machine gateway "
+                f"(got: {url})."
             )
         if not secret:
             raise GatewayConfigError(f"Gateway '{name}' is missing 'secret'.")
