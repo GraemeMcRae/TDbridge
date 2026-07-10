@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 # Wire-protocol version this build speaks. Kept in sync with
 # gateway_config.GATEWAY_PROTOCOL_VERSION (imported there as the canonical
 # value); duplicated as a module constant for callers that only import this.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # The five event types carried by the protocol.
 EVENT_MESSAGE = "message"
@@ -250,13 +250,32 @@ class IdsPayload:
         )
 
 
+@dataclass
+class AckPayload:
+    """Payload for 'ack' events. Acks are keyed by the server-assigned
+    event_ids of the outbound events being acknowledged — NOT by Telegram
+    message ids, which may be absent (e.g. a freshly-relayed message the client
+    has not yet posted). This lets any outbound event be acked unambiguously."""
+    event_ids: List[int] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"event_ids": list(self.event_ids)}
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "AckPayload":
+        ids = _require(d, "event_ids", "ack payload")
+        if not isinstance(ids, list):
+            raise GatewayProtocolError("ack payload: 'event_ids' must be an array")
+        return cls(event_ids=[_as_int(i, "event_ids[]") for i in ids])
+
+
 # Map event_type → payload class, for dispatch in from_dict.
 _PAYLOAD_CLASS = {
     EVENT_MESSAGE: MessagePayload,
     EVENT_EDITED_MESSAGE: MessagePayload,
     EVENT_REACTION: ReactionPayload,
     EVENT_DELETION: IdsPayload,
-    EVENT_ACK: IdsPayload,
+    EVENT_ACK: AckPayload,
 }
 
 
@@ -276,6 +295,12 @@ class Envelope:
     payload: Any                       # one of the *Payload dataclasses
     secret: Optional[str] = None
     protocol_version: int = PROTOCOL_VERSION
+    # Server-assigned, monotonic id for an OUTBOUND event (server → client),
+    # set when the event is delivered via poll. It is the stable handle used to
+    # ACK the event (independent of any Telegram message id, which may be absent
+    # for a freshly-relayed message) and to correlate it later. None on inbound
+    # requests and on events that have not yet been assigned an id.
+    event_id: Optional[int] = None
 
     def to_dict(self, *, include_secret: bool = True) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -284,6 +309,8 @@ class Envelope:
             "event_type": self.event_type,
             "payload": self.payload.to_dict(),
         }
+        if self.event_id is not None:
+            d["event_id"] = self.event_id
         if include_secret and self.secret is not None:
             d["secret"] = self.secret
         return d
@@ -325,12 +352,17 @@ class Envelope:
             raise GatewayProtocolError("envelope: 'payload' must be an object")
         payload = _PAYLOAD_CLASS[event_type].from_dict(payload_dict)
 
+        event_id = d.get("event_id")
+        if event_id is not None:
+            event_id = _as_int(event_id, "event_id")
+
         return cls(
             gateway=gateway,
             event_type=event_type,
             payload=payload,
             secret=secret,
             protocol_version=pv,
+            event_id=event_id,
         )
 
     @classmethod
@@ -420,15 +452,15 @@ def make_deletion(
 
 def make_ack(
     gateway: str,
-    chat_id: int,
-    message_ids: List[int],
+    event_ids: List[int],
     *,
     secret: Optional[str] = None,
 ) -> Envelope:
-    """Build an 'ack' envelope."""
+    """Build an 'ack' envelope acknowledging the given server-assigned
+    event_ids (removing them from the outbound queue for RequireACK gateways)."""
     return Envelope(
         gateway=gateway,
         event_type=EVENT_ACK,
         secret=secret,
-        payload=IdsPayload(chat_id=chat_id, message_ids=list(message_ids)),
+        payload=AckPayload(event_ids=list(event_ids)),
     )

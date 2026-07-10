@@ -192,17 +192,18 @@ class GatewayClient:
         """One long-poll (up to the server's ~10 s). Returns the list of event
         dicts (each a parsed envelope), possibly empty."""
         # The poll body is an envelope; event_type is unused by the server's
-        # poll handler beyond auth, so an 'ack'-shaped envelope with empty ids is
-        # a convenient carrier of gateway+secret.
-        env = gp.make_ack(self._gw.name, 0, [], secret=self._gw.secret)
+        # poll handler beyond auth, so an 'ack'-shaped envelope with empty
+        # event_ids is a convenient carrier of gateway+secret.
+        env = gp.make_ack(self._gw.name, [], secret=self._gw.secret)
         status, body = await self._post_envelope("poll", env)
         if status != 200:
             raise GatewayClientError(f"poll failed (HTTP {status}): {body}")
         return body.get("events", []) or []
 
-    async def ack(self, chat_id: int, message_ids: List[int]) -> dict:
-        """Acknowledge receipt of events (RequireACK gateways dequeue on ack)."""
-        env = gp.make_ack(self._gw.name, chat_id, message_ids, secret=self._gw.secret)
+    async def ack(self, event_ids: List[int]) -> dict:
+        """Acknowledge receipt of events by their server-assigned event_ids
+        (RequireACK gateways dequeue on ack)."""
+        env = gp.make_ack(self._gw.name, list(event_ids), secret=self._gw.secret)
         status, body = await self._post_envelope("ack", env)
         if status != 200:
             raise GatewayClientError(f"ack failed (HTTP {status}): {body}")

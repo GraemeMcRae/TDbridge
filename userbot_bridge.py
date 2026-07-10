@@ -46,8 +46,8 @@ class UserbotBridge:
         self._gw = gateway           # UserbotGateway
         self._outbox = outbox        # Outbox (persistent FIFO drain worker)
 
-        # Dedupe set of (chat_id, message_id) we've already processed inbound,
-        # so a redelivered event (pre-ack) isn't acted on twice.
+        # Dedupe set of event_ids we've already processed inbound, so a
+        # redelivered event (pre-ack) isn't acted on twice.
         self._seen_inbound: set = set()
 
     # ================================================================= #
@@ -115,15 +115,23 @@ class UserbotBridge:
         payload = ev.get("payload", {}) or {}
         chat = payload.get("chat", {}) or {}
         chat_id = chat.get("id")
+        # The server-assigned event_id is the stable identity: always present on
+        # outbound events, and the handle we ACK and dedupe by (a freshly relayed
+        # message has message_id=None, so message-id keying cannot work here).
+        event_id = ev.get("event_id")
 
-        # --- Dedupe by (chat_id, message_id[s]) ---
-        ids = self._ids(payload)
-        fresh = [i for i in ids if (chat_id, i) not in self._seen_inbound]
-        for i in fresh:
-            self._seen_inbound.add((chat_id, i))
-        if etype in ("message", "edited_message") and not fresh:
-            await self._ack(chat_id, ids)   # already handled; just re-ack
+        if event_id is None:
+            # Should not happen with a v2 server; log and skip to avoid a loop
+            # (we cannot ack what we cannot name).
+            logger.warning("GW event without event_id (cannot ack): %s", etype)
             return
+
+        # --- Dedupe by event_id ---
+        if event_id in self._seen_inbound:
+            await self._ack_events([event_id])   # already handled; just re-ack
+            logger.info("GW event re-acked (dup) | event_id=%s", event_id)
+            return
+        self._seen_inbound.add(event_id)
 
         # --- Dispatch: enqueue the outbound Telegram action, then ack ---
         # We enqueue (durably) and ack immediately. The outbox worker performs
@@ -136,28 +144,28 @@ class UserbotBridge:
         if etype in ("message", "edited_message"):
             await self._outbox.enqueue(chat_id, etype, self._msg_action(payload))
             logger.info(
-                "GW->TG enqueued | event=%s | chat=%s | reply_to=%s | "
+                "GW->TG enqueued | event_id=%s | event=%s | chat=%s | reply_to=%s | "
                 "attachments=%d | text='%s'",
-                etype, chat_id, payload.get("reply_to"),
+                event_id, etype, chat_id, payload.get("reply_to"),
                 len(payload.get("attachments") or []), _txt,
             )
         elif etype == "reaction":
             await self._outbox.enqueue(chat_id, "reaction", self._reaction_action(payload))
             logger.info(
-                "GW->TG enqueued | event=reaction | chat=%s | msg_id=%s | emoji=%s",
-                chat_id, payload.get("message_id"), payload.get("emoji"),
+                "GW->TG enqueued | event_id=%s | event=reaction | chat=%s | msg_id=%s | emoji=%s",
+                event_id, chat_id, payload.get("message_id"), payload.get("emoji"),
             )
         elif etype == "deletion":
             await self._outbox.enqueue(chat_id, "deletion", self._deletion_action(payload))
             logger.info(
-                "GW->TG enqueued | event=deletion | chat=%s | msg_ids=%s",
-                chat_id, self._ids(payload),
+                "GW->TG enqueued | event_id=%s | event=deletion | chat=%s | msg_ids=%s",
+                event_id, chat_id, self._ids(payload),
             )
         else:
-            logger.info("ignoring unknown gateway event_type=%s", etype)
+            logger.info("ignoring unknown gateway event_type=%s (event_id=%s)", etype, event_id)
 
-        await self._ack(chat_id, ids)
-        logger.info("GW event acked | chat=%s | ids=%s", chat_id, ids)
+        await self._ack_events([event_id])
+        logger.info("GW event acked | event_id=%s", event_id)
 
     # ---- Build serializable action payloads for the outbox -------------- #
     # These capture everything perform_action() needs; attachments are kept as
@@ -263,11 +271,11 @@ class UserbotBridge:
         single = payload.get("message_id")
         return [single] if single is not None else []
 
-    async def _ack(self, chat_id, ids) -> None:
-        if chat_id is None or not ids:
+    async def _ack_events(self, event_ids) -> None:
+        if not event_ids:
             return
         try:
-            await self._gw.ack(int(chat_id), [int(i) for i in ids])
+            await self._gw.ack([int(e) for e in event_ids])
         except Exception as e:
             logger.debug("ack failed (non-fatal): %s", e)
 

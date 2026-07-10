@@ -424,22 +424,18 @@ async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
 
     client = _get_gateway_client(gateway_name)
 
-    # Helper: ack the event so the server dequeues it (RequireACK). We ack by the
-    # message_ids the event carries (deletion/reaction carry a list; message
-    # carries a single id).
+    # Helper: ack the event so the server dequeues it (RequireACK). We ack by
+    # the server-assigned event_id carried on the envelope — the stable handle,
+    # independent of any Telegram message id (which may be absent).
+    event_id = ev.get("event_id")
+
     async def _ack():
-        if client is None or chat_id is None:
+        if client is None or event_id is None:
             return
-        ids = payload.get("message_ids")
-        if not ids:
-            single = payload.get("message_id")
-            ids = [single] if single is not None else []
-        ids = [int(i) for i in ids if i is not None]
-        if ids:
-            try:
-                await client.ack(int(chat_id), ids)
-            except Exception as e:
-                logger.warning(f"Gateway client [{gateway_name}]: ack failed: {e}")
+        try:
+            await client.ack([int(event_id)])
+        except Exception as e:
+            logger.warning(f"Gateway client [{gateway_name}]: ack failed: {e}")
 
     # Resolve the destination D_User row by (gateway, group) — Q3.
     row = sheets_manager.get_user_by_gateway_and_group(gateway_name, tg_group_id)

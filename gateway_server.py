@@ -383,7 +383,12 @@ class GatewayServer:
                 ids = []
                 for r in rows:
                     try:
-                        events.append(json.loads(r["event_json"]))
+                        ev = json.loads(r["event_json"])
+                        # Stamp the server-assigned event_id (the queue row id)
+                        # so the client can ACK and correlate by it. This is the
+                        # stable handle, independent of any Telegram message id.
+                        ev["event_id"] = r["id"]
+                        events.append(ev)
                         ids.append(r["id"])
                     except Exception:
                         ids.append(r["id"])  # drop unparseable row from queue
@@ -434,33 +439,24 @@ class GatewayServer:
             return web.json_response(
                 {"error": "ack endpoint requires event_type 'ack'"}, status=400
             )
-        payload = env.payload   # IdsPayload
+        payload = env.payload   # AckPayload (event_ids)
         loop = asyncio.get_running_loop()
+        want_ids = {int(e) for e in payload.event_ids}
         # Read the matching queued events first so we can delete their attachment
         # files once the rows are removed (ack is the terminal moment for
         # RequireACK gateways — no further download will be requested).
         matching = await loop.run_in_executor(
             None, db.gateway_peek, self._own_gateway, 1000
         )
-        want = {str(m) for m in payload.message_ids}
         to_clean = []
         for r in matching:
-            try:
-                ev = json.loads(r["event_json"])
-                p = ev.get("payload", {}) or {}
-                ids = set()
-                mid = p.get("message_id")
-                if mid is not None:
-                    ids.add(str(mid))
-                for m in (p.get("message_ids") or []):
-                    ids.add(str(m))
-                if ids & want:
-                    to_clean.append(ev)
-            except Exception:
-                continue
+            if r["id"] in want_ids:
+                try:
+                    to_clean.append(json.loads(r["event_json"]))
+                except Exception:
+                    pass
         removed = await loop.run_in_executor(
-            None, db.gateway_delete_by_chat_and_msgids,
-            self._own_gateway, str(payload.chat_id), payload.message_ids,
+            None, db.gateway_delete, list(want_ids),
         )
         await self._delete_event_files(to_clean)
         return web.json_response({

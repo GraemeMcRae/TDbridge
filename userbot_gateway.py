@@ -64,8 +64,8 @@ class UserbotGateway:
     async def download_file(self, file_ref: str) -> bytes:
         return await self._client.download_file(file_ref)
 
-    async def ack(self, chat_id: int, message_ids: List[int]) -> dict:
-        return await self._client.ack(chat_id, message_ids)
+    async def ack(self, event_ids: List[int]) -> dict:
+        return await self._client.ack(event_ids)
 
     # ---- Inbound (server -> userbot) ----------------------------------- #
 
