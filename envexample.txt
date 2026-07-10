@@ -53,6 +53,8 @@ TEST_POLL_ERR_MIN_COUNT=9
 TEST_POLL_ERR_MAX_RATE=0.05
 # SQLite message store file (stores TG<->DC message ID mappings for reply routing)
 TEST_SQLITE_DB_FILE=TDbridge_test.db
+# SQLite correlation store file (stores event<->ID mappings)
+TEST_CORRELATION_DB_FILE=TDbridge_test_correlations.db
 # Log file
 TEST_LOGFILENAME=TDbridge_test.log
 # How often to refresh the Google Sheets mapping cache (seconds); default 300
@@ -165,6 +167,8 @@ PROD_POLL_ERR_MIN_COUNT=9
 PROD_POLL_ERR_MAX_RATE=0.05
 # SQLite message store file (stores TG<->DC message ID mappings for reply routing)
 PROD_SQLITE_DB_FILE=TDbridge_prod.db
+# SQLite correlation store file (stores event<->ID mappings)
+PROD_CORRELATION_DB_FILE=TDbridge_prod_correlations.db
 # Log file
 PROD_LOGFILENAME=TDbridge_prod.log
 # How often to refresh the Google Sheets mapping cache (seconds); default 300
