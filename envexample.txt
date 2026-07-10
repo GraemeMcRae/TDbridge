@@ -113,12 +113,7 @@ TEST_USERBOT_METERING_MILLISEC=2000
 TEST_USERBOT_FLOOD=retry
 # Ceiling (seconds) for "retry": waits longer than this are still re-queued, just retried later.
 TEST_USERBOT_FLOOD_RETRY_MAX_SEC=120
-# Telegram group id whose bridged Discord channel receives the "enter the login code" prompt during a
-# gateway-mediated login. The human reads the code sent to the account and replies on Discord.
-# Leave empty to use the terminal login prompt instead.
-# Primary group -5102793369 is "Graeme McRae Prod | Group" which contains as members both TDbridgeProdBot (acting as SquadronDispatchBot) and this bot which is TDbridgeTestBot.
-TEST_USERBOT_PRIMARY_GROUP="-5102793369"
-# Minutes to wait for the human's code reply before re-requesting a fresh code (codes expire in minutes).
+# Minutes to wait for the code at the terminal prompt before re-requesting a fresh code (codes expire in minutes).
 TEST_USERBOT_LOGIN_CODE_WAIT_MIN=15
 # How many times to re-request a code after a timeout/expired code before giving up (restart to retry).
 TEST_USERBOT_LOGIN_CODE_MAX_RETRIES=3
@@ -230,12 +225,7 @@ PROD_USERBOT_METERING_MILLISEC=2000
 PROD_USERBOT_FLOOD=retry
 # Ceiling (seconds) for "retry": waits longer than this are still re-queued, just retried later.
 PROD_USERBOT_FLOOD_RETRY_MAX_SEC=120
-# Telegram group id whose bridged Discord channel receives the "enter the login code" prompt during a
-# gateway-mediated login. The human reads the code sent to the account and replies on Discord.
-# Leave empty to use the terminal login prompt instead.
-# Primary group -5102793369 is "Graeme McRae Prod | Group"
-PROD_USERBOT_PRIMARY_GROUP="-5102793369"
-# Minutes to wait for the human's code reply before re-requesting a fresh code (codes expire in minutes).
+# Minutes to wait for the code at the terminal prompt before re-requesting a fresh code (codes expire in minutes).
 PROD_USERBOT_LOGIN_CODE_WAIT_MIN=15
 # How many times to re-request a code after a timeout/expired code before giving up (restart to retry).
 PROD_USERBOT_LOGIN_CODE_MAX_RETRIES=3

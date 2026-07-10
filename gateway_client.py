@@ -218,6 +218,21 @@ class GatewayClient:
                 events = await self.poll_once()
                 backoff = 1.0
                 if events:
+                    for _ev in events:
+                        _p = _ev.get("payload", {}) or {}
+                        _chat = (_p.get("chat", {}) or {}).get("id")
+                        _txt = (_p.get("text") or "")
+                        _txt_prev = _txt.replace("\n", "\\n")
+                        if len(_txt_prev) > 200:
+                            _txt_prev = _txt_prev[:200] + "…"
+                        logger.info(
+                            "GW client RECV | gateway=%s | event=%s | chat=%s | "
+                            "msg_id=%s | reply_to=%s | emoji=%s | attachments=%d | text='%s'",
+                            self._gw.name, _ev.get("event_type"), _chat,
+                            _p.get("message_id"), _p.get("reply_to"),
+                            _p.get("emoji"),
+                            len(_p.get("attachments") or []), _txt_prev,
+                        )
                     await on_events(events)
             except GatewayClientError as e:
                 logger.warning("Gateway client poll error: %s (retrying in %.0fs)", e, backoff)

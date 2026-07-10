@@ -40,14 +40,31 @@ from userbot_login import make_terminal_code_provider
 
 
 def _setup_logging() -> logging.Logger:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(cfg.log_filename),
-        ],
-    )
+    # Timezone-aware formatter matching TDbridge's style: local time with the
+    # tz abbreviation (e.g. PDT) and milliseconds.
+    import time as _time
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        _tz = ZoneInfo(cfg.local_timezone)
+    except Exception:
+        _tz = None
+
+    class _TZFormatter(logging.Formatter):
+        def formatTime(self, record, datefmt=None):
+            dt = datetime.fromtimestamp(record.created, _tz)
+            # e.g. 2026-07-09 21:49:16.199 PDT
+            return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{int(record.msecs):03d} " + dt.strftime("%Z")
+
+    fmt = _TZFormatter("%(asctime)s - %(levelname)s - %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # Clear any handlers a prior basicConfig may have added.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    for handler in (logging.StreamHandler(), logging.FileHandler(cfg.log_filename)):
+        handler.setFormatter(fmt)
+        root.addHandler(handler)
     return logging.getLogger("userbot_main")
 
 
@@ -87,7 +104,6 @@ async def _run() -> None:
     )
     bridge = UserbotBridge(
         telegram, gateway, outbox=outbox,
-        primary_group_id=cfg.primary_group_id,
     )
     bridge_ref["bridge"] = bridge
     bridge.attach()   # register the Telegram inbound handler
@@ -95,21 +111,14 @@ async def _run() -> None:
     # --- Choose the login code provider ----------------------------------- #
     # Gateway-mediated when a primary group is set (prompt out over the gateway,
     # human replies on Discord); else terminal. The provider is only invoked if
-    # there is no valid saved session.
-    if cfg.primary_group_id:
-        code_provider = bridge.make_gateway_code_provider(
-            wait_min=cfg.login_code_wait_min
-        )
-        log.info("Login: gateway-mediated (primary group %s) if no session.",
-                 cfg.primary_group_id)
-    else:
-        code_provider = make_terminal_code_provider()
-        log.info("Login: terminal prompt if no session.")
+    # Login uses the terminal code provider: if there is no valid saved
+    # session, ensure_logged_in() prompts for the code at the console. The
+    # session is created once via `python userbot_login.py --env X` (or on the
+    # first run here), then reused silently on every subsequent start.
+    code_provider = make_terminal_code_provider()
+    log.info("Login: terminal prompt if no valid session.")
 
-    # --- Start Telethon (connect + ensure login) -------------------------- #
-    # For the gateway-mediated provider to receive the human's code reply, the
-    # gateway poll loop must be running DURING login. So we start the poll loop
-    # first, then ensure login, then start the outbox worker.
+    # --- Start the gateway poll loop, then Telethon (connect + login) ----- #
     stop_event = asyncio.Event()
 
     poll_task = asyncio.ensure_future(

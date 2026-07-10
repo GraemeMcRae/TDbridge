@@ -41,16 +41,10 @@ logger = logging.getLogger("userbot_bridge")
 
 
 class UserbotBridge:
-    def __init__(self, telegram, gateway, *, outbox, primary_group_id: str = ""):
+    def __init__(self, telegram, gateway, *, outbox):
         self._tg = telegram          # UserbotTelegram
         self._gw = gateway           # UserbotGateway
         self._outbox = outbox        # Outbox (persistent FIFO drain worker)
-        self._primary_group_id = primary_group_id
-
-        # One-shot login waiter: set to an asyncio.Future while a gateway-
-        # mediated login is awaiting the code reply; the inbound path fulfills
-        # it with the reply text instead of relaying that message.
-        self._login_waiter: Optional[asyncio.Future] = None
 
         # Dedupe set of (chat_id, message_id) we've already processed inbound,
         # so a redelivered event (pre-ack) isn't acted on twice.
@@ -122,18 +116,6 @@ class UserbotBridge:
         chat = payload.get("chat", {}) or {}
         chat_id = chat.get("id")
 
-        # --- Login interception: if a gateway-mediated login is awaiting a
-        # code, the first inbound message's text IS the code. Consume it and
-        # do NOT relay it as a normal action. ---
-        if (self._login_waiter is not None
-                and not self._login_waiter.done()
-                and etype in ("message", "edited_message")):
-            code_text = (payload.get("text") or "").strip()
-            if code_text:
-                self._login_waiter.set_result(code_text)
-                await self._ack(chat_id, self._ids(payload))
-                return
-
         # --- Dedupe by (chat_id, message_id[s]) ---
         ids = self._ids(payload)
         fresh = [i for i in ids if (chat_id, i) not in self._seen_inbound]
@@ -148,16 +130,34 @@ class UserbotBridge:
         # the action later, paced by metering and resilient to FLOOD. "Acked"
         # means "durably received", NOT "already performed" — this is what lets
         # polling continue at full speed while the queue drains.
+        _txt = (payload.get("text") or "").replace("\n", "\\n")
+        if len(_txt) > 200:
+            _txt = _txt[:200] + "…"
         if etype in ("message", "edited_message"):
             await self._outbox.enqueue(chat_id, etype, self._msg_action(payload))
+            logger.info(
+                "GW->TG enqueued | event=%s | chat=%s | reply_to=%s | "
+                "attachments=%d | text='%s'",
+                etype, chat_id, payload.get("reply_to"),
+                len(payload.get("attachments") or []), _txt,
+            )
         elif etype == "reaction":
             await self._outbox.enqueue(chat_id, "reaction", self._reaction_action(payload))
+            logger.info(
+                "GW->TG enqueued | event=reaction | chat=%s | msg_id=%s | emoji=%s",
+                chat_id, payload.get("message_id"), payload.get("emoji"),
+            )
         elif etype == "deletion":
             await self._outbox.enqueue(chat_id, "deletion", self._deletion_action(payload))
+            logger.info(
+                "GW->TG enqueued | event=deletion | chat=%s | msg_ids=%s",
+                chat_id, self._ids(payload),
+            )
         else:
             logger.info("ignoring unknown gateway event_type=%s", etype)
 
         await self._ack(chat_id, ids)
+        logger.info("GW event acked | chat=%s | ids=%s", chat_id, ids)
 
     # ---- Build serializable action payloads for the outbox -------------- #
     # These capture everything perform_action() needs; attachments are kept as
@@ -200,6 +200,9 @@ class UserbotBridge:
             text = payload.get("text") or ""
             reply_to = payload.get("reply_to")
             attachments = payload.get("attachments") or []
+            _tprev = text.replace("\n", "\\n")
+            if len(_tprev) > 200:
+                _tprev = _tprev[:200] + "…"
             if attachments:
                 first = True
                 for a in attachments:
@@ -207,27 +210,42 @@ class UserbotBridge:
                     if data is None:
                         continue
                     caption = text if first else ""
-                    await self._tg.send_file(
+                    new_id = await self._tg.send_file(
                         chat_id, data, filename=a.get("file_name"),
                         caption=caption, reply_to=reply_to,
+                    )
+                    logger.info(
+                        "TG POST (file) | chat=%s | new_tg_msg=%s | reply_to=%s | "
+                        "file=%s | caption='%s'",
+                        chat_id, new_id, reply_to, a.get("file_name"),
+                        _tprev if first else "",
                     )
                     first = False
                 if first and text:
                     await self._tg.send_text(chat_id, text, reply_to=reply_to)
             else:
-                await self._tg.send_text(chat_id, text, reply_to=reply_to)
+                new_id = await self._tg.send_text(chat_id, text, reply_to=reply_to)
+                logger.info(
+                    "TG POST (text) | chat=%s | new_tg_msg=%s | reply_to=%s | text='%s'",
+                    chat_id, new_id, reply_to, _tprev,
+                )
             return
         if action_type == "reaction":
             mid = payload.get("message_id")
             if mid is not None:
                 await self._tg.add_reaction(chat_id, int(mid), payload.get("emoji") or "")
+                logger.info("TG REACT | chat=%s | tg_msg=%s | emoji=%s",
+                            chat_id, mid, payload.get("emoji"))
             return
         if action_type == "deletion":
             ids = payload.get("message_ids") or []
             if ids:
                 await self._tg.delete_messages(chat_id, [int(i) for i in ids])
+                logger.info("TG DELETE | chat=%s | tg_msgs=%s", chat_id, ids)
             return
         logger.warning("perform_action: unknown action_type=%s", action_type)
+
+    async def _download_ref(self, att: dict):
         """Fetch an attachment's bytes from the server store by file_ref."""
         try:
             return await self._gw.download_file(att["file_ref"])
@@ -253,40 +271,3 @@ class UserbotBridge:
         except Exception as e:
             logger.debug("ack failed (non-fatal): %s", e)
 
-    # ================================================================= #
-    # Gateway-mediated login code provider                               #
-    # ================================================================= #
-    def make_gateway_code_provider(self, *, wait_min: int):
-        """Return a code_provider (async, no-arg) that prompts over the gateway
-        and awaits the human's reply. Raises asyncio.TimeoutError if no reply
-        arrives within wait_min minutes (so ensure_logged_in re-requests)."""
-        async def _provider() -> str:
-            if not self._primary_group_id:
-                raise RuntimeError(
-                    "Gateway-mediated login needs USERBOT_PRIMARY_GROUP set."
-                )
-            loop = asyncio.get_running_loop()
-            self._login_waiter = loop.create_future()
-            # Send the prompt out over the gateway, sourced from the primary
-            # group so TDbridge routes it to that group's Discord channel/tag.
-            prompt = ("🔐 TDbridge userbot login: reply to this message with the "
-                      "Telegram login code just sent to the userbot's phone.")
-            try:
-                await self._gw.send_message(
-                    int(self._primary_group_id),
-                    text=prompt,
-                    message_id=None,   # let the server post it (Echo path)
-                )
-            except Exception as e:
-                self._login_waiter = None
-                raise RuntimeError(f"could not send login prompt: {e}") from e
-            try:
-                code = await asyncio.wait_for(
-                    self._login_waiter, timeout=wait_min * 60
-                )
-                return code
-            except asyncio.TimeoutError:
-                raise
-            finally:
-                self._login_waiter = None
-        return _provider

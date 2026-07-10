@@ -139,21 +139,11 @@ class UserbotConfig:
         )
 
         # ------------------------------------------------------------------ #
-        # 7. Primary group (for the gateway-mediated login prompt)            #
+        # 7. Login code retry (terminal login)                                #
         # ------------------------------------------------------------------ #
-        # The Telegram group id whose bridged Discord channel receives the
-        # "enter the login code" prompt during a gateway-mediated login. The
-        # human reads the code (sent by Telegram to the account) and replies on
-        # Discord; that reply comes back over the gateway as the code.
-        self.primary_group_id: str = get(
-            "USERBOT_PRIMARY_GROUP", required=False
-        )
-
-        # How long the gateway-mediated login waits for a human's reply before
-        # re-requesting a fresh code (Telegram codes expire in minutes). On
-        # timeout it logs, requests a new code (producing a new Discord prompt),
-        # and waits again — up to USERBOT_LOGIN_CODE_MAX_RETRIES times, after
-        # which the login gives up (restart the service to try again).
+        # How long ensure_logged_in waits for a code before re-requesting a
+        # fresh one (Telegram codes expire in minutes), and how many times to
+        # retry before giving up (restart to try again).
         self.login_code_wait_min: int = int(
             get("USERBOT_LOGIN_CODE_WAIT_MIN", required=False, default="15")
         )
