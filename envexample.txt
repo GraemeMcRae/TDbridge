@@ -93,6 +93,11 @@ TEST_USERBOT_API_HASH="<api-hash>"
 TEST_USERBOT_PHONE="+16619434409"
 # Optional two-step-verification password (only if the account has 2SV enabled). Distinct from the per-login code.
 TEST_USERBOT_2FA_PASSWORD=""
+# The userbot's own Telegram USER-account id (numeric). Read by TDbridge (not just the userbot):
+# when this instance serves a client_reposts gateway, messages authored by this id are the
+# userbot's re-posts of Discord-origin content and must NOT be bridged back (boomerang suppression).
+# To find the account id, run this command then look for login successful id=...: cd ~/TDbridge && python userbot_login.py --env test
+TEST_USERBOT_ACCOUNT_ID="8641508117"
 # Telethon session file (resolved from the project root). Created by the first login; reused thereafter.
 TEST_USERBOT_SESSION_FILE=TDbridge_test_userbot.session
 # Relay messages from ANY bot in the group EXCEPT this one (our own sibling TDbridge bot, whose
@@ -204,6 +209,11 @@ PROD_USERBOT_API_HASH="<api-hash>"
 PROD_USERBOT_PHONE="+16618167186"
 # Optional two-step-verification password (only if the account has 2SV enabled). Distinct from the per-login code.
 PROD_USERBOT_2FA_PASSWORD=""
+# The userbot's own Telegram USER-account id (numeric). Read by TDbridge (not just the userbot):
+# when this instance serves a client_reposts gateway, messages authored by this id are the
+# userbot's re-posts of Discord-origin content and must NOT be bridged back (boomerang suppression).
+# To find the account id, run this command then look for login successful id=...: cd ~/TDbridge && python userbot_login.py --env prod
+PROD_USERBOT_ACCOUNT_ID=""
 # Telethon session file (resolved from the project root). Created by the first login; reused thereafter.
 PROD_USERBOT_SESSION_FILE=TDbridge_prod_userbot.session
 # Relay messages from ANY bot in the group EXCEPT this one (our own sibling TDbridge bot, whose

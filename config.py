@@ -259,6 +259,16 @@ class Config:
             self.env_prefix + "OWN_GATEWAY", ""
         ).strip()
 
+        # Option E: the Telegram user-account id of the co-located userbot (the
+        # gateway CLIENT that re-posts relayed messages into the group). When
+        # this instance serves a client_reposts gateway, messages authored by
+        # this account id are the userbot's re-posts of Discord-origin content —
+        # they must NOT be bridged back to Discord (that would boomerang). Empty
+        # (default) disables the suppression. Read by the native TG→DC path.
+        self.userbot_account_id: str = os.getenv(
+            self.env_prefix + "USERBOT_ACCOUNT_ID", ""
+        ).strip()
+
         # TELEGRAM_GATEWAYS names a JSON file (shared, no TEST_/PROD_ prefix)
         # listing all known gateways: name, url, secret, and behavior flags.
         # See gateway_config.py / TDbridge_Gateway_Protocol.md. Empty/unset means
@@ -331,6 +341,18 @@ class Config:
         from gateway_config import load_gateways, validate_own_gateway
         self.gateways = load_gateways(gateways_path)
         validate_own_gateway(self.gateways, self.own_gateway)
+
+        # Convenience: the GatewayDef this instance OWNS (serves), or None.
+        self.own_gateway_def = (
+            self.gateways.get(self.own_gateway) if self.own_gateway else None
+        )
+        # Does our owned gateway have client_reposts=true? (Option E: the client
+        # userbot re-posts into Telegram, so replies go ONLY via the gateway and
+        # the native send is suppressed; and the userbot's re-posts are not
+        # bridged back.) False when we own no gateway or the flag is unset.
+        self.own_gateway_client_reposts: bool = bool(
+            self.own_gateway_def and self.own_gateway_def.client_reposts
+        )
 
         # Google Sheets
         self.google_spreadsheet_name: str = get("GOOGLE_SPREADSHEET_NAME")

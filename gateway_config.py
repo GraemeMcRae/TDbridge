@@ -43,6 +43,17 @@ class GatewayDef:
     echo: bool = True
     require_ack: bool = False
     relay_user_messages: bool = False
+    # client_reposts: does the CLIENT on the other end re-post relayed messages
+    # into the real Telegram group itself?
+    #   false (default) — the client CONSUMES relayed messages (e.g. a partner's
+    #     dispatch bot) and does NOT put them in the group. So for the group to
+    #     show a reply, the SERVER must ALSO send it natively — i.e. the server
+    #     double-sends (native + gateway). This is the original B/C/D behavior.
+    #   true — the client (e.g. the Option-E userbot) re-posts relayed messages
+    #     into the group as a user account ("reverse echo"). The server must then
+    #     send replies ONLY via the gateway and SUPPRESS the native send, or the
+    #     message would appear twice. Mirror image of `echo` (server_reposts).
+    client_reposts: bool = False
 
     def is_server_for(self, own_gateway_name: str) -> bool:
         """True if the reading instance OWNS this gateway (acts as its server)."""
@@ -157,6 +168,7 @@ def load_gateways(path: str) -> Dict[str, GatewayDef]:
             relay_user_messages=_as_bool(
                 entry.get("relay_user_messages"), default=False
             ),
+            client_reposts=_as_bool(entry.get("client_reposts"), default=False),
         )
 
     return result

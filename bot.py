@@ -1684,6 +1684,26 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
     tg_group_id = _tg_group_id_str(tg_chat.id)
     tg_msg_id   = _tg_msg_id_str(msg.message_id)
 
+    # ---- Option E boomerang suppression ----
+    # When this instance serves a client_reposts gateway, the co-located userbot
+    # re-posts Discord-origin messages into the group as its own user account.
+    # Those re-posts must NOT be bridged back to Discord (they came FROM Discord;
+    # bridging them back would boomerang). Identify them by author id: any
+    # message authored by the configured userbot account, in this mode, is such
+    # a repost. This is race-free and stateless — no correlation needed for the
+    # suppression decision (correlation is a separate concern, for routing later
+    # reactions/replies to the reposted message).
+    if (config.own_gateway_client_reposts
+            and config.userbot_account_id
+            and msg.from_user
+            and str(msg.from_user.id) == config.userbot_account_id):
+        logger.info(
+            f"TG→DC: SKIPPING userbot repost (boomerang suppression) | "
+            f"tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
+            f"author_id={msg.from_user.id}"
+        )
+        return
+
     # ---- Burst circuit breaker (total throughput protection) ----
     if not gateway_ratelimit.check_and_record(tg_group_id, config.telegram_burstrate):
         # Tripped. The breaker's own tripped-set is what suppresses subsequent
@@ -2998,6 +3018,64 @@ class TDbridgeDiscordClient(discord.Client):
             await _send_via_gateway_client(
                 client, target_gateway, tg_group_id, text, message,
                 immediate_reply_tg_id, dc_channel_id, dc_msg_id,
+            )
+            return
+
+        # ---- Server-role gateway relay (Option E return path) ----
+        # If this Discord message replies to a message that arrived via a
+        # gateway THIS instance SERVES *and that gateway has client_reposts=true*
+        # (the client, e.g. the userbot, re-posts into Telegram itself), the
+        # reply must go back OUT that gateway ONLY — we must NOT also send it
+        # natively, or it would appear twice (once by us, once by the userbot's
+        # repost), and a native reply-to would use a gateway-space id that isn't
+        # a real message this bot can reply to. Origin determines the return
+        # path; native reachability is irrelevant here.
+        #
+        # When client_reposts is FALSE (the original B/C/D behavior: the client
+        # CONSUMES rather than reposts), we deliberately do NOT take this branch;
+        # control falls through to the native send below, and the existing
+        # hop-2 relay (further down) ALSO relays out the gateway — the correct
+        # double-send so the group shows the reply AND the consuming client
+        # receives it.
+        if (inherited_origin_gateway
+                and _gateway_server.is_serving()
+                and inherited_origin_gateway == config.own_gateway
+                and config.own_gateway_client_reposts):
+            resolved_content = _resolve_discord_mentions(message.content)
+            relay_text = f"{attribution} {resolved_content}".strip()
+            gw_attachments, gw_notes = await _gather_outbound_attachments_from_discord(
+                inherited_origin_gateway, message.attachments
+            )
+            for _n in gw_notes:
+                logger.warning(f"GW outbound attachment ({tg_group_id}): {_n}")
+            # Fresh reply relayed server->client: there is no server-side tg id
+            # yet (the client/userbot posts it and assigns the id), so the
+            # envelope carries message_id=None. reply_to is the parent's real
+            # tg id (immediate_reply_tg_id), which the client can reply to.
+            _reply_to = None
+            if immediate_reply_tg_id:
+                try:
+                    _reply_to = int(immediate_reply_tg_id)
+                except (ValueError, TypeError):
+                    _reply_to = None
+            env = gp.make_message(
+                inherited_origin_gateway, int(tg_group_id),
+                message_id=None,
+                text=relay_text,
+                reply_to=_reply_to,
+                from_user=gp.User(first_name=sender_name, is_synthetic=True),
+                edited=False,
+                attachments=(gw_attachments or None),
+            )
+            await _gateway_server.enqueue_outbound(
+                inherited_origin_gateway, int(tg_group_id),
+                env.to_json(include_secret=False),
+            )
+            logger.info(
+                f"DC→GW server relay (reply) | gateway={inherited_origin_gateway} "
+                f"| tg_group={tg_group_id} | reply_to={_reply_to} "
+                f"| sender={sender_name!r} | attachments="
+                f"{len(gw_attachments) if gw_attachments else 0}"
             )
             return
 
