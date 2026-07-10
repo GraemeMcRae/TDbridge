@@ -209,6 +209,17 @@ class GatewayClient:
             raise GatewayClientError(f"ack failed (HTTP {status}): {body}")
         return body
 
+    async def send_correlate(self, event_id: int, telegram_ids: List[int]) -> dict:
+        """Report that outbound `event_id` became the given telegram_ids (empty
+        list = deliberately nothing). Sent after the client posts to Telegram."""
+        env = gp.make_correlate(self._gw.name, int(event_id),
+                                [int(t) for t in telegram_ids],
+                                secret=self._gw.secret)
+        status, body = await self._post_envelope("correlate", env)
+        if status != 200:
+            raise GatewayClientError(f"correlate failed (HTTP {status}): {body}")
+        return body
+
     async def run_poll_loop(self, on_events) -> None:
         """Continuously long-poll and dispatch events to the async callback
         `on_events(list_of_event_dicts)`. Runs until cancelled. Transient errors

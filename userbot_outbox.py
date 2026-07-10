@@ -35,28 +35,37 @@ from telethon.errors import FloodWaitError
 
 logger = logging.getLogger("userbot_outbox")
 
-# perform(action_type, chat_id, payload) -> awaitable
-PerformFn = Callable[[str, str, dict], Awaitable[None]]
+# perform(action_type, chat_id, payload) -> awaitable[list[int]]
+#   Returns the Telegram target id(s) the action produced: e.g. the new message
+#   id for a posted message (as a 1-element list), the ids of a media group, or
+#   [] for an action that creates no Telegram message (a bare reaction, a
+#   deletion, or a no-op). The outbox reports these via on_correlate.
+PerformFn = Callable[[str, str, dict], Awaitable[list]]
+# on_correlate(event_id, target_ids) -> awaitable  (event_id may be None → skip)
+CorrelateFn = Callable[[int, list], Awaitable[None]]
 
 
 class Outbox:
     def __init__(self, db, *, metering_ms: int, flood_action: str,
-                 flood_retry_max_sec: int, perform: PerformFn):
+                 flood_retry_max_sec: int, perform: PerformFn,
+                 on_correlate: CorrelateFn = None):
         self._db = db
         self._min_interval = max(0.0, metering_ms / 1000.0)
         self._flood_action = flood_action if flood_action in ("retry", "save") else "retry"
         self._flood_retry_max_sec = max(0, flood_retry_max_sec)
         self._perform = perform
+        self._on_correlate = on_correlate
         self._wake = asyncio.Event()
         self._last_returned_at = 0.0   # in-memory; resets on restart (safe: only adds spacing)
         self._stopped = False
 
     # ---- enqueue side (called by the bridge) --------------------------- #
     async def enqueue(self, chat_id, action_type: str, payload: dict,
-                      defer_until_ts=None) -> None:
+                      defer_until_ts=None, event_id=None) -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None, self._db.enqueue, chat_id, action_type, payload, defer_until_ts
+            None, self._db.enqueue, chat_id, action_type, payload,
+            defer_until_ts, event_id
         )
         self._wake.set()   # wake the worker if it was sleeping on an empty queue
 
@@ -107,9 +116,20 @@ class Outbox:
                 continue
 
             try:
-                await self._perform(action_type, chat_id, payload)
+                target_ids = await self._perform(action_type, chat_id, payload)
                 self._last_returned_at = time.time()
                 await loop.run_in_executor(None, self._db.delete, head["seq"])
+                # Emit a correlate for the originating event (if any), reporting
+                # the Telegram id(s) this action produced. Even an empty list is
+                # reported ("deliberately nothing"), so the server's watermark
+                # advances and no event is left dangling.
+                ev_id = head["event_id"]
+                if ev_id is not None and self._on_correlate is not None:
+                    try:
+                        await self._on_correlate(int(ev_id), list(target_ids or []))
+                    except Exception as e:
+                        logger.warning("correlate emit failed for event_id=%s: %s",
+                                       ev_id, e)
             except FloodWaitError as e:
                 wait_s = int(getattr(e, "seconds", 0) or 0)
                 if self._flood_action == "retry" and wait_s > self._flood_retry_max_sec:

@@ -38,6 +38,7 @@ EVENT_EDITED_MESSAGE = "edited_message"
 EVENT_REACTION = "reaction"
 EVENT_DELETION = "deletion"
 EVENT_ACK = "ack"
+EVENT_CORRELATE = "correlate"
 
 _EVENT_TYPES = frozenset({
     EVENT_MESSAGE,
@@ -45,6 +46,7 @@ _EVENT_TYPES = frozenset({
     EVENT_REACTION,
     EVENT_DELETION,
     EVENT_ACK,
+    EVENT_CORRELATE,
 })
 
 
@@ -269,6 +271,35 @@ class AckPayload:
         return cls(event_ids=[_as_int(i, "event_ids[]") for i in ids])
 
 
+@dataclass
+class CorrelatePayload:
+    """Payload for 'correlate' events. Reports that the outbound event with
+    server-assigned `event_id` corresponds to the given `telegram_ids` — the
+    real Telegram message id(s) the poster (client, or server when echoing)
+    assigned when it posted. An empty list means 'deliberately nothing posted'
+    (the event needed no Telegram message). A media group yields multiple ids;
+    the first is the primary (reaction/edit target); deletions target all."""
+    event_id: int
+    telegram_ids: List[int] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "telegram_ids": list(self.telegram_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "CorrelatePayload":
+        eid = _require(d, "event_id", "correlate payload")
+        ids = _require(d, "telegram_ids", "correlate payload")
+        if not isinstance(ids, list):
+            raise GatewayProtocolError("correlate payload: 'telegram_ids' must be an array")
+        return cls(
+            event_id=_as_int(eid, "correlate payload event_id"),
+            telegram_ids=[_as_int(i, "telegram_ids[]") for i in ids],
+        )
+
+
 # Map event_type → payload class, for dispatch in from_dict.
 _PAYLOAD_CLASS = {
     EVENT_MESSAGE: MessagePayload,
@@ -276,6 +307,7 @@ _PAYLOAD_CLASS = {
     EVENT_REACTION: ReactionPayload,
     EVENT_DELETION: IdsPayload,
     EVENT_ACK: AckPayload,
+    EVENT_CORRELATE: CorrelatePayload,
 }
 
 
@@ -463,4 +495,21 @@ def make_ack(
         event_type=EVENT_ACK,
         secret=secret,
         payload=AckPayload(event_ids=list(event_ids)),
+    )
+
+
+def make_correlate(
+    gateway: str,
+    event_id: int,
+    telegram_ids: List[int],
+    *,
+    secret: Optional[str] = None,
+) -> Envelope:
+    """Build a 'correlate' envelope reporting that outbound `event_id` became
+    the given `telegram_ids` (empty list = deliberately nothing posted)."""
+    return Envelope(
+        gateway=gateway,
+        event_type=EVENT_CORRELATE,
+        secret=secret,
+        payload=CorrelatePayload(event_id=event_id, telegram_ids=list(telegram_ids)),
     )

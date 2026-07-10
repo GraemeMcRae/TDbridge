@@ -354,6 +354,15 @@ class Config:
             self.own_gateway_def and self.own_gateway_def.client_reposts
         )
 
+        # Correlation registry DB (Phase 2+): records outbound event_id →
+        # Telegram id(s). Server-side; only meaningful when this instance owns a
+        # gateway. Covered by .gitignore TDbridge*.db*.
+        corr_filename = os.getenv(
+            self.env_prefix + "CORRELATION_DB_FILE",
+            f"TDbridge_{self.env}_correlations.db",
+        )
+        self.correlation_db_file: str = str(PROJECT_ROOT / corr_filename)
+
         # Google Sheets
         self.google_spreadsheet_name: str = get("GOOGLE_SPREADSHEET_NAME")
 

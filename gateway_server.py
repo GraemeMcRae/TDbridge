@@ -58,6 +58,19 @@ class GatewayServer:
         self._debug_endpoints: bool = bool(
             getattr(config, "gateway_debug_endpoints", False)
         )
+        # Correlation registry (Phase 2): records outbound event_id → the
+        # Telegram id(s) the poster (client, or server when echoing) assigned.
+        # A standalone, domain-agnostic black box; the server records into it and
+        # (Phase 3) will complete provisional mappings from it.
+        self._correlations = None
+        corr_path = getattr(config, "correlation_db_file", "")
+        if corr_path:
+            try:
+                from correlation import CorrelationRegistry
+                self._correlations = CorrelationRegistry(corr_path)
+            except Exception as e:
+                logger.warning("could not open correlation registry (%s): %s",
+                               corr_path, e)
         # Async hook injected by bot.py implementing the gateway's central
         # function: place the message in Telegram (Echo=true) or accept the
         # client-supplied id (Echo=false), then bridge it to Discord. Signature:
@@ -131,6 +144,7 @@ class GatewayServer:
             web.post("/gateway/send", self._handle_send),
             web.post("/gateway/poll", self._handle_poll),
             web.post("/gateway/ack", self._handle_ack),
+            web.post("/gateway/correlate", self._handle_correlate),
             web.post("/gateway/upload", self._handle_upload),
             web.post("/gateway/getfile", self._handle_getfile),
             web.get("/gateway/file/{token}", self._handle_download),
@@ -464,6 +478,41 @@ class GatewayServer:
             "status": "ack",
             "removed": removed,
         })
+
+    async def _handle_correlate(self, request: web.Request) -> web.Response:
+        """Record a correlation: outbound event_id → the Telegram id(s) the
+        client assigned when it posted (empty list = deliberately nothing).
+        Phase 2 records it; Phase 3 will use it to complete provisional mappings
+        and fire parked actions."""
+        env, err = await self._read_envelope(request)
+        if err is not None:
+            return err
+        auth_err = self._check_secret(env)
+        if auth_err is not None:
+            return auth_err
+        if env.event_type != gp.EVENT_CORRELATE:
+            return web.json_response(
+                {"error": "correlate endpoint requires event_type 'correlate'"},
+                status=400,
+            )
+        p = env.payload   # CorrelatePayload
+        self.record_correlation(p.event_id, p.telegram_ids)
+        return web.json_response({
+            "protocol_version": gp.PROTOCOL_VERSION,
+            "status": "correlate",
+            "event_id": p.event_id,
+        })
+
+    def record_correlation(self, event_id: int, telegram_ids: list) -> None:
+        """Record a correlation in the registry. Called by the correlate
+        endpoint (client-sent) and (Phase 3) by the echo path (server
+        self-correlate)."""
+        if self._correlations is not None:
+            self._correlations.record(int(event_id), [int(t) for t in telegram_ids])
+        logger.info(
+            "CORRELATE recorded | gateway=%s | event_id=%s | telegram_ids=%s",
+            self._own_gateway, event_id, list(telegram_ids),
+        )
 
     async def _handle_debug_enqueue(self, request: web.Request) -> web.Response:
         """DEBUG-ONLY (gated by GATEWAY_DEBUG_ENDPOINTS): inject an event into

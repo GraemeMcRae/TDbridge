@@ -142,7 +142,8 @@ class UserbotBridge:
         if len(_txt) > 200:
             _txt = _txt[:200] + "…"
         if etype in ("message", "edited_message"):
-            await self._outbox.enqueue(chat_id, etype, self._msg_action(payload))
+            await self._outbox.enqueue(chat_id, etype, self._msg_action(payload),
+                                       event_id=event_id)
             logger.info(
                 "GW->TG enqueued | event_id=%s | event=%s | chat=%s | reply_to=%s | "
                 "attachments=%d | text='%s'",
@@ -150,13 +151,15 @@ class UserbotBridge:
                 len(payload.get("attachments") or []), _txt,
             )
         elif etype == "reaction":
-            await self._outbox.enqueue(chat_id, "reaction", self._reaction_action(payload))
+            await self._outbox.enqueue(chat_id, "reaction", self._reaction_action(payload),
+                                       event_id=event_id)
             logger.info(
                 "GW->TG enqueued | event_id=%s | event=reaction | chat=%s | msg_id=%s | emoji=%s",
                 event_id, chat_id, payload.get("message_id"), payload.get("emoji"),
             )
         elif etype == "deletion":
-            await self._outbox.enqueue(chat_id, "deletion", self._deletion_action(payload))
+            await self._outbox.enqueue(chat_id, "deletion", self._deletion_action(payload),
+                                       event_id=event_id)
             logger.info(
                 "GW->TG enqueued | event_id=%s | event=deletion | chat=%s | msg_ids=%s",
                 event_id, chat_id, self._ids(payload),
@@ -196,18 +199,22 @@ class UserbotBridge:
         return {"message_ids": [int(i) for i in ids]}
 
     # ---- perform_action: called by the outbox worker at send time ------- #
-    async def perform_action(self, action_type: str, chat_id, payload: dict) -> None:
-        """Perform one queued outbound Telegram action. Raises FloodWaitError on
-        a flood (the outbox re-appends); other exceptions propagate (dropped)."""
+    async def perform_action(self, action_type: str, chat_id, payload: dict) -> list:
+        """Perform one queued outbound Telegram action. Returns the Telegram
+        target id(s) it produced (for correlation): a message → [new_id]; a
+        media group → [id, id, ...]; a bare reaction/edit/deletion → [] (no new
+        message). Raises FloodWaitError on a flood (the outbox re-appends);
+        other exceptions propagate (dropped)."""
         if action_type == "edited_message":
             mid = payload.get("message_id")
             if mid is not None:
                 await self._tg.edit_text(chat_id, int(mid), payload.get("text") or "")
-            return
+            return []
         if action_type == "message":
             text = payload.get("text") or ""
             reply_to = payload.get("reply_to")
             attachments = payload.get("attachments") or []
+            produced = []
             _tprev = text.replace("\n", "\\n")
             if len(_tprev) > 200:
                 _tprev = _tprev[:200] + "…"
@@ -222,6 +229,7 @@ class UserbotBridge:
                         chat_id, data, filename=a.get("file_name"),
                         caption=caption, reply_to=reply_to,
                     )
+                    produced.append(new_id)
                     logger.info(
                         "TG POST (file) | chat=%s | new_tg_msg=%s | reply_to=%s | "
                         "file=%s | caption='%s'",
@@ -230,28 +238,42 @@ class UserbotBridge:
                     )
                     first = False
                 if first and text:
-                    await self._tg.send_text(chat_id, text, reply_to=reply_to)
+                    nid = await self._tg.send_text(chat_id, text, reply_to=reply_to)
+                    produced.append(nid)
             else:
                 new_id = await self._tg.send_text(chat_id, text, reply_to=reply_to)
+                produced.append(new_id)
                 logger.info(
                     "TG POST (text) | chat=%s | new_tg_msg=%s | reply_to=%s | text='%s'",
                     chat_id, new_id, reply_to, _tprev,
                 )
-            return
+            return produced
         if action_type == "reaction":
             mid = payload.get("message_id")
             if mid is not None:
                 await self._tg.add_reaction(chat_id, int(mid), payload.get("emoji") or "")
                 logger.info("TG REACT | chat=%s | tg_msg=%s | emoji=%s",
                             chat_id, mid, payload.get("emoji"))
-            return
+            return []
         if action_type == "deletion":
             ids = payload.get("message_ids") or []
             if ids:
                 await self._tg.delete_messages(chat_id, [int(i) for i in ids])
                 logger.info("TG DELETE | chat=%s | tg_msgs=%s", chat_id, ids)
-            return
+            return []
         logger.warning("perform_action: unknown action_type=%s", action_type)
+        return []
+
+    async def send_correlate(self, event_id: int, telegram_ids: list) -> None:
+        """Report to the server that outbound `event_id` became telegram_ids
+        (empty list = deliberately nothing). Called by the outbox after a
+        successful post, in ACK/post order."""
+        try:
+            await self._gw.send_correlate(int(event_id), [int(t) for t in telegram_ids])
+            logger.info("GW correlate sent | event_id=%s | telegram_ids=%s",
+                        event_id, telegram_ids)
+        except Exception as e:
+            logger.warning("correlate send failed for event_id=%s: %s", event_id, e)
 
     async def _download_ref(self, att: dict):
         """Fetch an attachment's bytes from the server store by file_ref."""

@@ -46,6 +46,7 @@ class UserbotDB:
             """
             CREATE TABLE IF NOT EXISTS deferred_actions (
                 seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id       INTEGER,            -- originating gateway event id (for correlate)
                 chat_id        TEXT    NOT NULL,
                 action_type    TEXT    NOT NULL,   -- message|edited_message|reaction|deletion
                 payload_json   TEXT    NOT NULL,   -- the action's parameters
@@ -65,7 +66,8 @@ class UserbotDB:
 
     # ---- enqueue --------------------------------------------------------- #
     def enqueue(self, chat_id, action_type: str, payload: dict,
-                defer_until_ts: Optional[float] = None) -> int:
+                defer_until_ts: Optional[float] = None,
+                event_id: Optional[int] = None) -> int:
         """Append an outbound action to the tail of the FIFO queue.
         Returns the new row's seq."""
         now = time.time()
@@ -73,9 +75,10 @@ class UserbotDB:
             defer_until_ts = now
         cur = self._conn.execute(
             "INSERT INTO deferred_actions "
-            "(chat_id, action_type, payload_json, defer_until_ts, attempts, created_ts) "
-            "VALUES (?, ?, ?, ?, 0, ?)",
-            (str(chat_id), action_type, json.dumps(payload), defer_until_ts, now),
+            "(event_id, chat_id, action_type, payload_json, defer_until_ts, attempts, created_ts) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (event_id, str(chat_id), action_type, json.dumps(payload),
+             defer_until_ts, now),
         )
         self._conn.commit()
         return cur.lastrowid
@@ -97,7 +100,7 @@ class UserbotDB:
         attempts. Used for FLOOD retries so the action keeps its place BEHIND
         anything already queued but is retried later. Returns the new seq."""
         row = self._conn.execute(
-            "SELECT chat_id, action_type, payload_json, attempts, created_ts "
+            "SELECT event_id, chat_id, action_type, payload_json, attempts, created_ts "
             "FROM deferred_actions WHERE seq = ?", (seq,)
         ).fetchone()
         if row is None:
@@ -105,9 +108,9 @@ class UserbotDB:
         self._conn.execute("DELETE FROM deferred_actions WHERE seq = ?", (seq,))
         cur = self._conn.execute(
             "INSERT INTO deferred_actions "
-            "(chat_id, action_type, payload_json, defer_until_ts, attempts, created_ts) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (row["chat_id"], row["action_type"], row["payload_json"],
+            "(event_id, chat_id, action_type, payload_json, defer_until_ts, attempts, created_ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (row["event_id"], row["chat_id"], row["action_type"], row["payload_json"],
              defer_until_ts, row["attempts"] + 1, row["created_ts"]),
         )
         self._conn.commit()

@@ -67,6 +67,9 @@ class UserbotGateway:
     async def ack(self, event_ids: List[int]) -> dict:
         return await self._client.ack(event_ids)
 
+    async def send_correlate(self, event_id: int, telegram_ids: List[int]) -> dict:
+        return await self._client.send_correlate(event_id, telegram_ids)
+
     # ---- Inbound (server -> userbot) ----------------------------------- #
 
     async def run_poll_loop(self, on_events: Callable[[list], Awaitable[None]]) -> None:

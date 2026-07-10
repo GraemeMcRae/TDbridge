@@ -93,7 +93,10 @@ async def _run() -> None:
     bridge_ref = {}
 
     async def _perform(action_type, chat_id, payload):
-        await bridge_ref["bridge"].perform_action(action_type, chat_id, payload)
+        return await bridge_ref["bridge"].perform_action(action_type, chat_id, payload)
+
+    async def _on_correlate(event_id, target_ids):
+        await bridge_ref["bridge"].send_correlate(event_id, target_ids)
 
     outbox = Outbox(
         db,
@@ -101,6 +104,7 @@ async def _run() -> None:
         flood_action=cfg.flood_action,
         flood_retry_max_sec=cfg.flood_retry_max_sec,
         perform=_perform,
+        on_correlate=_on_correlate,
     )
     bridge = UserbotBridge(
         telegram, gateway, outbox=outbox,
