@@ -56,6 +56,17 @@ class UserbotDB:
             )
             """
         )
+        # Lightweight migration: a DB created before event_id was added won't
+        # have that column (CREATE TABLE IF NOT EXISTS is a no-op on an existing
+        # table). Add it if missing. Idempotent and safe on fresh DBs too.
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(deferred_actions)")
+        }
+        if "event_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE deferred_actions ADD COLUMN event_id INTEGER"
+            )
         self._conn.commit()
 
     def close(self) -> None:

@@ -127,11 +127,13 @@ class UserbotBridge:
             return
 
         # --- Dedupe by event_id ---
+        # We mark the event as seen only AFTER a successful enqueue+ack below.
+        # If enqueue raises, we neither mark it seen nor ack it, so the server
+        # redelivers it and we retry cleanly (no silent loss).
         if event_id in self._seen_inbound:
             await self._ack_events([event_id])   # already handled; just re-ack
             logger.info("GW event re-acked (dup) | event_id=%s", event_id)
             return
-        self._seen_inbound.add(event_id)
 
         # --- Dispatch: enqueue the outbound Telegram action, then ack ---
         # We enqueue (durably) and ack immediately. The outbox worker performs
@@ -168,6 +170,7 @@ class UserbotBridge:
             logger.info("ignoring unknown gateway event_type=%s (event_id=%s)", etype, event_id)
 
         await self._ack_events([event_id])
+        self._seen_inbound.add(event_id)   # mark handled only after enqueue+ack
         logger.info("GW event acked | event_id=%s", event_id)
 
     # ---- Build serializable action payloads for the outbox -------------- #
