@@ -3063,13 +3063,29 @@ class TDbridgeDiscordClient(discord.Client):
                 edited=False,
                 attachments=(gw_attachments or None),
             )
-            await _gateway_server.enqueue_outbound(
+            event_id = await _gateway_server.enqueue_outbound(
                 inherited_origin_gateway, int(tg_group_id),
                 env.to_json(include_secret=False),
             )
+            # Register a pending mapping-completion: when the client posts this
+            # reply and correlates event_id → real tg id, a message_map row will
+            # be written so later Discord-side actions on THIS Discord message
+            # route to the reposted Telegram message. Persistent across restart.
+            try:
+                _gateway_server.register_pending_mapping(
+                    event_id,
+                    dc_channel_id=str(message.channel.id),
+                    dc_message_id=str(message.id),
+                    tg_group_id=str(tg_group_id),
+                    dc_user_id=str(getattr(message.author, "id", "") or ""),
+                    origin_gateway=inherited_origin_gateway,
+                )
+            except Exception as _e:
+                logger.warning(f"register_pending_mapping failed: {_e}")
             logger.info(
                 f"DC→GW server relay (reply) | gateway={inherited_origin_gateway} "
                 f"| tg_group={tg_group_id} | reply_to={_reply_to} "
+                f"| event_id={event_id} "
                 f"| sender={sender_name!r} | attachments="
                 f"{len(gw_attachments) if gw_attachments else 0}"
             )

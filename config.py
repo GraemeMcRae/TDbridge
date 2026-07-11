@@ -363,6 +363,14 @@ class Config:
         )
         self.correlation_db_file: str = str(PROJECT_ROOT / corr_filename)
 
+        # Pending-work store DB (Phase 3+): work waiting for events to correlate
+        # (e.g. message_map row completion). Server-side. gitignore TDbridge*.db*.
+        pw_filename = os.getenv(
+            self.env_prefix + "PENDING_WORK_DB_FILE",
+            f"TDbridge_{self.env}_pending_work.db",
+        )
+        self.pending_work_db_file: str = str(PROJECT_ROOT / pw_filename)
+
         # Google Sheets
         self.google_spreadsheet_name: str = get("GOOGLE_SPREADSHEET_NAME")
 

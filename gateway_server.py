@@ -71,6 +71,18 @@ class GatewayServer:
             except Exception as e:
                 logger.warning("could not open correlation registry (%s): %s",
                                corr_path, e)
+        # Pending-work store (Phase 3+): units of work waiting for an event to be
+        # correlated (e.g. "write the message_map row once the tg id is known").
+        # Domain-agnostic; the dispatcher below interprets record kinds.
+        self._pending = None
+        pw_path = getattr(config, "pending_work_db_file", "")
+        if pw_path:
+            try:
+                from pending_work import PendingWorkStore
+                self._pending = PendingWorkStore(pw_path)
+            except Exception as e:
+                logger.warning("could not open pending-work store (%s): %s",
+                               pw_path, e)
         # Async hook injected by bot.py implementing the gateway's central
         # function: place the message in Telegram (Echo=true) or accept the
         # client-supplied id (Echo=false), then bridge it to Discord. Signature:
@@ -504,14 +516,79 @@ class GatewayServer:
         })
 
     def record_correlation(self, event_id: int, telegram_ids: list) -> None:
-        """Record a correlation in the registry. Called by the correlate
-        endpoint (client-sent) and (Phase 3) by the echo path (server
-        self-correlate)."""
+        """Record a correlation in the registry, then dispatch any pending work
+        that was waiting on this event (Phase 3: complete the message_map
+        row(s); Phase 4 will add parked-action kinds). Called by the correlate
+        endpoint (client-sent) and (future) by the echo path (self-correlate)."""
         if self._correlations is not None:
             self._correlations.record(int(event_id), [int(t) for t in telegram_ids])
         logger.info(
             "CORRELATE recorded | gateway=%s | event_id=%s | telegram_ids=%s",
             self._own_gateway, event_id, list(telegram_ids),
+        )
+        self._dispatch_pending(int(event_id), [int(t) for t in telegram_ids])
+
+    def register_pending_mapping(self, event_id: int, *, dc_channel_id: str,
+                                 dc_message_id: str, tg_group_id: str,
+                                 dc_user_id: str = "",
+                                 origin_gateway: str = "") -> None:
+        """Register that, once `event_id` is correlated to real Telegram id(s),
+        a message_map row should be written for each (so downstream Discord
+        actions on this Discord message can route to the reposted Telegram
+        message). Called at relay time for client_reposts gateways. Persistent:
+        survives a restart between relay and correlate."""
+        if self._pending is None:
+            return
+        self._pending.add(int(event_id), "complete_mapping", {
+            "dc_channel_id": str(dc_channel_id),
+            "dc_message_id": str(dc_message_id),
+            "tg_group_id": str(tg_group_id),
+            "dc_user_id": str(dc_user_id),
+            "origin_gateway": str(origin_gateway),
+        })
+
+    def _dispatch_pending(self, event_id: int, telegram_ids: list) -> None:
+        """Run all pending work for a now-correlated event. Phase 3 handles the
+        'complete_mapping' kind (write message_map rows). Unknown kinds are
+        logged and dropped so a partial build can't wedge the queue."""
+        if self._pending is None:
+            return
+        items = self._pending.take(event_id)
+        for it in items:
+            if it.kind == "complete_mapping":
+                self._complete_mapping(it.data, telegram_ids)
+            else:
+                logger.warning(
+                    "pending work: unknown kind=%s for event_id=%s (dropped)",
+                    it.kind, event_id,
+                )
+
+    def _complete_mapping(self, ctx: dict, telegram_ids: list) -> None:
+        """Write a message_map row for each correlated Telegram id, so a later
+        Discord-side action on this Discord message fans out to each. Each id is
+        its own row (merge-friendly: a second correlate ADDS rows). An empty
+        telegram_ids list means the poster deliberately created no Telegram
+        message, so there is nothing to map."""
+        if not telegram_ids:
+            logger.info(
+                "CORRELATE complete_mapping | dc_msg=%s | telegram_ids=[] "
+                "(nothing to map)", ctx.get("dc_message_id"),
+            )
+            return
+        for tg_id in telegram_ids:
+            db.store_message(
+                tg_group_id=ctx["tg_group_id"],
+                tg_message_id=str(tg_id),
+                dc_channel_id=ctx["dc_channel_id"],
+                dc_message_id=ctx["dc_message_id"],
+                root_tg_msg_id=str(tg_id),      # a reposted message roots itself
+                dc_user_id=ctx.get("dc_user_id", ""),
+                origin_gateway=ctx.get("origin_gateway", ""),
+            )
+        logger.info(
+            "CORRELATE complete_mapping | dc_msg=%s | tg_group=%s | tg_msgs=%s | gateway=%s",
+            ctx.get("dc_message_id"), ctx.get("tg_group_id"),
+            list(telegram_ids), ctx.get("origin_gateway"),
         )
 
     async def _handle_debug_enqueue(self, request: web.Request) -> web.Response:
@@ -543,16 +620,18 @@ class GatewayServer:
         if self._poll_wakeup is not None:
             self._poll_wakeup.set()
 
-    async def enqueue_outbound(self, gateway: str, chat_id, event_json: str) -> None:
+    async def enqueue_outbound(self, gateway: str, chat_id, event_json: str) -> int:
         """Enqueue an outbound event for a gateway client to poll, and wake any
         waiting long-poll. Called by the bot when a reply/reaction/deletion/edit
         concerns a gateway-originated message. `gateway` is the destination
-        gateway name (the message's origin_gateway)."""
+        gateway name (the message's origin_gateway). Returns the server-assigned
+        event_id (the queue row id) so the caller can key pending work to it."""
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
+        event_id = await loop.run_in_executor(
             None, db.gateway_enqueue, str(gateway), str(chat_id), event_json
         )
         self._notify_poll_waiters()
+        return event_id
 
     async def _delete_event_files(self, events: list) -> None:
         """Delete any gateway attachment files referenced by the given event
