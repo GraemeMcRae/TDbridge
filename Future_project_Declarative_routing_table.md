@@ -1,0 +1,295 @@
+# Future Project: Declarative Routing Table
+
+**Status:** Proposed (not started). To be undertaken *after* the Gateway +
+Userbot subsystem is complete, fully tested in test mode, and frozen at a
+known-good milestone commit (e.g. "Frozen TDbridge with Gateway and Userbot
+Final Final Version 1").
+
+**One-line summary:** Replace the imperative, hard-coded dispatch logic in
+`bot.py` (the "arcane method" that decides whether to send a message/reaction/
+edit/deletion natively, via a gateway, or both) with a **declarative routing
+table** — a re-keyed `message_map` — so that routing becomes *look up the rows,
+do the simple thing each row says*, instead of *evaluate a tangle of conditions
+and branch*.
+
+---
+
+## 1. Motivation
+
+Today TDbridge decides how to propagate a Discord-side action (a reply, a
+reaction, an edit, a deletion) to Telegram using conditional logic embedded in
+one or more long methods in `bot.py`. That logic asks questions like: is this a
+reply to a gateway-origin message? does this instance serve a `client_reposts`
+gateway? should we send natively, via the gateway, or both? The answers are
+computed each time from flags and origin lookups, and the "both" case (send
+natively *and* via the gateway) is handled by a single method that does one
+send and then, under the right circumstances, also does the other.
+
+This works, but it concentrates hard-to-follow decision-making in imperative
+code. The insight behind this project is that **the decision is really a data
+lookup**: given a Discord message, *which Telegram targets does it map to, and
+by what route (native or which gateway)?* If the mapping table records that
+directly, the code that acts on it becomes a loop over rows, each row saying
+"send to this (route, group, message)" — no branching on flags, no arcane
+conditions.
+
+### The two-sided fan-out (the core idea)
+
+- **Discord → Telegram fan-out:** One Discord message can map to multiple
+  Telegram targets — e.g. a media group (already one-DC-to-many-TG today), or
+  the same content sent *both* natively *and* via a gateway (Tim's B/C/D case:
+  native so humans in the group see it, gateway so Tim's bot — blind to native
+  posts — also receives it). A downstream reaction on that Discord message
+  should fan out to *all* its targets: look up all rows for the Discord
+  message, perform the action once per row.
+- **Telegram → Discord fan-out (the mirror):** A lookup keyed from the Telegram
+  side (`find_by_tg`) can likewise return *all* matching rows across routes. A
+  native Telegram update matches the native row; a gateway event matches that
+  gateway's row. When no route is specified, the lookup returns the full set —
+  which is exactly what the current arcane method computes by hand before
+  testing `origin_gateway` and choosing one/other/both.
+
+Both directions collapse the same way: **imperative branching becomes row
+iteration.**
+
+---
+
+## 2. The central change: re-key `message_map`
+
+### Current schema (as of the frozen milestone)
+
+```
+message_map (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_group_id     TEXT NOT NULL,
+    tg_message_id   TEXT NOT NULL,
+    dc_channel_id   TEXT NOT NULL,
+    dc_message_id   TEXT NOT NULL,
+    root_tg_msg_id  TEXT NOT NULL,
+    dc_user_id      TEXT NOT NULL DEFAULT '',
+    origin_gateway  TEXT NOT NULL DEFAULT '',   -- currently a payload column
+    created_at      REAL NOT NULL
+)
+UNIQUE INDEX idx_tg ON message_map (tg_group_id, tg_message_id)
+INDEX        idx_dc ON message_map (dc_channel_id, dc_message_id)   -- non-unique
+```
+
+`origin_gateway` already exists but is a *payload* column, not part of the key.
+The unique key is `(tg_group_id, tg_message_id)`, so the *same* (group, message)
+cannot appear twice — which is precisely why "send both natively and via
+gateway" cannot be represented as two rows and must instead be jammed into
+imperative logic.
+
+### Proposed schema
+
+Promote `origin_gateway` **into the unique key**:
+
+```
+UNIQUE INDEX idx_route_tg ON message_map (origin_gateway, tg_group_id, tg_message_id)
+```
+
+- A **blank** `origin_gateway` means **native bridging** (the current default
+  meaning is preserved).
+- A **non-blank** `origin_gateway` means the row represents the message as it
+  exists *through that gateway* (which, for an invented-id client, may be an id
+  meaningful only to that client).
+
+Now the same `(group, message)` can exist once per route: one native row
+(blank gateway) and one row per gateway. "Send both ways" is simply **two rows**
+pointing at the same Discord message:
+
+```
+(origin_gateway='',            tg_group=456, tg_msg=123) → dc_msg=789
+(origin_gateway='Userbot_gw',  tg_group=456, tg_msg=123) → dc_msg=789
+```
+
+A downstream reaction on `dc_msg=789` looks up both rows and performs the action
+twice: once natively to (456,123), once out `Userbot_gw` to (456,123). The
+"one/other/both" decision is *gone* — it's just "do each row."
+
+### Consequence analysis (worked through in design discussion)
+
+1. **Same (group,msg) can exist twice (native + gatewayed).** This is the point
+   — it's how "both ways" is represented. Today it can't be, which is why the
+   dual-send is imperative. **Improvement.**
+2. **Lookups gain a route dimension.** `find_by_tg` / `find_by_dc` must accept a
+   gateway/native context. Two forms:
+   - `find_by_tg(gateway, group, msg)` — called from a context that *implies* a
+     route (a native Telegram update implies blank; a gateway event implies that
+     gateway). Most existing call sites are of this form and refactor trivially.
+   - `find_by_tg(ANY, group, msg)` — returns the *list* of all rows across
+     routes (efficient in SQL: drop the `origin_gateway` term from the WHERE
+     clause; the remaining index columns still apply). This is the Telegram-side
+     fan-out that mirrors the Discord-side fan-out, and it is what the arcane
+     method currently computes by hand. **This is the cost** (touching every
+     lookup call site), and also **the payoff** (the arcane method becomes a
+     list lookup + iteration).
+3. **DC→(reaction/edit/delete) becomes a fan-out over rows.** Look up all rows
+   for the Discord message; perform the action once per row, each to its
+   (route, group, message). The hard-coded dual-send branch disappears.
+   **Improvement — the strongest single argument for the project.**
+
+---
+
+## 3. Correlation completion CREATES/UPDATES rows (for all messages)
+
+(Builds on the Gateway/Userbot subsystem's correlation machinery.)
+
+- **Every** message_map row is born from a **correlation completion**, uniformly:
+  - **Server echo (`echo:true`)**: the server posts to Telegram natively, then
+    *self-emits* a `correlate(event_id → [tg_id])`; the correlate handler writes
+    the (native) row. (Migrated from today's inline row-write in the echo path —
+    see §5 staging note; this is the higher-blast-radius change because the echo
+    path handles all of prod's normal traffic.)
+  - **Client repost (`client_reposts:true`)**: the client posts and sends
+    `correlate(event_id → [tg_id])`; the handler writes the (gateway) row.
+  - **Invented ids**: a client that never really posts but invents ids still
+    sends a correlate; we record it faithfully and route downstream actions out
+    that gateway with the client's own id. The server neither knows nor cares
+    whether the id is "real." (Validates the domain-agnostic registry.)
+
+- **Merge, not replace.** Because message_map is one-Discord-to-many-Telegram,
+  correlation completion must **add** rows, never clobber siblings. Each
+  correlated target id becomes its **own row**. Two correlates for one event
+  (the echo+repost misconfiguration) therefore *merge* — both routes end up
+  represented — rather than one overwriting the other. The only legitimate
+  REPLACE is re-storing the *same* (route, group, msg) (e.g. an edit/resend).
+  - Note: with the route in the key, "server echoed AND client reposted the same
+    event" produces a native row *and* a gateway row — no collision, no data
+    loss, exactly the desired merge. "Do what we're told and move on."
+
+- **The correlation event needs no gateway field.** Every correlate arrives
+  *through* a gateway (or natively for echo), so the (route) dimension of the
+  resulting row is already determined by *how the correlate arrived*. The
+  correlate payload stays minimal: `event_id → [target_id, ...]` (bare ids).
+  Group and route come from arrival context, not from the payload. Keeps the
+  correlation registry domain-agnostic.
+
+---
+
+## 4. New gateway flag: "blind to native bridging"
+
+(Working name — final name TBD, e.g. `client_blind_to_native` /
+`native_invisible_to_client`.)
+
+The B/C/D rationale for dual-send is: *Tim's bot cannot see messages
+TDbridgeProdBot posts natively into the Telegram group, so we must also send
+everything via the gateway.* Today that fact is implicit in the arcane method.
+This project makes it **an explicit per-gateway boolean** in
+`telegram_gateways.json`.
+
+When set on a gateway, it means: for messages on that gateway's groups, generate
+**two** correlations (hence two message_map rows) — the native one (from the
+server, per `echo:true`) and the gateway one (from the client, per this new
+flag) — so that both routes are recorded and downstream fan-out naturally hits
+both. This replaces the imperative "also send it the other way" with a
+declarative "this gateway is blind to native, so both rows exist."
+
+Interaction with existing flags:
+- `echo` (a.k.a. `server_reposts`) — server posts to Telegram.
+- `client_reposts` — client posts to Telegram (userbot case).
+- the new blind-to-native flag — client cannot see native posts, so native
+  content must *also* be relayed via the gateway (B/C/D case).
+
+These are orthogonal booleans; the routing table expresses their *combined*
+effect as rows, so the code never has to reason about the combination.
+
+---
+
+## 5. The end state: arcane method → table lookup
+
+> "The Python method that makes painful agonizing decisions using arcane
+> hard-coded methods will be replaced by a look-up in a database, followed by
+> do this simple thing."
+
+Concretely, the target shape of the propagation code:
+
+```
+# Discord-side action (reaction / edit / delete / reply) on dc_msg:
+rows = find_all_by_dc(dc_channel, dc_msg)        # fan-out: all routes
+for row in rows:
+    route = row.origin_gateway                    # '' = native, else a gateway
+    perform_action(route, row.tg_group, row.tg_message, action)   # one simple thing
+```
+
+No flag-testing, no "one or the other or both" branching. The table is the
+single source of truth for *what exists where*, and the loop does the rest.
+
+### Staging note (protecting prod, even though prod is low-exposure)
+
+Prod is currently low-exposure (drivers are not actively using their Telegram
+groups; Tim's bot is blind to TDbridgeProdBot's native posts; TDbridgeProdBot
+could be down for ~2 days with only the maintainers noticing). This reduces —
+but does not eliminate — the value of staging. Recommended order within this
+project:
+
+1. Re-key `message_map` (add `origin_gateway` to the unique index) and migrate
+   all lookup call sites to the route-aware forms, **preserving current behavior**
+   (native rows only, blank gateway) — a pure refactor with no behavior change,
+   verified against prod's normal traffic.
+2. Route the **client_reposts** row creation through correlation completion
+   (already true from the Userbot subsystem's Phase 3) and confirm gateway rows
+   coexist with native rows.
+3. Migrate the **echo path** to create its native row via self-correlate
+   (highest blast radius — this is prod's normal traffic). Test thoroughly.
+4. Introduce the **blind-to-native** flag and represent dual-send as two rows;
+   delete the arcane imperative dual-send branch.
+5. Collapse the DC-side and TG-side propagation code to the fan-out/iterate
+   shape above.
+
+---
+
+## 6. Related refactors folded into this project
+
+These were accumulated on the running wishlist during the Gateway/Userbot build
+and belong here, as they are the same "make bot.py modular" effort:
+
+- **Extract gateway + correlation logic out of `bot.py`** into a dedicated
+  module (or modules), so bridging/correlation becomes a black box and `bot.py`
+  stops being the catch-all host. The declarative routing table is the natural
+  seam along which to cut.
+- **Analyze `bot.py`'s longer / more complex methods for modularization**,
+  *preferring to repurpose or generalize existing black boxes over creating new
+  ones*. The best refactor removes a long method by discovering it is a special
+  case of something a black box already does. Fewer boxes doing more general
+  work beats more narrow boxes.
+- **`echo:true` + present-id override** (deferred design item): when echo is on
+  and an id is already present, decide the precise semantics (server reposts
+  only if no message id, etc.) — the "server_reposts but only if there is no
+  message id" refinement discussed during the Userbot build.
+- **`PIN_GATEWAY=true`** (`.env` param already stubbed): route *all* Discord
+  messages through the gateway (not just replies), so nothing is invisible to a
+  gateway consumer. Interacts with `client_reposts` (a pinned non-reply message
+  under `client_reposts=true` should relay-only, not double-send) — an
+  interaction the routing table expresses naturally as rows.
+
+---
+
+## 7. Black-box discipline (carried over)
+
+- The **correlation registry** and **parked-action store** remain standalone,
+  domain-agnostic modules (opaque event ids → target ids; callbacks keyed on
+  event ids). They must not gain knowledge of Discord/Telegram specifics. If a
+  boundary starts to mention platform specifics, that is the signal the
+  abstraction is leaking and should be reshaped.
+- The correlation registry **feeds** the message store (correlation completion
+  writes message_map rows); it is not a parallel duplicate of it.
+- Reaping / staleness / purge hang off **existing** cadences (the 24-hour
+  cleanup, the periodic dashboard cycle), not a new scheduler.
+- Generality is not gold-plating here: a route-aware, domain-agnostic routing
+  table and correlation registry are what let the *same* machinery serve the
+  userbot gateway **and** the future client/server gateway (the test-data
+  generator setup: test TDbridge as client, prod TDbridge as server, passing
+  messages/edits/reactions/replies/deletes over the gateway) without
+  duplication.
+
+---
+
+## 8. Explicit non-goals for this project
+
+- Not a change to the Telegram Bot API usage, polling/webhook mode, or the
+  Discord side beyond routing.
+- Not a change to the Google Sheets mapping tables' meaning (D_User / T_Group),
+  except insofar as routing reads them.
+- Not a rewrite of the outbox / metering / FLOOD handling (those black boxes are
+  reused as-is).
