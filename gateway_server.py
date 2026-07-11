@@ -78,11 +78,20 @@ class GatewayServer:
         pw_path = getattr(config, "pending_work_db_file", "")
         if pw_path:
             try:
-                from pending_work import PendingWorkStore
+                from pending_work import PendingWorkStore, AwaitingIndex
                 self._pending = PendingWorkStore(pw_path)
+                self._awaiting = AwaitingIndex(pw_path)
             except Exception as e:
                 logger.warning("could not open pending-work store (%s): %s",
                                pw_path, e)
+                self._awaiting = None
+        else:
+            self._awaiting = None
+        # Callback to perform a parked action when its correlation completes or
+        # goes stale. Set by the bot (perform_parked_action(kind_data, tg_ids)).
+        # Kept as a hook so the pending-work dispatcher (here) stays free of
+        # Discord/Telegram action logic (which lives in bot.py).
+        self._perform_parked = None
         # Async hook injected by bot.py implementing the gateway's central
         # function: place the message in Telegram (Echo=true) or accept the
         # client-supplied id (Echo=false), then bridge it to Discord. Signature:
@@ -539,29 +548,87 @@ class GatewayServer:
         survives a restart between relay and correlate."""
         if self._pending is None:
             return
-        self._pending.add(int(event_id), "complete_mapping", {
+        self._pending.add(int(event_id), "finish_mapping", {
             "dc_channel_id": str(dc_channel_id),
             "dc_message_id": str(dc_message_id),
             "tg_group_id": str(tg_group_id),
             "dc_user_id": str(dc_user_id),
             "origin_gateway": str(origin_gateway),
         })
+        # Index dc_msg → event_id so an incoming Discord action on this message,
+        # arriving BEFORE the correlation completes, can discover which event it
+        # is awaiting (and park itself on it).
+        if self._awaiting is not None:
+            self._awaiting.put(self._dc_ref(dc_channel_id, dc_message_id),
+                               int(event_id))
+
+    @staticmethod
+    def _dc_ref(dc_channel_id, dc_message_id) -> str:
+        """The opaque ref_key used in the awaiting index for a Discord msg."""
+        return f"{dc_channel_id}:{dc_message_id}"
+
+    def set_parked_action_handler(self, handler) -> None:
+        """Register the async callback the dispatcher calls to perform a parked
+        action: handler(action_data: dict, telegram_ids: list). Set by the bot
+        so this module stays free of Discord/Telegram action logic."""
+        self._perform_parked = handler
+
+    def resolve_awaiting_event(self, dc_channel_id, dc_message_id):
+        """If a Discord message is awaiting correlation (its mapping isn't
+        written yet), return the event_id it's waiting on; else None. Used by an
+        incoming action to decide: route now (mapped), park (awaiting), or drop
+        (unknown)."""
+        if self._awaiting is None:
+            return None
+        return self._awaiting.get(self._dc_ref(dc_channel_id, dc_message_id))
+
+    def park_action(self, event_id: int, action_data: dict) -> None:
+        """Park a downstream action to fire when event_id's correlation
+        completes (or goes stale). action_data is an opaque dict the bot's
+        parked-action handler understands. Inserted AFTER the finish_mapping
+        item for the same event, so dispatch (insertion order) completes the
+        mapping first — the action's own map lookup then succeeds."""
+        if self._pending is None:
+            return
+        self._pending.add(int(event_id), "perform_action", dict(action_data))
+        logger.info("PARKED action | event_id=%s | kind=%s",
+                    event_id, action_data.get("action_type"))
 
     def _dispatch_pending(self, event_id: int, telegram_ids: list) -> None:
-        """Run all pending work for a now-correlated event. Phase 3 handles the
-        'complete_mapping' kind (write message_map rows). Unknown kinds are
-        logged and dropped so a partial build can't wedge the queue."""
+        """Run all pending work for a now-correlated event, IN INSERTION ORDER.
+        Order matters: the finish_mapping item (added at relay time) precedes any
+        perform_action items (parked later), so the mapping is written before a
+        parked action's own map lookup runs. finish_mapping is handled inline
+        (synchronous DB write); perform_action is scheduled on the event loop via
+        the bot's async handler. Unknown kinds are logged and dropped."""
         if self._pending is None:
             return
         items = self._pending.take(event_id)
+        # Clear awaiting-index entries for this event (it is completing now).
+        if self._awaiting is not None:
+            self._awaiting.remove_event(event_id)
+        parked = []
         for it in items:
-            if it.kind == "complete_mapping":
-                self._complete_mapping(it.data, telegram_ids)
+            if it.kind == "finish_mapping":
+                self._complete_mapping(it.data, telegram_ids)   # writes rows now
+            elif it.kind == "perform_action":
+                parked.append(it.data)
             else:
                 logger.warning(
                     "pending work: unknown kind=%s for event_id=%s (dropped)",
                     it.kind, event_id,
                 )
+        # Fire parked actions AFTER mapping completion, in order. Performing an
+        # action is async (bot.py logic), so schedule on the running loop.
+        if parked and self._perform_parked is not None:
+            import asyncio
+            for action_data in parked:
+                try:
+                    asyncio.get_running_loop().create_task(
+                        self._perform_parked(action_data, list(telegram_ids))
+                    )
+                except RuntimeError:
+                    logger.warning("no running loop to fire parked action")
 
     def _complete_mapping(self, ctx: dict, telegram_ids: list) -> None:
         """Write a message_map row for each correlated Telegram id, so a later
@@ -571,7 +638,7 @@ class GatewayServer:
         message, so there is nothing to map."""
         if not telegram_ids:
             logger.info(
-                "CORRELATE complete_mapping | dc_msg=%s | telegram_ids=[] "
+                "CORRELATE finish_mapping | dc_msg=%s | telegram_ids=[] "
                 "(nothing to map)", ctx.get("dc_message_id"),
             )
             return
@@ -586,7 +653,7 @@ class GatewayServer:
                 origin_gateway=ctx.get("origin_gateway", ""),
             )
         logger.info(
-            "CORRELATE complete_mapping | dc_msg=%s | tg_group=%s | tg_msgs=%s | gateway=%s",
+            "CORRELATE finish_mapping | dc_msg=%s | tg_group=%s | tg_msgs=%s | gateway=%s",
             ctx.get("dc_message_id"), ctx.get("tg_group_id"),
             list(telegram_ids), ctx.get("origin_gateway"),
         )

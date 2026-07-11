@@ -107,6 +107,31 @@ A downstream reaction on `dc_msg=789` looks up both rows and performs the action
 twice: once natively to (456,123), once out `Userbot_gw` to (456,123). The
 "one/other/both" decision is *gone* — it's just "do each row."
 
+### 2a. Candidate: consolidate mapping + correlation state into one table
+
+A strong option for the re-keyed table (to evaluate during this project): key
+`message_map` by **`discord_msgid`** (+ channel) rather than by the Telegram
+tuple, and allow a row to exist in a *provisional/awaiting* state — a NULL
+Telegram tuple `(tg_group, tg_message)` plus an `event_id` column naming the
+outbound event whose correlation will fill in the tuple. A **secondary
+non-unique index** on the Telegram tuple preserves efficient reverse lookups
+(Telegram-side → Discord-side). With this shape, a single lookup answers all
+three states an incoming Discord action needs to distinguish:
+
+- **Mapped**: a row exists with a non-NULL Telegram tuple → route now.
+- **Awaiting correlation**: a row exists with a NULL tuple + an `event_id` →
+  the correlation has not completed yet → park the action on that event_id.
+- **Unknown**: no row → genuinely not ours → drop.
+
+This would collapse the interim Phase-4 two-structure approach (the live
+`message_map` plus a small separate "awaiting" table keyed by dc_msg) into one
+table, and it dovetails with putting `origin_gateway` in the key (a row per
+route, some provisional). Deferred to this project because it re-keys the
+central table and touches every lookup in prod's core — exactly the blast radius
+the userbot subsystem deliberately avoids. The userbot subsystem instead uses a
+small, separate, volatile "awaiting" table so `message_map` is untouched until
+this project.
+
 ### Consequence analysis (worked through in design discussion)
 
 1. **Same (group,msg) can exist twice (native + gatewayed).** This is the point
@@ -264,6 +289,57 @@ and belong here, as they are the same "make bot.py modular" effort:
   interaction the routing table expresses naturally as rows.
 
 ---
+
+## 6a. Discord → Telegram emoji reaction translator
+
+**Problem observed (Phase 3 live test):** Telegram only accepts reactions from a
+curated allowed set. A Discord user can react with *any* emoji (hundreds
+possible), and when that emoji is not in Telegram's allowed set, the reaction is
+rejected at the final API call (`setMessageReaction`/`SendReactionRequest` →
+HTTP 400, "Invalid reaction provided (only emoji are allowed)"). Today the
+reaction then fails silently (dropped in the outbox / logged as a warning), so a
+driver reacting with a non-approved emoji gets no effect and no feedback.
+
+**Proposed:** a translation layer that maps any Discord reaction emoji to the
+nearest **approved Telegram** reaction, by category, before the reaction is sent
+to Telegram (native or via gateway). Only translate when the original emoji is
+not already approved (pass approved emoji through unchanged).
+
+**Design work required:** classify the full set of plausible Discord reaction
+emoji into categories, each with a representative approved-Telegram emoji.
+Starter category table (representatives):
+
+| Category | Emoji | Unicode | Python literal | Notes |
+| --- | --- | --- | --- | --- |
+| Positive / Approval | ✅ | U+2705 | `"\u2705"` | White Heavy Check Mark |
+| Negative / Disapproval | ❌ | U+274C | `"\u274c"` | Cross Mark |
+| Surprise / Shock | 😮 | U+1F62E | `"\U0001f62e"` | Face with Open Mouth |
+| Sadness / Sympathy | 😭 | U+1F62D | `"\U0001f62d"` | Loudly Crying Face |
+| Other Expressive | 🤷 | U+1F937 | `"\U0001f937"` | Shrug (no gender modifier) |
+| Other Non-Expressive | 😐 | U+1F610 | `"\U0001f610"` | Neutral Face |
+
+**Approved Telegram reaction set** (the common default/standard reactions to map
+*to*; verify against Telegram's current list at implementation time, as it can
+change):
+- Positive / Approval: 👍 ❤️ 🔥 🎉 👏 😁 🤩 😂 🤣 🥰 🥳 😎 ✅
+- Negative / Disapproval: 👎 💩 🤮 🤬 🖕 ❌
+- Surprise / Shock: 😱 😮 🤯 😳
+- Sadness / Sympathy: 😢 😭 💔 🥺
+- Other Expressive: 🤔 🤷 🤫 ⚡ 🏆 💤
+- Other Non-Expressive: 😐 🐳 🕊️ 🍌 🍓
+
+**Notes / open questions for the implementation:**
+- Should live as a small standalone black box (`emoji_translate.py`): input any
+  emoji → output an approved Telegram emoji (pass-through if already approved).
+  Domain-agnostic, table-driven, unit-testable in isolation.
+- Consider whether an unmapped/unknown emoji falls back to a neutral
+  representative (😐) or to a reply-style bridge ("X reacted <emoji>") so the
+  original emoji is preserved as text when it cannot be sent as a reaction.
+- The approved list should be easy to update (Telegram may change it); keep it as
+  data, not code.
+- Applies to BOTH the native reaction path and the gateway reaction path, so the
+  translator should sit at a shared choke point before the reaction leaves for
+  Telegram.
 
 ## 7. Black-box discipline (carried over)
 

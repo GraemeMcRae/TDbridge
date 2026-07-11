@@ -2276,6 +2276,129 @@ async def _gather_outbound_attachments_from_discord(
     return attachments, notes
 
 
+async def _perform_reaction_to_target(
+    *, tg_group_id, tg_msg_id, emoji_str, user_name, record_gateway,
+    dc_msg_id, dc_channel_id, behavior,
+) -> None:
+    """Perform a Discord→Telegram reaction against a resolved target. Shared by
+    the live reaction handler (when the mapping exists) and the parked-action
+    firing path (when a correlation completes). Routes out the gateway if the
+    target is gateway-origin and we're that gateway's client; otherwise native
+    (react and/or reply per REACTIONS_DTOT)."""
+    tg_msg_id = int(tg_msg_id)
+    if record_gateway:
+        client = _get_gateway_client(record_gateway)
+        if client is not None:
+            try:
+                await client.send_reaction(
+                    int(tg_group_id), tg_msg_id, [emoji_str],
+                    sender_name=user_name,
+                )
+                logger.info(
+                    f"DC→GW reaction | gateway={record_gateway} | "
+                    f"tg_group={tg_group_id} | tg_msg={tg_msg_id} | "
+                    f"emoji={emoji_str} | user={user_name!r}"
+                )
+            except GatewayClientError as e:
+                logger.error(
+                    f"DC→GW reaction failed | gateway={record_gateway} | "
+                    f"tg_msg={tg_msg_id} | emoji={emoji_str} | {e}"
+                )
+            return
+        # record_gateway set but we're not its client → fall through to native.
+
+    if _tg_app is None:
+        logger.debug("Skipping reaction: Telegram app not ready yet (startup window)")
+        return
+    tg_bot: TelegramBot = _tg_app.bot
+    native_ok = False
+    reply_ok = False
+
+    if behavior in ("react", "both"):
+        from telegram import ReactionTypeEmoji
+        try:
+            await tg_bot.set_message_reaction(
+                chat_id=int(tg_group_id),
+                message_id=tg_msg_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji_str)],
+            )
+            native_ok = True
+        except Exception as e:
+            logger.warning(
+                f"DC→TG reaction | dc_msg={dc_msg_id} | tg_msg={tg_msg_id} | "
+                f"emoji={emoji_str} | result=NATIVE_FAILED | reason={e}"
+            )
+            if behavior == "react":
+                logger.info(
+                    f"DC→TG reaction | dc_msg={dc_msg_id} | tg_msg={tg_msg_id} | "
+                    f"emoji={emoji_str} | result=NOT_BRIDGED | "
+                    f"reason=react-only and native failed"
+                )
+                return
+
+    if behavior in ("reply", "both"):
+        try:
+            await tg_bot.send_message(
+                chat_id=int(tg_group_id),
+                text=f"{emoji_str} {user_name} (Discord) reacted to this message",
+                reply_to_message_id=tg_msg_id,
+            )
+            reply_ok = True
+        except Exception as e:
+            logger.warning(
+                f"DC→TG reaction | dc_msg={dc_msg_id} | tg_msg={tg_msg_id} | "
+                f"emoji={emoji_str} | result=REPLY_FAILED | reason={e}"
+            )
+
+    logger.info(
+        f"DC→TG reaction | dc_msg={dc_msg_id} | dc_channel={dc_channel_id} | "
+        f"user={user_name!r} | emoji={emoji_str} | tg_msg={tg_msg_id} | "
+        f"tg_group={tg_group_id} | behavior={behavior} | "
+        f"native={'ok' if native_ok else 'skipped/failed'} | "
+        f"reply={'ok' if reply_ok else 'skipped'}"
+    )
+
+
+async def _perform_parked_action(action_data: dict, telegram_ids: list) -> None:
+    """Fire a parked downstream action once its parent's correlation completes
+    (or goes stale). Registered with the gateway server as the parked-action
+    handler. Re-resolves the target from the (now-written) message_map and runs
+    the SAME code the live handler would have run — one path, two triggers. On a
+    missing correlation (stale), the map lookup finds nothing and the action's
+    own 'no target' behavior applies (for a reaction: nothing to do)."""
+    kind = action_data.get("action_type")
+    if kind == "reaction":
+        dc_channel_id = action_data["dc_channel_id"]
+        dc_msg_id = action_data["dc_message_id"]
+        loop = asyncio.get_running_loop()
+        record = await loop.run_in_executor(
+            None, db.find_by_dc, dc_channel_id, dc_msg_id
+        )
+        if not record:
+            logger.info(
+                f"PARKED reaction fired but no target | dc_msg={dc_msg_id} | "
+                f"emoji={action_data.get('emoji_str')} (no-op)"
+            )
+            return
+        behavior = config.reactions_dtot
+        if behavior == "neither":
+            return
+        await _perform_reaction_to_target(
+            tg_group_id=record["tg_group_id"],
+            tg_msg_id=int(record["tg_message_id"]),
+            emoji_str=action_data["emoji_str"],
+            user_name=action_data.get("user_name", ""),
+            record_gateway=record.get("origin_gateway", "") or "",
+            dc_msg_id=dc_msg_id, dc_channel_id=dc_channel_id, behavior=behavior,
+        )
+        logger.info(
+            f"PARKED reaction fired | dc_msg={dc_msg_id} | "
+            f"tg_msg={record['tg_message_id']} | emoji={action_data['emoji_str']}"
+        )
+    else:
+        logger.warning(f"parked action: unknown action_type={kind} (dropped)")
+
+
 async def _gw_enqueue_outbound_message(
     origin_gateway: str, tg_group_id: str, tg_msg_id: str,
     text: str, sender_name: str, reply_to_tg_id: Optional[str],
@@ -3530,6 +3653,29 @@ class TDbridgeDiscordClient(discord.Client):
         loop = asyncio.get_running_loop()
         record = await loop.run_in_executor(None, db.find_by_dc, dc_channel_id, dc_msg_id)
         if not record:
+            # No mapping yet. Two sub-cases:
+            #  (b) this Discord message is AWAITING correlation (a userbot-
+            #      reposted message whose tg id isn't known yet) → PARK the
+            #      reaction to fire when the correlate completes.
+            #  (a) genuinely unknown (never bridged) → drop, as before.
+            awaiting_event = None
+            if _gateway_server is not None:
+                awaiting_event = _gateway_server.resolve_awaiting_event(
+                    dc_channel_id, dc_msg_id
+                )
+            if awaiting_event is not None:
+                _gateway_server.park_action(awaiting_event, {
+                    "action_type": "reaction",
+                    "dc_channel_id": dc_channel_id,
+                    "dc_message_id": dc_msg_id,
+                    "emoji_str": str(payload.emoji),
+                    "user_name": user_name,
+                })
+                logger.info(
+                    f"DC→TG reaction PARKED (awaiting correlation) | "
+                    f"dc_msg={dc_msg_id} | event_id={awaiting_event} | "
+                    f"emoji={str(payload.emoji)} | user={user_name!r}"
+                )
             return
 
         tg_group_id = record["tg_group_id"]
@@ -3546,82 +3692,10 @@ class TDbridgeDiscordClient(discord.Client):
             )
             return
 
-        # If the message this reaction targets is gateway-origin AND we are a
-        # CLIENT for that gateway, the reaction travels OUT via the gateway
-        # (not a native Telegram call — this instance isn't in that TG group).
-        if record_gateway:
-            client = _get_gateway_client(record_gateway)
-            if client is not None:
-                try:
-                    await client.send_reaction(
-                        int(tg_group_id), tg_msg_id, [emoji_str],
-                        sender_name=user_name,
-                    )
-                    logger.info(
-                        f"DC→GW reaction | gateway={record_gateway} | "
-                        f"tg_group={tg_group_id} | tg_msg={tg_msg_id} | "
-                        f"emoji={emoji_str} | user={user_name!r}"
-                    )
-                except GatewayClientError as e:
-                    logger.error(
-                        f"DC→GW reaction failed | gateway={record_gateway} | "
-                        f"tg_msg={tg_msg_id} | emoji={emoji_str} | {e}"
-                    )
-                return
-            # record_gateway set but we're not its client → fall through to
-            # native (we own/serve that gateway, so native TG is correct).
-
-        if _tg_app is None:
-            logger.debug("Skipping Discord event: Telegram app not ready yet (startup window)")
-            return
-        tg_bot: TelegramBot = _tg_app.bot
-        native_ok = False
-        reply_ok  = False
-
-        if behavior in ("react", "both"):
-            from telegram import ReactionTypeEmoji
-            try:
-                await tg_bot.set_message_reaction(
-                    chat_id=int(tg_group_id),
-                    message_id=tg_msg_id,
-                    reaction=[ReactionTypeEmoji(emoji=emoji_str)],
-                )
-                native_ok = True
-            except Exception as e:
-                logger.warning(
-                    f"DC→TG reaction | dc_msg={dc_msg_id} | tg_msg={tg_msg_id} | "
-                    f"emoji={emoji_str} | result=NATIVE_FAILED | reason={e}"
-                )
-                if behavior == "react":
-                    logger.info(
-                        f"DC→TG reaction | dc_msg={dc_msg_id} | tg_msg={tg_msg_id} | "
-                        f"emoji={emoji_str} | result=NOT_BRIDGED | "
-                        f"reason=react-only and native failed"
-                    )
-                    return
-
-        if behavior in ("reply", "both"):
-            try:
-                await tg_bot.send_message(
-                    chat_id=int(tg_group_id),
-                    text=f"{emoji_str} {user_name} (Discord) reacted to this message",
-                    reply_to_message_id=tg_msg_id,
-                )
-                reply_ok = True
-            except Exception as e:
-                logger.warning(
-                    f"DC→TG reaction | dc_msg={dc_msg_id} | tg_msg={tg_msg_id} | "
-                    f"emoji={emoji_str} | result=REPLY_FAILED | reason={e}"
-                )
-
-        logger.info(
-            f"DC→TG reaction | "
-            f"dc_msg={dc_msg_id} | dc_channel={dc_channel_id} | "
-            f"user={user_name!r}({str(user_id)}) | emoji={emoji_str} | "
-            f"tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
-            f"behavior={behavior} | "
-            f"native={'ok' if native_ok else 'skipped/failed'} | "
-            f"reply={'ok' if reply_ok else 'skipped'}"
+        await _perform_reaction_to_target(
+            tg_group_id=tg_group_id, tg_msg_id=tg_msg_id, emoji_str=emoji_str,
+            user_name=user_name, record_gateway=record_gateway,
+            dc_msg_id=dc_msg_id, dc_channel_id=dc_channel_id, behavior=behavior,
         )
 
         # If the reacted-to message is gateway-origin, the reaction also flows
@@ -4521,6 +4595,7 @@ async def _startup(discord_client: discord.Client) -> None:
     _gateway_server.set_bridge_hook(_gateway_bridge)
     _gateway_server.set_reaction_hook(_gateway_reaction)
     _gateway_server.set_deletion_hook(_gateway_deletion)
+    _gateway_server.set_parked_action_handler(_perform_parked_action)
     await _gateway_server.start()
     bot_status.gateway_serving = _gateway_server.is_serving()
 

@@ -164,3 +164,68 @@ class PendingWorkStore:
             data=json.loads(r["data"]),
             created_ts=r["created_ts"],
         )
+
+
+class AwaitingIndex:
+    """A small, domain-agnostic reverse index: opaque `ref_key` (a string) →
+    the `event_id` whose correlation that ref is waiting on. Lets an incoming
+    action resolve 'which event is this reference awaiting?' with one indexed
+    lookup, WITHOUT the pending-work store having to expose or search its opaque
+    data blobs. The server chooses what a ref_key means (here: a Discord
+    message's channel:id), so this class stays free of domain knowledge.
+
+    Shares a DB file with PendingWorkStore for lifecycle simplicity, but is an
+    independent table. A ref maps to exactly one event_id (last write wins); an
+    entry is removed when its event completes or goes stale.
+    """
+    def __init__(self, path: str):
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS awaiting_index (
+                ref_key     TEXT PRIMARY KEY,
+                event_id    INTEGER NOT NULL,
+                created_ts  REAL NOT NULL
+            )
+            """
+        )
+        self._conn.commit()
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    def put(self, ref_key: str, event_id: int) -> None:
+        self._conn.execute(
+            "INSERT INTO awaiting_index (ref_key, event_id, created_ts) "
+            "VALUES (?, ?, ?) ON CONFLICT(ref_key) DO UPDATE SET "
+            "event_id=excluded.event_id, created_ts=excluded.created_ts",
+            (str(ref_key), int(event_id), time.time()),
+        )
+        self._conn.commit()
+
+    def get(self, ref_key: str):
+        """Return the event_id this ref is awaiting, or None."""
+        row = self._conn.execute(
+            "SELECT event_id FROM awaiting_index WHERE ref_key = ?",
+            (str(ref_key),),
+        ).fetchone()
+        return row["event_id"] if row else None
+
+    def remove_event(self, event_id: int) -> int:
+        """Remove all refs pointing at event_id (on completion/staleness)."""
+        cur = self._conn.execute(
+            "DELETE FROM awaiting_index WHERE event_id = ?", (int(event_id),)
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def purge_older_than(self, cutoff_ts: float) -> int:
+        cur = self._conn.execute(
+            "DELETE FROM awaiting_index WHERE created_ts < ?", (float(cutoff_ts),)
+        )
+        self._conn.commit()
+        return cur.rowcount
