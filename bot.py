@@ -2758,6 +2758,23 @@ async def route_tg_reaction_to_discord(update: Update, context: ContextTypes.DEF
         else "Someone"
     )
 
+    # ---- Boomerang suppression (reactions) ----
+    # When we serve a client_reposts gateway, the userbot applies reactions into
+    # the group as the delivery of Discord-origin reactions. Those reactions must
+    # NOT be bridged back toward Discord (they came FROM Discord). Mirror the
+    # message-path suppression: skip reactions whose actor is the userbot account.
+    _actor = reaction_update.user
+    if (config.own_gateway_client_reposts
+            and config.userbot_account_id
+            and _actor is not None
+            and str(_actor.id) == config.userbot_account_id):
+        logger.info(
+            f"TG→DC reaction: SKIPPING userbot reaction (boomerang suppression) "
+            f"| tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
+            f"actor_id={_actor.id}"
+        )
+        return
+
     # Get the new reactions (may be empty if all reactions were removed)
     new_reactions = reaction_update.new_reaction
     if not new_reactions:

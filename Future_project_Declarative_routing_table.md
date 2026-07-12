@@ -341,6 +341,56 @@ change):
   translator should sit at a shared choke point before the reaction leaves for
   Telegram.
 
+## 6b. Explicit client/server role discipline per gateway unit of work
+
+At the start of every unit of work that touches a gateway, set an explicit
+`role = "client"` or `role = "server"`, and assert the invariant:
+
+```
+((role == "client" and gateway != own_gateway) XOR
+ (role == "server" and gateway == own_gateway))
+```
+
+This makes the role explicit and catches confusion early (a whole class of bugs
+this subsystem hit — e.g. a reaction that should have been server-enqueued going
+down a client/native path instead — would trip the assertion immediately). The
+role is partly implicit today (scattered `is_serving()` / `_get_gateway_client`
+checks); this consolidates it into one stated, asserted variable per unit of
+work. Loud, early failure on a role/gateway mismatch beats a silent
+mis-delivery.
+
+## 6c. Unify native bridging as "client of the Telegram API"
+
+Native bridging and gateway actions should be unified by treating the **native
+Telegram bridge as just another gateway** — specifically, TDbridge acting as a
+*client* of the Telegram Bot API exactly as it acts as a client of any gateway
+it does not own. The client mentality is already implicit in the original
+bridging code (it polls the Telegram API to receive events, posts to the API to
+send — classic client behavior), but because native bridging was designed and
+built *before* the client/server gateway concept existed, the client code was
+later "bolted on" separately, leaving two parallel implementations of
+fundamentally the same pattern (poll for inbound, send outbound, ack/track). The
+result is duplication of functions that a unified model would collapse.
+
+Target: a single "client-of-a-transport" abstraction where the Telegram Bot API
+is one transport (the native bridge) and each gateway is another. Inbound
+(poll/receive) and outbound (send/react/edit/delete) then share one code path
+parameterized by transport, rather than native-specific and gateway-specific
+copies. This dovetails with the declarative routing table (each message_map row
+names a route/transport; acting on a row means "do the action on that
+transport") and with 6b (role is a property of the transport interaction).
+
+**Pre-existing noise this would clean up (observed in Phase 4 testing):** for a
+server-role, gateway-origin message, the current reaction path always attempts a
+*native* Telegram reaction first (which fails with HTTP 400 "message to react
+not found", because the message lives only in the client's Telegram space) and
+*then* enqueues out the gateway (which succeeds). The reaction is delivered
+correctly, but two scary WARNING lines are logged every time. Under the unified
+model, the route on the message_map row would say "gateway" and only the gateway
+transport would be used — no doomed native attempt, no noise. (Do NOT special-
+case this away in isolation before the unification; it is a symptom of the
+duplication, and the clean fix is the unified transport model.)
+
 ## 7. Black-box discipline (carried over)
 
 - The **correlation registry** and **parked-action store** remain standalone,

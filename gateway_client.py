@@ -238,8 +238,8 @@ class GatewayClient:
                         if len(_txt_prev) > 200:
                             _txt_prev = _txt_prev[:200] + "…"
                         logger.info(
-                            "GW client RECV | gateway=%s | event=%s | chat=%s | "
-                            "msg_id=%s | reply_to=%s | emoji=%s | attachments=%d | text='%s'",
+                            "GW client RECV | gateway=%s | event=%s | tg_group=%s | "
+                            "tg_msg=%s | reply_to=%s | emoji=%s | attachments=%d | text='%s'",
                             self._gw.name, _ev.get("event_type"), _chat,
                             _p.get("message_id"), _p.get("reply_to"),
                             _p.get("emoji"),

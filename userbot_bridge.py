@@ -92,12 +92,17 @@ class UserbotBridge:
                 reply_to=norm.get("reply_to"),
                 attachments=attachments or None,
             )
+            _rtxt = (norm.get("text") or "").replace("\n", "\\n")
+            if len(_rtxt) > 300:
+                _rtxt = _rtxt[:300] + "…"
             logger.info(
-                "TG->GW relayed | chat=%s | msg=%s | from=%s | attachments=%d",
-                chat_id, message_id, norm.get("sender_username"), len(attachments),
+                "TG->GW relayed | tg_group=%s | tg_msg=%s | from=%s | reply_to=%s | "
+                "attachments=%d | text='%s'",
+                chat_id, message_id, norm.get("sender_username"),
+                norm.get("reply_to"), len(attachments), _rtxt,
             )
         except Exception as e:
-            logger.warning("TG->GW send failed | chat=%s msg=%s: %s",
+            logger.warning("TG->GW send failed | tg_group=%s tg_msg=%s: %s",
                            chat_id, message_id, e)
 
     # ================================================================= #
@@ -147,7 +152,7 @@ class UserbotBridge:
             await self._outbox.enqueue(chat_id, etype, self._msg_action(payload),
                                        event_id=event_id)
             logger.info(
-                "GW->TG enqueued | event_id=%s | event=%s | chat=%s | reply_to=%s | "
+                "GW->TG enqueued | event_id=%s | event=%s | tg_group=%s | reply_to=%s | "
                 "attachments=%d | text='%s'",
                 event_id, etype, chat_id, payload.get("reply_to"),
                 len(payload.get("attachments") or []), _txt,
@@ -156,14 +161,14 @@ class UserbotBridge:
             await self._outbox.enqueue(chat_id, "reaction", self._reaction_action(payload),
                                        event_id=event_id)
             logger.info(
-                "GW->TG enqueued | event_id=%s | event=reaction | chat=%s | msg_id=%s | emoji=%s",
+                "GW->TG enqueued | event_id=%s | event=reaction | tg_group=%s | tg_msg=%s | emoji=%s",
                 event_id, chat_id, payload.get("message_id"), payload.get("emoji"),
             )
         elif etype == "deletion":
             await self._outbox.enqueue(chat_id, "deletion", self._deletion_action(payload),
                                        event_id=event_id)
             logger.info(
-                "GW->TG enqueued | event_id=%s | event=deletion | chat=%s | msg_ids=%s",
+                "GW->TG enqueued | event_id=%s | event=deletion | tg_group=%s | tg_msgs=%s",
                 event_id, chat_id, self._ids(payload),
             )
         else:
@@ -234,7 +239,7 @@ class UserbotBridge:
                     )
                     produced.append(new_id)
                     logger.info(
-                        "TG POST (file) | chat=%s | new_tg_msg=%s | reply_to=%s | "
+                        "TG POST (file) | tg_group=%s | new_tg_msg=%s | reply_to=%s | "
                         "file=%s | caption='%s'",
                         chat_id, new_id, reply_to, a.get("file_name"),
                         _tprev if first else "",
@@ -247,7 +252,7 @@ class UserbotBridge:
                 new_id = await self._tg.send_text(chat_id, text, reply_to=reply_to)
                 produced.append(new_id)
                 logger.info(
-                    "TG POST (text) | chat=%s | new_tg_msg=%s | reply_to=%s | text='%s'",
+                    "TG POST (text) | tg_group=%s | new_tg_msg=%s | reply_to=%s | text='%s'",
                     chat_id, new_id, reply_to, _tprev,
                 )
             return produced
@@ -255,14 +260,14 @@ class UserbotBridge:
             mid = payload.get("message_id")
             if mid is not None:
                 await self._tg.add_reaction(chat_id, int(mid), payload.get("emoji") or "")
-                logger.info("TG REACT | chat=%s | tg_msg=%s | emoji=%s",
+                logger.info("TG REACT | tg_group=%s | tg_msg=%s | emoji=%s",
                             chat_id, mid, payload.get("emoji"))
             return []
         if action_type == "deletion":
             ids = payload.get("message_ids") or []
             if ids:
                 await self._tg.delete_messages(chat_id, [int(i) for i in ids])
-                logger.info("TG DELETE | chat=%s | tg_msgs=%s", chat_id, ids)
+                logger.info("TG DELETE | tg_group=%s | tg_msgs=%s", chat_id, ids)
             return []
         logger.warning("perform_action: unknown action_type=%s", action_type)
         return []
