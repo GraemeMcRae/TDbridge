@@ -188,9 +188,22 @@ def is_active_group_via_gateway(tg_group_id: str, gateway: str = "") -> bool:
     This is the gateway-aware validation described in the gateway protocol:
     a group is only valid for a given gateway if there is an Active T_Group
     row matching that exact (T_GroupID, T_Gateway) combination.
+
+    ADDITIONALLY, the group must be a Telegram SUPERGROUP (T_Type='supergroup').
+    Ordinary groups (T_Type='group') give each member its own per-member
+    message-id numbering, which breaks reply/reaction/correlation bridging (those
+    rely on a message id meaning the same thing to every member). Such groups are
+    treated as inactive here; the bot also warns on join and suggests converting
+    (set 'Chat history for new members' to 'Visible'). A blank/unknown T_Type is
+    treated conservatively as NOT a supergroup.
     """
     row = get_tg_group_via_gateway(tg_group_id, gateway)
-    return bool(row) and _is_active(row.get("T_Status", ""))
+    if not row or not _is_active(row.get("T_Status", "")):
+        return False
+    t_type = str(row.get("T_Type", "")).strip().lower()
+    if t_type != "supergroup":
+        return False
+    return True
 
 
 def get_user_by_tg_group_inactive(tg_group_id: str) -> Optional[dict]:
@@ -259,9 +272,18 @@ def get_active_channels() -> list[dict]:
 
 
 def get_active_tg_groups() -> list[dict]:
-    """Return all T_Group rows with T_Status == 'Active'."""
+    """Return all T_Group rows that are Active AND supergroups.
+
+    A group is only usable if T_Status == 'Active' AND T_Type == 'supergroup'
+    (ordinary groups have per-member message-id spaces that break bridging — see
+    is_active_group_via_gateway). Currently unused, but gated the same way as the
+    live activeness check so it can't become a footgun if wired up later."""
     with _lock:
-        return [r for r in group_by_id.values() if _is_active(r.get("T_Status", ""))]
+        return [
+            r for r in group_by_id.values()
+            if _is_active(r.get("T_Status", ""))
+            and str(r.get("T_Type", "")).strip().lower() == "supergroup"
+        ]
 
 
 def set_group_status_in_memory(tg_group_id: str, status: str) -> bool:

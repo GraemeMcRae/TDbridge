@@ -582,6 +582,22 @@ class GatewayServer:
             return None
         return self._awaiting.get(self._dc_ref(dc_channel_id, dc_message_id))
 
+    def get_pending_mapping_context(self, event_id: int):
+        """Return the finish_mapping context (tg_group_id, origin_gateway, ...)
+        for a pending event, or None. Lets a reply-park discover the parent's
+        target group and gateway without the caller reaching into the store's
+        opaque data. Peeks WITHOUT removing (the finish_mapping item must still
+        run when the event completes)."""
+        if self._pending is None:
+            return None
+        # peek_older_than with a far-future cutoff returns all items; filter to
+        # this event's finish_mapping. (Small store; this is cheap.)
+        import time as _t
+        for it in self._pending.peek_older_than(_t.time() + 1e9):
+            if it.event_id == int(event_id) and it.kind == "finish_mapping":
+                return dict(it.data)
+        return None
+
     def park_action(self, event_id: int, action_data: dict) -> None:
         """Park a downstream action to fire when event_id's correlation
         completes (or goes stale). action_data is an opaque dict the bot's
