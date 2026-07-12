@@ -341,6 +341,92 @@ change):
   translator should sit at a shared choke point before the reaction leaves for
   Telegram.
 
+## 6a-bis. Deferred bug: reaction double-application (server-role client_reposts)
+
+Observed live (supergroup test, 2026-07-12). In the server-role `client_reposts`
+case, a Discord reaction to a gateway-reposted message is applied TWICE to the
+Telegram message: once natively by the server instance's bot account, and once
+by the client (userbot) that was enqueued the reaction. Two distinct accounts →
+Telegram shows two reaction pills. (The `both` reply-message is not duplicated,
+because only the native path expands to a reply-message; the enqueued client
+reaction is a bare reaction.)
+
+Root cause: the reaction executor does BOTH `_perform_reaction_to_target` (which
+falls through to a native reaction/reply when we are not the gateway client) AND
+`_gw_enqueue_outbound_reaction`. This is inconsistent with the MESSAGE contract,
+where under `client_reposts` the server deliberately does NOT send natively (only
+the client reposts). In the ordinary-group era the native reaction failed with
+HTTP 400 and the duplication was invisible; in a supergroup the native reaction
+succeeds, exposing it.
+
+Deferred deliberately to this project (not patched inline) because the clean fix
+is not "add another role check here" — it is the role delineation and the
+unified transport model below (6b/6c). A local patch would add one more instance
+of the scattered role conditionals that 6b exists to consolidate. Low current
+exposure (no driver reacts to reposted messages yet). When fixed under the
+unified model, a gateway-origin reaction in the server role will take the gateway
+transport ONLY, and the duplicate native application simply won't exist.
+
+## 6a-ter. Framing vision: the bridge as a Telegram-like server/client pair
+
+This is the organizing analogy the refactor should be built around (captured so
+the design blocks are chosen well from the start rather than discovered late).
+
+The claim: **the Discord side of the bridge behaves like a Telegram-like
+*server*, and the Telegram side behaves like a Telegram *client*.** Where the
+real Telegram server packages/stores/manages messages, our "Telegram-like
+server" packages/stores/manages messages *on Discord*. The same abstraction then
+serves both:
+- the **native bridge** (Discord-side = Telegram-like server; Telegram-side =
+  real Telegram client — we poll/send against the Bot API), and
+- a **gateway** (Discord-side = Telegram-like server; Telegram-side = a
+  Telegram-like client, e.g. the userbot).
+
+Consequences if the analogy holds:
+- **One black box per server-like function** (package a message for
+  storage/management, assign/track ids, correlate, fan out) usable by BOTH the
+  bridge and the gateway, with necessary differences appearing as short
+  either/or paths inside, not as duplicated implementations.
+- **One black box per client-like function** (receive/poll inbound, send/react/
+  edit/delete outbound, ack) shared between the real-Telegram client and the
+  Telegram-like client.
+- The `client`/`server` **role** (6b) is then not an ad-hoc flag but the
+  fundamental identity of each side of each transport, asserted once per unit of
+  work: `((role=client AND transport≠own) XOR (role=server AND transport=own))`.
+- The reaction double-application (6a-bis) dissolves: a server-role action emits
+  on its transport once; there is no separate "also do it natively" path,
+  because "native" is just one transport the server drives through the same
+  client-like black box.
+
+Stress-tests to resolve DURING design (where the analogy might strain, so we
+find out before building rather than after):
+1. **Id spaces.** The real Telegram server owns the message-id space; our
+   Telegram-like server owns the Discord id space; a Telegram-like *client*
+   (userbot) invents/holds its own ids. The "package a message" black box must
+   be explicit about WHOSE id space a given id lives in (this is exactly what the
+   declarative routing table's route-keyed rows encode). If the analogy is going
+   to break, it will most likely break here — so id-space ownership must be a
+   first-class parameter of the server-like black boxes, not an afterthought.
+2. **Fan-out asymmetry.** A real Telegram client talks to ONE server; our
+   Telegram-like client (the bridge's Telegram side) may need to represent a
+   message that exists on multiple transports (native + gateway). The
+   client-like black box must tolerate one logical message having several
+   transport-specific realizations (the two-sided fan-out, §1).
+3. **Reactions/edits/deletes as first-class client verbs.** The analogy is
+   cleanest for "message"; verify each of react/edit/delete maps to a clean
+   client-like verb with a server-like counterpart, rather than becoming a
+   special case. If special cases multiply here, that is signal (per the note
+   below) that a block boundary is drawn in the wrong place.
+
+Design method (explicitly adopted): build from small, proven building blocks —
+axioms → lemmas → theorems. Each "lemma" (black box) does a few well-understood
+steps; each "theorem" (a bridge/gateway behavior) is composed of a handful of
+lemmas. If a behavior cannot be expressed as a short composition of existing
+blocks, the blocks are wrong, not the behavior — redesign the blocks. A
+proliferation of special cases or work-arounds is the diagnostic that a block
+boundary is misplaced; treat it as a signal to re-cut the blocks, not to add
+another conditional.
+
 ## 6b. Explicit client/server role discipline per gateway unit of work
 
 At the start of every unit of work that touches a gateway, set an explicit
