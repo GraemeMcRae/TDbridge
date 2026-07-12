@@ -2359,169 +2359,203 @@ async def _perform_reaction_to_target(
     )
 
 
-async def _execute_gateway_reply(
-    *, origin_gateway: str, tg_group_id: str, parent_dc_channel_id: str,
-    parent_dc_id: str, relay_text: str, attachments: list,
-    sender_name: str, dc_channel_id: str, dc_message_id: str,
-    dc_user_id: str,
-) -> bool:
-    """Execute a server-role gateway reply. Shared by the live reply relay (when
-    the parent's tg_msg is already mapped) and the parked-reply fire path (when
-    it becomes mapped later). The parent is identified by its DISCORD id; the
-    parent's tg_msg is resolved from the message_map HERE, at execution time —
-    it is never carried in the parked data (it may not have existed at park
-    time). Posts nothing itself: enqueues the reply out the gateway (the client
-    reposts it) and registers a pending mapping so THIS reply's own correlation
-    writes its message_map row (the cascade — identical to a first-time relay).
+# ---------------------------------------------------------------------------
+# Scheduled downstream actions (unified build → dispatch-or-park → execute)
+# ---------------------------------------------------------------------------
+#
+# A "scheduled action" is a plain, serializable dict describing a downstream
+# Discord-side action (reaction / reply / edit / delete) to be applied to the
+# Telegram side. The lifecycle is deliberately uniform for every action type:
+#
+#   1. BUILD the action unconditionally (never looks at the message map). It
+#      carries everything needed to execute, keyed by DISCORD identity. It never
+#      carries a resolved Telegram message id — for a reply, not even the
+#      parent's tg_msg. (For persistence, attachment bytes are pre-stored and
+#      only references travel.)
+#   2. DISPATCH-OR-PARK: one quick decision. If the target the action depends on
+#      is already mapped → execute now. If it is awaiting correlation → park it
+#      on that event. If neither → drop (not ours).
+#   3. EXECUTE assumes completeness. The only ways to reach execution are (a)
+#      executed immediately because the map was ready, or (b) fired from the
+#      park after the map became ready. So the executor resolves its Telegram
+#      target(s) from the map expecting them to be present, and acts.
+#
+# Because there is exactly ONE build site and ONE executor per action type, the
+# immediate path and the parked-fire path cannot drift apart.
+#
+# "The target the action depends on":
+#   * reaction/edit/delete → the acted-on Discord message itself.
+#   * reply                → the reply's PARENT Discord message (the reply's own
+#                            row is created later, by its own correlation).
 
-    Returns True if enqueued, False if the parent still has no tg_msg (caller
-    decides whether to park or drop)."""
+
+def _dc_ref_of_action(action: dict) -> tuple:
+    """(dc_channel_id, dc_message_id) whose mapping this action depends on.
+    For a reply it is the PARENT; for the others it is the acted-on message."""
+    if action["action_type"] == "reply":
+        return action["parent_dc_channel_id"], action["parent_dc_id"]
+    return action["dc_channel_id"], action["dc_message_id"]
+
+
+async def _dispatch_or_park_action(action: dict) -> None:
+    """The one quick decision, identical for every action type: execute now if
+    the dependency is mapped, else park it if the dependency is awaiting
+    correlation, else drop. The action is already fully built by the caller."""
+    dep_channel, dep_msg = _dc_ref_of_action(action)
     loop = asyncio.get_running_loop()
-    parent_record = await loop.run_in_executor(
-        None, db.find_by_dc, parent_dc_channel_id, parent_dc_id
-    )
-    if not parent_record:
-        return False   # parent's tg_msg not known yet
-    reply_to = None
-    try:
-        reply_to = int(parent_record["tg_message_id"])
-    except (ValueError, TypeError):
-        reply_to = None
-
-    env = gp.make_message(
-        origin_gateway, int(tg_group_id),
-        message_id=None,                      # client assigns the real id
-        text=relay_text,
-        reply_to=reply_to,
-        from_user=gp.User(first_name=sender_name, is_synthetic=True),
-        edited=False,
-        attachments=(attachments or None),
-    )
-    event_id = await _gateway_server.enqueue_outbound(
-        origin_gateway, int(tg_group_id), env.to_json(include_secret=False),
-    )
-    try:
-        _gateway_server.register_pending_mapping(
-            event_id,
-            dc_channel_id=str(dc_channel_id),
-            dc_message_id=str(dc_message_id),
-            tg_group_id=str(tg_group_id),
-            dc_user_id=str(dc_user_id),
-            origin_gateway=origin_gateway,
+    record = await loop.run_in_executor(None, db.find_by_dc, dep_channel, dep_msg)
+    if record:
+        await _execute_scheduled_action(action)
+        return
+    awaiting_event = None
+    if _gateway_server is not None:
+        awaiting_event = _gateway_server.resolve_awaiting_event(dep_channel, dep_msg)
+    if awaiting_event is not None:
+        _gateway_server.park_action(awaiting_event, action)
+        logger.info(
+            f"DC→TG {action['action_type']} PARKED (awaiting correlation) | "
+            f"dc_msg={action.get('dc_message_id')} | "
+            f"dep_dc={dep_msg} | event_id={awaiting_event}"
         )
-    except Exception as _e:
-        logger.warning(f"register_pending_mapping failed (reply exec): {_e}")
-    logger.info(
-        f"DC→GW server relay (reply) | gateway={origin_gateway} "
-        f"| tg_group={tg_group_id} | reply_to_tg_msg={reply_to} "
-        f"| event_id={event_id} | sender={sender_name!r} "
-        f"| attachments={len(attachments) if attachments else 0}"
-    )
-    return True
+        return
+    # Neither mapped nor awaiting → not ours. Drop silently (prior behavior).
 
 
-async def _perform_parked_action(action_data: dict, telegram_ids: list) -> None:
-    """Fire a parked downstream action once its parent's correlation completes
-    (or goes stale). Registered with the gateway server as the parked-action
-    handler. Re-resolves the target from the (now-written) message_map and runs
-    the SAME code the live handler would have run — one path, two triggers. On a
-    missing correlation (stale), the map lookup finds nothing and the action's
-    own 'no target' behavior applies (for a reaction: nothing to do)."""
-    kind = action_data.get("action_type")
+async def _execute_scheduled_action(action: dict) -> None:
+    """Execute a scheduled action, ASSUMING its dependency is now mapped (see
+    lifecycle note above). Called both immediately (dependency was ready) and
+    from the parked-fire path (dependency became ready). One executor per action
+    type; no re-checking of readiness beyond a defensive stale guard."""
+    kind = action["action_type"]
+    loop = asyncio.get_running_loop()
+
     if kind == "reaction":
-        dc_channel_id = action_data["dc_channel_id"]
-        dc_msg_id = action_data["dc_message_id"]
-        loop = asyncio.get_running_loop()
-        record = await loop.run_in_executor(
-            None, db.find_by_dc, dc_channel_id, dc_msg_id
-        )
+        dc_channel_id = action["dc_channel_id"]
+        dc_msg_id = action["dc_message_id"]
+        record = await loop.run_in_executor(None, db.find_by_dc, dc_channel_id, dc_msg_id)
         if not record:
             logger.info(
-                f"PARKED reaction fired but no target | dc_msg={dc_msg_id} | "
-                f"emoji={action_data.get('emoji_str')} (no-op)"
+                f"scheduled reaction: no target | dc_msg={dc_msg_id} | "
+                f"emoji={action.get('emoji_str')} (no-op)"
             )
             return
         behavior = config.reactions_dtot
         if behavior == "neither":
+            logger.info(
+                f"DC→TG reaction | dc_msg={dc_msg_id} | "
+                f"emoji={action.get('emoji_str')} | result=IGNORED | "
+                f"reason=REACTIONS_DTOT=neither"
+            )
             return
+        record_gateway = record.get("origin_gateway", "") or ""
         await _perform_reaction_to_target(
             tg_group_id=record["tg_group_id"],
             tg_msg_id=int(record["tg_message_id"]),
-            emoji_str=action_data["emoji_str"],
-            user_name=action_data.get("user_name", ""),
-            record_gateway=record.get("origin_gateway", "") or "",
+            emoji_str=action["emoji_str"],
+            user_name=action.get("user_name", ""),
+            record_gateway=record_gateway,
             dc_msg_id=dc_msg_id, dc_channel_id=dc_channel_id, behavior=behavior,
         )
-        # If the reacted-to message is gateway-origin, the reaction ALSO flows
-        # back out the gateway to the client (server role). This mirrors the
-        # live reaction handler: _perform_reaction_to_target covers the native /
-        # gateway-CLIENT cases, and this enqueue covers the server-role case
-        # (where THIS instance serves that gateway and must deliver to the
-        # client that reposted the message). Omitting this was why an early
-        # parked reaction reached Telegram via neither path.
-        origin_gateway = record.get("origin_gateway", "") or ""
-        if origin_gateway:
+        # Gateway-origin: the reaction also flows out the gateway to the client
+        # (server role). Covers the case where THIS instance serves the gateway.
+        if record_gateway:
             await _gw_enqueue_outbound_reaction(
-                origin_gateway=origin_gateway,
+                origin_gateway=record_gateway,
                 tg_group_id=str(record["tg_group_id"]),
                 tg_msg_id=str(record["tg_message_id"]),
-                emoji=[action_data["emoji_str"]],
-                sender_name=action_data.get("user_name", ""),
+                emoji=[action["emoji_str"]],
+                sender_name=action.get("user_name", ""),
             )
+        return
+
+    if kind == "reply":
+        # The parent's tg_msg is resolved here, at execution time (guaranteed
+        # present). Posts nothing itself: enqueues the reply out the gateway and
+        # registers THIS reply's own pending mapping (the cascade — identical to
+        # a first-time relay).
+        parent_record = await loop.run_in_executor(
+            None, db.find_by_dc,
+            action["parent_dc_channel_id"], action["parent_dc_id"],
+        )
+        if not parent_record:
+            logger.info(
+                f"scheduled reply: parent unmapped | "
+                f"dc_msg={action['dc_message_id']} | "
+                f"parent_dc={action['parent_dc_id']} (dropped)"
+            )
+            return
+        try:
+            reply_to = int(parent_record["tg_message_id"])
+        except (ValueError, TypeError):
+            reply_to = None
+        env = gp.make_message(
+            action["origin_gateway"], int(action["tg_group_id"]),
+            message_id=None,
+            text=action["relay_text"],
+            reply_to=reply_to,
+            from_user=gp.User(first_name=action.get("sender_name", ""),
+                              is_synthetic=True),
+            edited=False,
+            attachments=(_attachments_from_parked(action.get("attachments")) or None),
+        )
+        event_id = await _gateway_server.enqueue_outbound(
+            action["origin_gateway"], int(action["tg_group_id"]),
+            env.to_json(include_secret=False),
+        )
+        try:
+            _gateway_server.register_pending_mapping(
+                event_id,
+                dc_channel_id=str(action["dc_channel_id"]),
+                dc_message_id=str(action["dc_message_id"]),
+                tg_group_id=str(action["tg_group_id"]),
+                dc_user_id=str(action.get("dc_user_id", "")),
+                origin_gateway=action["origin_gateway"],
+            )
+        except Exception as _e:
+            logger.warning(f"register_pending_mapping failed (reply exec): {_e}")
         logger.info(
-            f"PARKED reaction fired | dc_msg={dc_msg_id} | "
-            f"tg_msg={record['tg_message_id']} | emoji={action_data['emoji_str']}"
+            f"DC→GW server relay (reply) | gateway={action['origin_gateway']} "
+            f"| tg_group={action['tg_group_id']} | reply_to_tg_msg={reply_to} "
+            f"| event_id={event_id} | sender={action.get('sender_name','')!r} "
+            f"| attachments={len(action.get('attachments') or [])}"
         )
-    elif kind == "reply":
-        # Fire a parked reply: the parent's correlation just completed, so its
-        # tg_msg now exists in the map. Execute via the SAME helper the live relay
-        # uses — it resolves the parent's tg_msg at execution time and creates
-        # this reply's own pending mapping (the cascade). The parent's tg_msg was
-        # never stored in the parked data; only its Discord id.
-        ok = await _execute_gateway_reply(
-            origin_gateway=action_data["origin_gateway"],
-            tg_group_id=action_data["tg_group_id"],
-            parent_dc_channel_id=action_data["parent_dc_channel_id"],
-            parent_dc_id=action_data["parent_dc_id"],
-            relay_text=action_data["relay_text"],
-            attachments=_attachments_from_parked(action_data.get("attachments")),
-            sender_name=action_data.get("sender_name", ""),
-            dc_channel_id=action_data["dc_channel_id"],
-            dc_message_id=action_data["dc_message_id"],
-            dc_user_id=action_data.get("dc_user_id", ""),
-        )
-        if ok:
-            logger.info(
-                f"PARKED reply fired | dc_msg={action_data['dc_message_id']} | "
-                f"parent_dc={action_data['parent_dc_id']} | "
-                f"tg_group={action_data['tg_group_id']}"
-            )
-        else:
-            # Parent still unmapped at fire time (stale / empty correlation):
-            # the reply has no valid parent to attach to. Log and drop.
-            logger.info(
-                f"PARKED reply fired but parent still unmapped | "
-                f"dc_msg={action_data['dc_message_id']} | "
-                f"parent_dc={action_data['parent_dc_id']} (dropped)"
-            )
-    elif kind == "delete":
-        # Fire a parked delete: the message's correlation completed, so its
-        # tg_msg(s) now exist. Resolve and delete via the same routing the live
-        # delete handler uses (gateway-client, or server-enqueue for a gateway we
-        # serve, plus best-effort native). No cascade.
-        dc_channel_id = action_data["dc_channel_id"]
-        dc_msg_id = action_data["dc_message_id"]
-        loop = asyncio.get_running_loop()
+        return
+
+    if kind == "delete":
+        dc_channel_id = action["dc_channel_id"]
+        dc_msg_id = action["dc_message_id"]
         records = await loop.run_in_executor(
             None, db.find_all_by_dc, dc_channel_id, dc_msg_id
         )
         if not records:
-            logger.info(
-                f"PARKED delete fired but no target | dc_msg={dc_msg_id} (no-op)"
-            )
+            logger.info(f"scheduled delete: no target | dc_msg={dc_msg_id} (no-op)")
             return
+        if _tg_app is None:
+            logger.debug("Skipping delete: Telegram app not ready yet (startup window)")
+            return
+        tg_bot = _tg_app.bot
+        behavior = config.dc_msg_delete_behavior  # "delete" | "ignore" | "<notice>"
         tg_group_id = records[0]["tg_group_id"]
         tg_msg_ids = [int(r["tg_message_id"]) for r in records]
+        tg_first_id = tg_msg_ids[0]
+
+        if behavior == "ignore":
+            logger.info(
+                f"DC→TG delete ignored (DC_MSG_DELETE_BEHAVIOR=ignore): "
+                f"dc_msg={dc_msg_id} → tg_msg={tg_msg_ids}"
+            )
+            return
+        if behavior != "delete":
+            # Any other value is posted as a TG reply notice.
+            try:
+                await tg_bot.send_message(
+                    chat_id=int(tg_group_id), text=behavior,
+                    reply_to_message_id=tg_first_id,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to post delete notification to Telegram: {e}")
+            return
+
         origin_gateway = ""
         for r in records:
             og = r.get("origin_gateway", "") or ""
@@ -2532,42 +2566,78 @@ async def _perform_parked_action(action_data: dict, telegram_ids: list) -> None:
         if _client is not None:
             try:
                 await _client.send_deletion(int(tg_group_id), [int(m) for m in tg_msg_ids])
+                logger.info(
+                    f"DC→GW deletion | gateway={origin_gateway} | "
+                    f"tg_group={tg_group_id} | tg_msg={tg_msg_ids}"
+                )
             except GatewayClientError as e:
-                logger.error(f"PARKED delete (client) failed | {e}")
-        else:
-            if _tg_app is not None:
-                for _m in sorted(tg_msg_ids, reverse=True):
+                logger.error(
+                    f"DC→GW deletion failed | gateway={origin_gateway} | "
+                    f"tg_group={tg_group_id} | tg_msg={tg_msg_ids} | {e}"
+                )
+            rows_removed = await loop.run_in_executor(
+                None, db.delete_by_dc, dc_channel_id, dc_msg_id
+            )
+            logger.info(
+                f"DC→GW delete | db_rows_removed={rows_removed} for dc_msg={dc_msg_id}"
+            )
+            return
+
+        deleted_tg = []
+        failed_tg = []
+        for _m in sorted(tg_msg_ids, reverse=True):
+            try:
+                await tg_bot.delete_message(chat_id=int(tg_group_id), message_id=_m)
+                deleted_tg.append(_m)
+            except Exception as e:
+                failed_tg.append((_m, str(e)))
+                logger.warning(
+                    f"DC→TG delete | dc_msg={dc_msg_id} | tg_msg={_m} | "
+                    f"tg_group={tg_group_id} | result=FAILED | reason={e}"
+                )
+                if config.delete_fail_errmsg:
                     try:
-                        await _tg_app.bot.delete_message(chat_id=int(tg_group_id), message_id=_m)
+                        await tg_bot.send_message(
+                            chat_id=int(tg_group_id), text=config.delete_fail_errmsg,
+                            reply_to_message_id=_m,
+                        )
                     except Exception:
                         pass
-            if origin_gateway:
-                await _gw_enqueue_outbound_deletion(
-                    origin_gateway=origin_gateway,
-                    tg_group_id=str(tg_group_id),
-                    tg_msg_ids=tg_msg_ids,
-                )
-        await loop.run_in_executor(None, db.delete_by_dc, dc_channel_id, dc_msg_id)
         logger.info(
-            f"PARKED delete fired | dc_msg={dc_msg_id} | tg_group={tg_group_id} | "
-            f"tg_msg={tg_msg_ids}"
+            f"DC→TG delete | dc_msg={dc_msg_id} | tg_group={tg_group_id} | "
+            f"tg_msgs_deleted={deleted_tg} | tg_msgs_failed={[t for t, _ in failed_tg]}"
         )
-    elif kind == "edit":
-        # Fire a parked edit: apply the new content to the now-mapped tg_msg via
-        # the same routing the live edit handler uses. No cascade.
-        dc_channel_id = action_data["dc_channel_id"]
-        dc_msg_id = action_data["dc_message_id"]
-        resolved_edit = action_data.get("resolved_edit", "")
-        loop = asyncio.get_running_loop()
+        # Gateway-origin AND we serve that gateway → deletion flows out to clients.
+        if origin_gateway:
+            await _gw_enqueue_outbound_deletion(
+                origin_gateway=origin_gateway,
+                tg_group_id=str(tg_group_id),
+                tg_msg_ids=tg_msg_ids,
+            )
+        rows_removed = await loop.run_in_executor(
+            None, db.delete_by_dc, dc_channel_id, dc_msg_id
+        )
+        logger.info(
+            f"DC→TG delete | db_rows_removed={rows_removed} for dc_msg={dc_msg_id}"
+        )
+        return
+
+    if kind == "edit":
+        dc_channel_id = action["dc_channel_id"]
+        dc_msg_id = action["dc_message_id"]
+        resolved_edit = action.get("resolved_edit", "")
+        sender_name = action.get("sender_name", "")
         record = await loop.run_in_executor(None, db.find_by_dc, dc_channel_id, dc_msg_id)
         if not record:
-            logger.info(
-                f"PARKED edit fired but no target | dc_msg={dc_msg_id} (no-op)"
-            )
+            logger.info(f"scheduled edit: no target | dc_msg={dc_msg_id} (no-op)")
             return
         tg_group_id = record["tg_group_id"]
         tg_msg_id = int(record["tg_message_id"])
         origin_gateway = record.get("origin_gateway", "") or ""
+        new_text = f"✏️ EDIT — 👤 {sender_name} (Discord): {resolved_edit}"
+
+        # Client role: edit travels out via the gateway client (can't edit
+        # natively — not in that TG group).
         _client = _get_gateway_client(origin_gateway) if origin_gateway else None
         if _client is not None:
             try:
@@ -2575,27 +2645,81 @@ async def _perform_parked_action(action_data: dict, telegram_ids: list) -> None:
                     int(tg_group_id), text=resolved_edit,
                     message_id=int(tg_msg_id), edited=True,
                 )
+                logger.info(
+                    f"DC→GW edit | gateway={origin_gateway} | tg_group={tg_group_id} | "
+                    f"tg_msg={tg_msg_id} | sender={sender_name!r}"
+                )
             except GatewayClientError as e:
-                logger.error(f"PARKED edit (client) failed | {e}")
-        elif origin_gateway:
-            await _gw_enqueue_outbound_message(
-                origin_gateway=origin_gateway,
-                tg_group_id=str(tg_group_id),
-                tg_msg_id=str(tg_msg_id),
-                text=resolved_edit,
-                sender_name=action_data.get("sender_name", ""),
-                reply_to_tg_id=None,
-                edited=True,
+                logger.error(
+                    f"DC→GW edit failed | gateway={origin_gateway} | "
+                    f"tg_msg={tg_msg_id} | {e}"
+                )
+            return
+
+        if _tg_app is None:
+            logger.debug("Skipping edit: Telegram app not ready yet (startup window)")
+            return
+        tg_bot = _tg_app.bot
+
+        async def _enqueue_edit_outbound():
+            # Server role: edit of a gateway-origin message flows back out to
+            # clients as an edited_message.
+            if origin_gateway:
+                await _gw_enqueue_outbound_message(
+                    origin_gateway=origin_gateway,
+                    tg_group_id=str(tg_group_id),
+                    tg_msg_id=str(tg_msg_id),
+                    text=resolved_edit,
+                    sender_name=sender_name,
+                    reply_to_tg_id=None,
+                    edited=True,
+                )
+
+        # Cascade 1: edit the Telegram message in place.
+        try:
+            await tg_bot.edit_message_text(
+                chat_id=int(tg_group_id), message_id=tg_msg_id, text=new_text,
             )
-        logger.info(
-            f"PARKED edit fired | dc_msg={dc_msg_id} | tg_group={tg_group_id} | "
-            f"tg_msg={tg_msg_id}"
-        )
-    else:
-        logger.warning(f"parked action: unknown action_type={kind} (dropped)")
-    """Serialize gp.Attachment objects to plain dicts for the parked structure
-    (persistable). The underlying files are already stored on disk by the
-    gather step; only the references travel."""
+            await _enqueue_edit_outbound()
+            logger.info(
+                f"DC→TG edit | dc_msg={dc_msg_id} | tg_group={tg_group_id} | "
+                f"tg_msg={tg_msg_id} | result=edited"
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Could not edit TG message tg_msg={tg_msg_id}: {e}")
+
+        # Cascade 2: post a new reply carrying the edit indicator.
+        try:
+            await tg_bot.send_message(
+                chat_id=int(tg_group_id), text=new_text,
+                reply_to_message_id=tg_msg_id,
+            )
+            await _enqueue_edit_outbound()
+            logger.info(
+                f"DC→TG edit | dc_msg={dc_msg_id} | tg_group={tg_group_id} | "
+                f"tg_msg={tg_msg_id} | result=reply_fallback"
+            )
+        except Exception as e:
+            logger.error(f"Failed to post edit fallback to Telegram: {e}")
+        return
+
+    logger.warning(f"scheduled action: unknown action_type={kind} (dropped)")
+
+
+async def _perform_parked_action(action_data: dict, telegram_ids: list) -> None:
+    """Parked-action handler registered with the gateway server. A parked action
+    fires when its dependency's correlation completes — at which point the
+    dependency is mapped, so we simply run the shared executor (which assumes
+    completeness). `telegram_ids` is unused here: the executor resolves targets
+    from the map, which is the single source of truth."""
+    await _execute_scheduled_action(action_data)
+
+
+def _attachments_to_parked(attachments: list) -> list:
+    """Serialize gp.Attachment objects to plain dicts for the scheduled action
+    (persistable). The underlying files are already stored on disk by the gather
+    step; only the references travel."""
     out = []
     for a in (attachments or []):
         out.append({
@@ -3448,21 +3572,24 @@ class TDbridgeDiscordClient(discord.Client):
             )
             for _n in gw_notes:
                 logger.warning(f"GW outbound attachment ({tg_group_id}): {_n}")
-            # Execute via the shared helper — SAME path the parked-reply fire uses
-            # (one path, two triggers). The parent's tg_msg is resolved inside the
-            # helper from the map (it exists here, since parent_record was found).
-            await _execute_gateway_reply(
-                origin_gateway=inherited_origin_gateway,
-                tg_group_id=str(tg_group_id),
-                parent_dc_channel_id=dc_channel_id,
-                parent_dc_id=str(message.reference.message_id),
-                relay_text=relay_text,
-                attachments=gw_attachments,
-                sender_name=sender_name,
-                dc_channel_id=str(message.channel.id),
-                dc_message_id=str(message.id),
-                dc_user_id=str(getattr(message.author, "id", "") or ""),
-            )
+            # Build the reply action and execute it through the SAME executor the
+            # parked-reply fire uses (one build shape, one executor). The parent's
+            # tg_msg is resolved inside the executor from the map (present here,
+            # since parent_record was found). Executing assumes completeness.
+            action = {
+                "action_type": "reply",
+                "origin_gateway": inherited_origin_gateway,
+                "tg_group_id": str(tg_group_id),
+                "parent_dc_channel_id": dc_channel_id,
+                "parent_dc_id": str(message.reference.message_id),
+                "relay_text": relay_text,
+                "attachments": _attachments_to_parked(gw_attachments),
+                "sender_name": sender_name,
+                "dc_channel_id": str(message.channel.id),
+                "dc_message_id": str(message.id),
+                "dc_user_id": str(getattr(message.author, "id", "") or ""),
+            }
+            await _execute_scheduled_action(action)
             return
 
         # ---- Send to Telegram (native) ----
@@ -3638,95 +3765,17 @@ class TDbridgeDiscordClient(discord.Client):
             fallback_name=author.get("username"),
         )
 
-        loop = asyncio.get_running_loop()
-        record = await loop.run_in_executor(None, db.find_by_dc, dc_channel_id, dc_msg_id)
-        if not record:
-            # Race: the edited message may be a gateway repost whose correlation
-            # hasn't completed (its tg_msg doesn't exist yet). If awaiting, PARK
-            # the edit to fire once the mapping is written.
-            awaiting_event = None
-            if _gateway_server is not None:
-                awaiting_event = _gateway_server.resolve_awaiting_event(
-                    dc_channel_id, dc_msg_id
-                )
-            if awaiting_event is not None:
-                _gateway_server.park_action(awaiting_event, {
-                    "action_type": "edit",
-                    "dc_channel_id": dc_channel_id,
-                    "dc_message_id": dc_msg_id,
-                    "resolved_edit": _resolve_discord_mentions(data.get("content", "")),
-                    "sender_name": sender_name,
-                })
-                logger.info(
-                    f"DC→TG edit PARKED (awaiting correlation) | "
-                    f"dc_msg={dc_msg_id} | event_id={awaiting_event}"
-                )
-            return
-        resolved_edit = _resolve_discord_mentions(data.get("content", ""))
-        new_text      = f"✏️ EDIT — 👤 {sender_name} (Discord): {resolved_edit}"
-
-        if _tg_app is None:
-            logger.debug("Skipping Discord event: Telegram app not ready yet (startup window)")
-            return
-        tg_bot: TelegramBot = _tg_app.bot
-
-        # If the message is gateway-origin AND we are a CLIENT for that gateway,
-        # the edit travels OUT via the gateway client (we can't edit natively —
-        # not in that Telegram group). Mirrors the delete/reaction routing.
-        _client = _get_gateway_client(origin_gateway) if origin_gateway else None
-        if _client is not None:
-            try:
-                await _client.send_message(
-                    int(tg_group_id), text=resolved_edit,
-                    message_id=int(tg_msg_id), edited=True,
-                )
-                logger.info(
-                    f"DC→GW edit | gateway={origin_gateway} | tg_group={tg_group_id} | "
-                    f"tg_msg={tg_msg_id} | sender={sender_name!r}"
-                )
-            except GatewayClientError as e:
-                logger.error(
-                    f"DC→GW edit failed | gateway={origin_gateway} | "
-                    f"tg_msg={tg_msg_id} | {e}"
-                )
-            return
-
-        async def _enqueue_edit_outbound():
-            # An edit of a gateway-origin message flows back out the gateway as
-            # an edited_message carrying the new (resolved) text.
-            if origin_gateway:
-                await _gw_enqueue_outbound_message(
-                    origin_gateway=origin_gateway,
-                    tg_group_id=str(tg_group_id),
-                    tg_msg_id=str(tg_msg_id),
-                    text=resolved_edit,
-                    sender_name=sender_name,
-                    reply_to_tg_id=None,
-                    edited=True,
-                )
-
-        # Cascade 1: try to edit the Telegram message
-        try:
-            await tg_bot.edit_message_text(
-                chat_id=int(tg_group_id),
-                message_id=tg_msg_id,
-                text=new_text,
-            )
-            await _enqueue_edit_outbound()
-            return
-        except Exception as e:
-            logger.warning(f"Could not edit TG message {tg_msg_id}: {e}")
-
-        # Cascade 2: send a new reply with edit indicator
-        try:
-            await tg_bot.send_message(
-                chat_id=int(tg_group_id),
-                text=new_text,
-                reply_to_message_id=tg_msg_id,
-            )
-            await _enqueue_edit_outbound()
-        except Exception as e:
-            logger.error(f"Failed to post edit fallback to Telegram: {e}")
+        # Build the scheduled edit unconditionally, then dispatch-or-park. The
+        # executor resolves the tg target from the map and applies the edit
+        # (in-place, or reply-fallback), plus gateway enqueue if we serve it.
+        action = {
+            "action_type": "edit",
+            "dc_channel_id": dc_channel_id,
+            "dc_message_id": dc_msg_id,
+            "resolved_edit": _resolve_discord_mentions(data.get("content", "")),
+            "sender_name": sender_name,
+        }
+        await _dispatch_or_park_action(action)
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         """Bridge a Discord message deletion to Telegram.
@@ -3751,160 +3800,15 @@ class TDbridgeDiscordClient(discord.Client):
             )
             return
 
-        loop = asyncio.get_running_loop()
-        records = await loop.run_in_executor(
-            None, db.find_all_by_dc, dc_channel_id, dc_msg_id
-        )
-        if not records:
-            # Race: the message being deleted may be a gateway repost whose
-            # correlation hasn't completed (its tg_msg doesn't exist yet). If it
-            # is awaiting, PARK the delete to fire once the mapping is written.
-            awaiting_event = None
-            if _gateway_server is not None:
-                awaiting_event = _gateway_server.resolve_awaiting_event(
-                    dc_channel_id, dc_msg_id
-                )
-            if awaiting_event is not None:
-                _gateway_server.park_action(awaiting_event, {
-                    "action_type": "delete",
-                    "dc_channel_id": dc_channel_id,
-                    "dc_message_id": dc_msg_id,
-                })
-                logger.info(
-                    f"DC→TG delete PARKED (awaiting correlation) | "
-                    f"dc_msg={dc_msg_id} | event_id={awaiting_event}"
-                )
-            return
-        dc_channel_name = getattr(chan, "name", str(payload.channel_id))
-
-        if _tg_app is None:
-            logger.debug("Skipping Discord event: Telegram app not ready yet (startup window)")
-            return
-        tg_bot: TelegramBot = _tg_app.bot
-        # dc_msg_delete_behavior: "delete" | "ignore" | "<any other string>"
-        # Any string other than "delete" or "ignore" is posted as a TG reply.
-        behavior = config.dc_msg_delete_behavior
-
-        # All records share the same tg_group_id (a Discord message only
-        # routes to one Telegram group).
-        tg_group_id  = records[0]["tg_group_id"]
-        tg_msg_ids   = [int(r["tg_message_id"]) for r in records]
-        tg_first_id  = tg_msg_ids[0]   # use first as the reply anchor for notices
-
-        if behavior == "ignore":
-            logger.info(
-                f"DC→TG delete ignored (DC_MSG_DELETE_BEHAVIOR=ignore): "
-                f"dc_msg {dc_msg_id} → tg_msgs {tg_msg_ids}"
-            )
-            return
-
-        if behavior != "delete":
-            # Any value other than "delete" or "ignore" is posted as a TG reply
-            try:
-                await tg_bot.send_message(
-                    chat_id=int(tg_group_id),
-                    text=behavior,
-                    reply_to_message_id=tg_first_id,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to post delete notification to Telegram: {e}")
-            return
-
-        # "delete": attempt to delete every Telegram message produced by this
-        # Discord message.
-
-        # If these messages are gateway-origin AND we are a CLIENT for that
-        # gateway, the deletion travels OUT via the gateway client (we can't
-        # delete natively — this instance isn't in that Telegram group). This
-        # mirrors the reaction/message client-routing. Determine the origin
-        # gateway from the records (all share one).
-        _origin_gateway = ""
-        for r in records:
-            og = r.get("origin_gateway", "") or ""
-            if og:
-                _origin_gateway = og
-                break
-
-        _client = _get_gateway_client(_origin_gateway) if _origin_gateway else None
-        if _client is not None:
-            try:
-                await _client.send_deletion(int(tg_group_id), [int(m) for m in tg_msg_ids])
-                logger.info(
-                    f"DC→GW deletion | gateway={_origin_gateway} | "
-                    f"tg_group={tg_group_id} | tg_msg={tg_msg_ids}"
-                )
-            except GatewayClientError as e:
-                logger.error(
-                    f"DC→GW deletion failed | gateway={_origin_gateway} | "
-                    f"tg_group={tg_group_id} | tg_msg={tg_msg_ids} | {e}"
-                )
-            # Remove local DB records and stop — no native delete, no server enqueue.
-            rows_removed = await loop.run_in_executor(
-                None, db.delete_by_dc, dc_channel_id, dc_msg_id
-            )
-            logger.info(
-                f"DC→GW delete | db_rows_removed={rows_removed} for dc_msg={dc_msg_id}"
-            )
-            return
-
-        deleted_tg = []
-        failed_tg  = []
-        # Delete highest id first. For media-group (album) messages this order
-        # is more robust than first-first, and it's harmless for single msgs.
-        for tg_msg_id in sorted(tg_msg_ids, reverse=True):
-            try:
-                _result = await tg_bot.delete_message(
-                    chat_id=int(tg_group_id),
-                    message_id=tg_msg_id,
-                )
-                deleted_tg.append(tg_msg_id)
-                logger.info(
-                    f"DC→TG delete: deleteMessage(chat={tg_group_id}, "
-                    f"msg={tg_msg_id}) returned {_result!r}"
-                )
-            except Exception as e:
-                failed_tg.append((tg_msg_id, str(e)))
-                logger.warning(
-                    f"DC→TG delete | dc_msg={dc_msg_id} | "
-                    f"tg_msg={tg_msg_id} | tg_group={tg_group_id} | "
-                    f"result=FAILED | reason={e}"
-                )
-                if config.delete_fail_errmsg:
-                    try:
-                        await tg_bot.send_message(
-                            chat_id=int(tg_group_id),
-                            text=config.delete_fail_errmsg,
-                            reply_to_message_id=tg_msg_id,
-                        )
-                    except Exception:
-                        pass
-
-        logger.info(
-            f"DC→TG delete | "
-            f"dc_msg={dc_msg_id} | "
-            f"dc_channel=#{dc_channel_name}({dc_channel_id}) | "
-            f"tg_group={tg_group_id} | "
-            f"tg_msgs_deleted={deleted_tg} | "
-            f"tg_msgs_failed={[t for t, _ in failed_tg]}"
-        )
-
-        # If any of the deleted messages were gateway-origin AND we SERVE that
-        # gateway (owner), the deletion also flows back out via the server
-        # enqueue mechanism so clients see it.
-        if _origin_gateway:
-            await _gw_enqueue_outbound_deletion(
-                origin_gateway=_origin_gateway,
-                tg_group_id=str(tg_group_id),
-                tg_msg_ids=tg_msg_ids,
-            )
-
-        # Remove all DB records for this Discord message after attempting deletion
-        rows_removed = await loop.run_in_executor(
-            None, db.delete_by_dc, dc_channel_id, dc_msg_id
-        )
-        logger.info(
-            f"DC→TG delete | db_rows_removed={rows_removed} for dc_msg={dc_msg_id}"
-        )
+        # Build the scheduled delete unconditionally, then dispatch-or-park. The
+        # executor resolves the tg target(s) from the map and applies the
+        # configured delete behavior; nothing here inspects the map.
+        action = {
+            "action_type": "delete",
+            "dc_channel_id": dc_channel_id,
+            "dc_message_id": dc_msg_id,
+        }
+        await _dispatch_or_park_action(action)
 
     async def on_raw_reaction_add(
         self, payload: discord.RawReactionActionEvent
@@ -3932,65 +3836,17 @@ class TDbridgeDiscordClient(discord.Client):
             _guild, user_id, member=member,
         )
 
-        loop = asyncio.get_running_loop()
-        record = await loop.run_in_executor(None, db.find_by_dc, dc_channel_id, dc_msg_id)
-        if not record:
-            # No mapping yet. Two sub-cases:
-            #  (b) this Discord message is AWAITING correlation (a userbot-
-            #      reposted message whose tg id isn't known yet) → PARK the
-            #      reaction to fire when the correlate completes.
-            #  (a) genuinely unknown (never bridged) → drop, as before.
-            awaiting_event = None
-            if _gateway_server is not None:
-                awaiting_event = _gateway_server.resolve_awaiting_event(
-                    dc_channel_id, dc_msg_id
-                )
-            if awaiting_event is not None:
-                _gateway_server.park_action(awaiting_event, {
-                    "action_type": "reaction",
-                    "dc_channel_id": dc_channel_id,
-                    "dc_message_id": dc_msg_id,
-                    "emoji_str": str(payload.emoji),
-                    "user_name": user_name,
-                })
-                logger.info(
-                    f"DC→TG reaction PARKED (awaiting correlation) | "
-                    f"dc_msg={dc_msg_id} | event_id={awaiting_event} | "
-                    f"emoji={str(payload.emoji)} | user={user_name!r}"
-                )
-            return
-
-        tg_group_id = record["tg_group_id"]
-        tg_msg_id   = int(record["tg_message_id"])
-        emoji_str   = str(payload.emoji)
-        record_gateway = record.get("origin_gateway", "") or ""
-
-        behavior = config.reactions_dtot
-        if behavior == "neither":
-            logger.info(
-                f"DC→TG reaction | dc_msg={dc_msg_id} | dc_channel={dc_channel_id} | "
-                f"user={user_name!r} | emoji={emoji_str} | "
-                f"result=IGNORED | reason=REACTIONS_DTOT=neither"
-            )
-            return
-
-        await _perform_reaction_to_target(
-            tg_group_id=tg_group_id, tg_msg_id=tg_msg_id, emoji_str=emoji_str,
-            user_name=user_name, record_gateway=record_gateway,
-            dc_msg_id=dc_msg_id, dc_channel_id=dc_channel_id, behavior=behavior,
-        )
-
-        # If the reacted-to message is gateway-origin, the reaction also flows
-        # back out the gateway to the client.
-        origin_gateway = record.get("origin_gateway", "") or ""
-        if origin_gateway:
-            await _gw_enqueue_outbound_reaction(
-                origin_gateway=origin_gateway,
-                tg_group_id=str(tg_group_id),
-                tg_msg_id=str(tg_msg_id),
-                emoji=[emoji_str],
-                sender_name=user_name,
-            )
+        # Build the scheduled action unconditionally, then let the one dispatch
+        # decision execute-now or park. The executor resolves the tg target from
+        # the map (assuming completeness), so nothing here inspects the map.
+        action = {
+            "action_type": "reaction",
+            "dc_channel_id": dc_channel_id,
+            "dc_message_id": dc_msg_id,
+            "emoji_str": str(payload.emoji),
+            "user_name": user_name,
+        }
+        await _dispatch_or_park_action(action)
 
 
 # ===========================================================================
