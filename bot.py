@@ -2391,6 +2391,22 @@ async def _perform_parked_action(action_data: dict, telegram_ids: list) -> None:
             record_gateway=record.get("origin_gateway", "") or "",
             dc_msg_id=dc_msg_id, dc_channel_id=dc_channel_id, behavior=behavior,
         )
+        # If the reacted-to message is gateway-origin, the reaction ALSO flows
+        # back out the gateway to the client (server role). This mirrors the
+        # live reaction handler: _perform_reaction_to_target covers the native /
+        # gateway-CLIENT cases, and this enqueue covers the server-role case
+        # (where THIS instance serves that gateway and must deliver to the
+        # client that reposted the message). Omitting this was why an early
+        # parked reaction reached Telegram via neither path.
+        origin_gateway = record.get("origin_gateway", "") or ""
+        if origin_gateway:
+            await _gw_enqueue_outbound_reaction(
+                origin_gateway=origin_gateway,
+                tg_group_id=str(record["tg_group_id"]),
+                tg_msg_id=str(record["tg_message_id"]),
+                emoji=[action_data["emoji_str"]],
+                sender_name=action_data.get("user_name", ""),
+            )
         logger.info(
             f"PARKED reaction fired | dc_msg={dc_msg_id} | "
             f"tg_msg={record['tg_message_id']} | emoji={action_data['emoji_str']}"
