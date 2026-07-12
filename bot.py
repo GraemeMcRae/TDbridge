@@ -388,8 +388,8 @@ async def _send_via_gateway_client(
     msg_ids = resp.get("message_ids") or []
     logger.info(
         f"DC→GW client send | gateway={gateway_name} | tg_group={tg_group_id} | "
-        f"reply_to={reply_to} | attachments={len(gw_attachments)} | "
-        f"tg_msgs={msg_ids} | status={resp.get('status')}"
+        f"reply_to_tg_msg={reply_to} | attachments={len(gw_attachments)} | "
+        f"tg_msg={msg_ids} | status={resp.get('status')}"
     )
 
     # Store DC↔TG mapping in our own SQLite so replies thread (Q4). Echo returns
@@ -498,7 +498,7 @@ async def _bridge_gateway_client_event(gateway_name: str, ev: dict) -> None:
                 )
         logger.info(
             f"GW client→DC deletion | gateway={gateway_name} | tg_group={tg_group_id} | "
-            f"tg_msgs={ids} | dc_deleted={deleted} | disassociated={disassociated}"
+            f"tg_msg={ids} | dc_deleted={deleted} | disassociated={disassociated}"
         )
         await _ack()
         return
@@ -1715,7 +1715,7 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         msg.from_user.full_name if msg.from_user else tg_chat.title or "Unknown"
     )
     logger.info(
-        f"TG→DC: received message {tg_msg_id} from '{sender_name}' "
+        f"TG→DC: received message tg_msg={tg_msg_id} from '{sender_name}' "
         f"in group {tg_group_id} ('{tg_chat.title}')"
     )
     # Update Telegram connectivity timestamp for the health dashboard.
@@ -2064,7 +2064,7 @@ async def route_tg_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif msg.poll:
             _tg_attach = f"poll({msg.poll.question!r})"
         _tg_reply_info = (
-            f"reply_to_tg={msg.reply_to_message.message_id}"
+            f"reply_to_tg_msg={msg.reply_to_message.message_id}"
             if msg.reply_to_message else "not_a_reply"
         )
         _dc_reply_info = (
@@ -2454,7 +2454,7 @@ async def _gw_enqueue_outbound_message(
         f"GW outbound | gateway={origin_gateway} | type="
         f"{'edited_message' if edited else 'message'} | "
         f"tg_group={tg_group_id} | tg_msg={tg_msg_id} | "
-        f"reply_to={reply_to} | sender={sender_name!r} | "
+        f"reply_to_tg_msg={reply_to} | sender={sender_name!r} | "
         f"attachments={len(attachments) if attachments else 0}"
     )
 
@@ -2501,7 +2501,7 @@ async def _gw_enqueue_outbound_deletion(
     )
     logger.info(
         f"GW outbound | gateway={origin_gateway} | type=deletion | "
-        f"tg_group={tg_group_id} | tg_msgs={mids}"
+        f"tg_group={tg_group_id} | tg_msg={mids}"
     )
 
 
@@ -2534,7 +2534,7 @@ async def bridge_gateway_message_to_discord(
     text only.
     """
     logger.info(
-        f"GW→DC: bridging gateway message {tg_msg_id} for group {tg_group_id} "
+        f"GW→DC: bridging gateway message tg_msg={tg_msg_id} for group {tg_group_id} "
         f"(sender {sender_name!r})"
     )
 
@@ -2780,7 +2780,7 @@ async def route_tg_reaction_to_discord(update: Update, context: ContextTypes.DEF
     if not new_reactions:
         logger.info(
             f"TG→DC reaction: reaction removed by {actor_name} on "
-            f"tg_msg {tg_msg_id} in group {tg_group_id} — no action"
+            f"tg_msg={tg_msg_id} in group {tg_group_id} — no action"
         )
         return  # Reaction was removed; no action for now
 
@@ -2790,7 +2790,7 @@ async def route_tg_reaction_to_discord(update: Update, context: ContextTypes.DEF
     )
     logger.info(
         f"TG→DC reaction: {actor_name} reacted {emoji_str!r} to "
-        f"tg_msg {tg_msg_id} in group {tg_group_id}"
+        f"tg_msg={tg_msg_id} in group {tg_group_id}"
     )
     bot_status.tg_last_update = localnow()
     try:
@@ -2802,7 +2802,7 @@ async def route_tg_reaction_to_discord(update: Update, context: ContextTypes.DEF
     record = await loop.run_in_executor(None, db.find_by_tg, tg_group_id, tg_msg_id)
     if not record:
         logger.info(
-            f"TG→DC reaction: tg_msg {tg_msg_id} in group {tg_group_id} "
+            f"TG→DC reaction: tg_msg={tg_msg_id} in group {tg_group_id} "
             f"not found in message map — reaction not bridged. "
             f"(Message may have originated outside TDbridge, or map entry was purged.)"
         )
@@ -3240,7 +3240,7 @@ class TDbridgeDiscordClient(discord.Client):
                 logger.warning(f"register_pending_mapping failed: {_e}")
             logger.info(
                 f"DC→GW server relay (reply) | gateway={inherited_origin_gateway} "
-                f"| tg_group={tg_group_id} | reply_to={_reply_to} "
+                f"| tg_group={tg_group_id} | reply_to_tg_msg={_reply_to} "
                 f"| event_id={event_id} "
                 f"| sender={sender_name!r} | attachments="
                 f"{len(gw_attachments) if gw_attachments else 0}"
@@ -3343,11 +3343,11 @@ class TDbridgeDiscordClient(discord.Client):
                     else "not_a_reply"
                 )
                 _tg_reply_to_info = (
-                    f"tg_reply_to={reply_to_telegram_id}"
+                    f"reply_to_tg_msg={reply_to_telegram_id}"
                     if reply_to_telegram_id else "tg_new_message"
                 )
                 _tg_all_ids_str = (
-                    f"tg_msgs={tg_all_ids}" if len(tg_all_ids) > 1
+                    f"tg_msg={tg_all_ids}" if len(tg_all_ids) > 1
                     else f"tg_msg={tg_msg_id}"
                 )
                 logger.info(
@@ -3582,12 +3582,12 @@ class TDbridgeDiscordClient(discord.Client):
                 await _client.send_deletion(int(tg_group_id), [int(m) for m in tg_msg_ids])
                 logger.info(
                     f"DC→GW deletion | gateway={_origin_gateway} | "
-                    f"tg_group={tg_group_id} | tg_msgs={tg_msg_ids}"
+                    f"tg_group={tg_group_id} | tg_msg={tg_msg_ids}"
                 )
             except GatewayClientError as e:
                 logger.error(
                     f"DC→GW deletion failed | gateway={_origin_gateway} | "
-                    f"tg_group={tg_group_id} | tg_msgs={tg_msg_ids} | {e}"
+                    f"tg_group={tg_group_id} | tg_msg={tg_msg_ids} | {e}"
                 )
             # Remove local DB records and stop — no native delete, no server enqueue.
             rows_removed = await loop.run_in_executor(
@@ -4620,7 +4620,7 @@ async def _startup(discord_client: discord.Client) -> None:
                 except Exception as e:
                     logger.warning(f"GW→DC deletion failed for {mid}: {e}")
         logger.info(
-            f"GW→TG/DC deletion applied | tg_group={gid_str} | tg_msgs={list(message_ids)} | "
+            f"GW→TG/DC deletion applied | tg_group={gid_str} | tg_msg={list(message_ids)} | "
             f"sender={sender_name!r}"
         )
         return {"notes": notes}

@@ -96,7 +96,7 @@ class UserbotBridge:
             if len(_rtxt) > 300:
                 _rtxt = _rtxt[:300] + "…"
             logger.info(
-                "TG->GW relayed | tg_group=%s | tg_msg=%s | from=%s | reply_to=%s | "
+                "TG->GW relayed | tg_group=%s | tg_msg=%s | from=%s | reply_to_tg_msg=%s | "
                 "attachments=%d | text='%s'",
                 chat_id, message_id, norm.get("sender_username"),
                 norm.get("reply_to"), len(attachments), _rtxt,
@@ -152,7 +152,7 @@ class UserbotBridge:
             await self._outbox.enqueue(chat_id, etype, self._msg_action(payload),
                                        event_id=event_id)
             logger.info(
-                "GW->TG enqueued | event_id=%s | event=%s | tg_group=%s | reply_to=%s | "
+                "GW->TG enqueued | event_id=%s | event=%s | tg_group=%s | reply_to_tg_msg=%s | "
                 "attachments=%d | text='%s'",
                 event_id, etype, chat_id, payload.get("reply_to"),
                 len(payload.get("attachments") or []), _txt,
@@ -168,7 +168,7 @@ class UserbotBridge:
             await self._outbox.enqueue(chat_id, "deletion", self._deletion_action(payload),
                                        event_id=event_id)
             logger.info(
-                "GW->TG enqueued | event_id=%s | event=deletion | tg_group=%s | tg_msgs=%s",
+                "GW->TG enqueued | event_id=%s | event=deletion | tg_group=%s | tg_msg=%s",
                 event_id, chat_id, self._ids(payload),
             )
         else:
@@ -239,7 +239,7 @@ class UserbotBridge:
                     )
                     produced.append(new_id)
                     logger.info(
-                        "TG POST (file) | tg_group=%s | new_tg_msg=%s | reply_to=%s | "
+                        "TG POST (file) | tg_group=%s | new_tg_msg=%s | reply_to_tg_msg=%s | "
                         "file=%s | caption='%s'",
                         chat_id, new_id, reply_to, a.get("file_name"),
                         _tprev if first else "",
@@ -252,7 +252,7 @@ class UserbotBridge:
                 new_id = await self._tg.send_text(chat_id, text, reply_to=reply_to)
                 produced.append(new_id)
                 logger.info(
-                    "TG POST (text) | tg_group=%s | new_tg_msg=%s | reply_to=%s | text='%s'",
+                    "TG POST (text) | tg_group=%s | new_tg_msg=%s | reply_to_tg_msg=%s | text='%s'",
                     chat_id, new_id, reply_to, _tprev,
                 )
             return produced
@@ -267,7 +267,7 @@ class UserbotBridge:
             ids = payload.get("message_ids") or []
             if ids:
                 await self._tg.delete_messages(chat_id, [int(i) for i in ids])
-                logger.info("TG DELETE | tg_group=%s | tg_msgs=%s", chat_id, ids)
+                logger.info("TG DELETE | tg_group=%s | tg_msg=%s", chat_id, ids)
             return []
         logger.warning("perform_action: unknown action_type=%s", action_type)
         return []
@@ -278,7 +278,7 @@ class UserbotBridge:
         successful post, in ACK/post order."""
         try:
             await self._gw.send_correlate(int(event_id), [int(t) for t in telegram_ids])
-            logger.info("GW correlate sent | event_id=%s | telegram_ids=%s",
+            logger.info("GW correlate sent | event_id=%s | tg_msg=%s",
                         event_id, telegram_ids)
         except Exception as e:
             logger.warning("correlate send failed for event_id=%s: %s", event_id, e)

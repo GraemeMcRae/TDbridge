@@ -532,7 +532,7 @@ class GatewayServer:
         if self._correlations is not None:
             self._correlations.record(int(event_id), [int(t) for t in telegram_ids])
         logger.info(
-            "CORRELATE recorded | gateway=%s | event_id=%s | telegram_ids=%s",
+            "CORRELATE recorded | gateway=%s | event_id=%s | tg_msg=%s",
             self._own_gateway, event_id, list(telegram_ids),
         )
         self._dispatch_pending(int(event_id), [int(t) for t in telegram_ids])
@@ -638,7 +638,7 @@ class GatewayServer:
         message, so there is nothing to map."""
         if not telegram_ids:
             logger.info(
-                "CORRELATE finish_mapping | dc_msg=%s | telegram_ids=[] "
+                "CORRELATE finish_mapping | dc_msg=%s | tg_msg=[] "
                 "(nothing to map)", ctx.get("dc_message_id"),
             )
             return
@@ -653,7 +653,7 @@ class GatewayServer:
                 origin_gateway=ctx.get("origin_gateway", ""),
             )
         logger.info(
-            "CORRELATE finish_mapping | dc_msg=%s | tg_group=%s | tg_msgs=%s | gateway=%s",
+            "CORRELATE finish_mapping | dc_msg=%s | tg_group=%s | tg_msg=%s | gateway=%s",
             ctx.get("dc_message_id"), ctx.get("tg_group_id"),
             list(telegram_ids), ctx.get("origin_gateway"),
         )
