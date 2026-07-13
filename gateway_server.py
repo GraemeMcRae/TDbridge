@@ -537,10 +537,11 @@ class GatewayServer:
         (lower event_id) will never be correlated and is declared stale now."""
         event_id = int(event_id)
         self._cancel_stale_timer(event_id)
-        # ACK-order staleness: everything still pending with a lower id is stale.
+        # ACK-order staleness: everything still pending with a lower id is
+        # abandoned (client correlated a later event → will never correlate these).
         if self._pending is not None:
             for older in self._pending_event_ids_below(event_id):
-                self._declare_stale(older)
+                self._declare_abandoned(older)
         if self._correlations is not None:
             self._correlations.record(event_id, [int(t) for t in telegram_ids])
         logger.info(
@@ -579,21 +580,20 @@ class GatewayServer:
         self._arm_stale_timer(int(event_id))
 
     def _arm_stale_timer(self, event_id: int) -> None:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return   # no loop yet (startup); the periodic housekeeping still covers it
-        old = self._stale_timers.pop(event_id, None)
-        if old is not None:
-            old.cancel()
-        self._stale_timers[event_id] = loop.call_later(
-            self._stale_sec, lambda: asyncio.ensure_future(self._sweep_stale())
-        )
+        """Ensure the periodic staleness sweep is running. We use a SINGLE
+        periodic sweep (not per-event timers): when a pending mapping is
+        registered, make sure the sweep is scheduled. The sweep re-arms itself
+        while any event remains stuck, and stops re-arming once the queue drains.
+        (event_id is unused now but kept for call-site clarity.)"""
+        if "_periodic" not in self._stale_timers:
+            self._rearm_periodic_sweep()
 
     def _cancel_stale_timer(self, event_id: int) -> None:
-        t = self._stale_timers.pop(event_id, None)
-        if t is not None:
-            t.cancel()
+        """Cancel bookkeeping for an event that just completed/abandoned. The
+        periodic sweep is self-managing (it stops re-arming when the queue is
+        empty), so there is nothing per-event to cancel; kept for call-site
+        symmetry and future use."""
+        self._stale_timers.pop(int(event_id), None)
 
     @staticmethod
     def _dc_ref(dc_channel_id, dc_message_id) -> str:
@@ -693,31 +693,104 @@ class GatewayServer:
         return sorted(seen)
 
     async def _sweep_stale(self) -> None:
-        """Timer-driven sweep: declare stale every pending event whose oldest
-        item is older than stale_sec. (A timer pop only schedules the sweep; the
-        sweep re-checks ages so a single sweep can clear several.)"""
+        """Timer-driven TIMEOUT sweep. For each pending event whose oldest item
+        is older than stale_sec, apply timeout staleness: fire+remove ONLY parked
+        REPLY actions (their fallback — an ordinary message routed like the parent
+        — is better than a very-late linked reply), and LEAVE parked
+        react/edit/delete AND finish_mapping in place (a late reaction/edit/delete
+        is as good as an on-time one; a late correlation still writes the row).
+        Emits one WARNING for the OLDEST still-stuck event per stale_sec.
+
+        This is distinct from ACK-order staleness (_declare_abandoned), which is
+        a definitive 'client will never correlate this' and deletes everything."""
         if self._pending is None:
             return
         import time as _t
-        cutoff = _t.time() - self._stale_sec
-        stale_events = sorted({
-            it.event_id for it in self._pending.peek_older_than(cutoff)
-        })
-        for ev in stale_events:
-            self._declare_stale(ev)
+        now = _t.time()
+        cutoff = now - self._stale_sec
+        items = self._pending.peek_older_than(cutoff)
+        if not items:
+            # Nothing stale yet. If work is still pending (younger than cutoff),
+            # keep the periodic sweep alive so it re-checks; else let it stop.
+            if self._pending.count() > 0:
+                self._rearm_periodic_sweep()
+            else:
+                self._stale_timers.pop("_periodic", None)
+            return
+        # Group stale items by event.
+        by_event: dict = {}
+        for it in items:
+            by_event.setdefault(it.event_id, []).append(it)
 
-    def _declare_stale(self, event_id: int) -> None:
-        """Handle a pending event that will never be correlated. Per design:
-        DELETE its finish_mapping (no map row will ever be written), then FIRE
-        the remaining parked actions normally — each looks up its tg_msg, finds
-        none (mapping was never written), and runs its own fallback. This reuses
-        the exact same firing path as a successful correlation; the only
-        difference is finish_mapping is dropped rather than run."""
+        # Timeout action: fire+remove only reply parked actions.
+        for ev, evitems in by_event.items():
+            reply_items = [
+                it for it in evitems
+                if it.kind == "perform_action"
+                and it.data.get("action_type") == "reply"
+            ]
+            for it in reply_items:
+                logger.warning(
+                    "CORRELATION_TIMEOUT (reply fallback) | gateway=%s | "
+                    "event_id=%s | dc_msg=%s | reason=no correlation within %.0fs; "
+                    "sending reply as ordinary message",
+                    self._own_gateway, ev, it.data.get("dc_message_id"),
+                    self._stale_sec,
+                )
+                if self._perform_parked is not None:
+                    try:
+                        asyncio.get_running_loop().create_task(
+                            self._perform_parked(dict(it.data), [])
+                        )
+                    except RuntimeError:
+                        logger.warning("no running loop to fire timeout reply fallback")
+            if reply_items:
+                self._pending.drop([it.id for it in reply_items])
+
+        # Periodic visibility: one WARNING for the OLDEST still-stuck event.
+        oldest = min(items, key=lambda it: it.created_ts)
+        age = now - oldest.created_ts
+        logger.warning(
+            "CORRELATION_STUCK | gateway=%s | oldest_event_id=%s | dc_msg=%s | "
+            "age=%.0fs | still awaiting correlation (finish_mapping and any "
+            "react/edit/delete retained)",
+            self._own_gateway, oldest.event_id,
+            oldest.data.get("dc_message_id"), age,
+        )
+        # Re-arm the periodic sweep only while something is still pending, so a
+        # stuck event keeps getting the periodic warning (and newly-timed-out
+        # replies get flushed) every stale_sec; stop re-arming when drained.
+        import time as _t2
+        if self._pending.count() > 0:
+            self._rearm_periodic_sweep()
+        else:
+            self._stale_timers.pop("_periodic", None)
+
+    def _rearm_periodic_sweep(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        # Reuse a dedicated key so we don't stack multiple periodic sweeps.
+        old = self._stale_timers.pop("_periodic", None)
+        if old is not None:
+            old.cancel()
+        self._stale_timers["_periodic"] = loop.call_later(
+            self._stale_sec, lambda: asyncio.ensure_future(self._sweep_stale())
+        )
+
+    def _declare_abandoned(self, event_id: int) -> None:
+        """ACK-order staleness: a correlation for a LATER event arrived, and
+        clients send correlations in ACK order, so the client has definitively
+        said it will NEVER correlate this (older) event. Fire ALL remaining
+        parked actions' fallbacks (reply→ordinary message; react/edit/delete→
+        WARNING) and DELETE everything, including finish_mapping. Also the safety
+        valve against a forever-stuck event (e.g. client DB wiped + restarted)."""
         if self._pending is None:
             return
         event_id = int(event_id)
         self._cancel_stale_timer(event_id)
-        items = self._pending.take(event_id)
+        items = self._pending.take(event_id)   # removes ALL items for the event
         if not items:
             return
         if self._awaiting is not None:
@@ -726,19 +799,15 @@ class GatewayServer:
         dropped_mapping = 0
         for it in items:
             if it.kind == "finish_mapping":
-                dropped_mapping += 1          # drop: no row will be written
+                dropped_mapping += 1
             elif it.kind == "perform_action":
                 parked.append(it.data)
         logger.warning(
-            "CORRELATION_MISSING | gateway=%s | event_id=%s | "
-            "finish_mapping_dropped=%d | parked_actions_fired=%d | "
-            "reason=no correlation within stale window (%.0fs)",
+            "CORRELATION_MISSING (abandoned, ACK-order) | gateway=%s | "
+            "event_id=%s | finish_mapping_dropped=%d | parked_actions_fired=%d | "
+            "reason=client correlated a later event; this one will never correlate",
             self._own_gateway, event_id, dropped_mapping, len(parked),
-            self._stale_sec,
         )
-        # Fire remaining parked actions with NO mapping present → each takes its
-        # fallback. Same firing path as success; empty telegram_ids is irrelevant
-        # (actions resolve their own tg_msg from the map, which won't be there).
         if parked and self._perform_parked is not None:
             for action_data in parked:
                 try:
@@ -746,7 +815,7 @@ class GatewayServer:
                         self._perform_parked(action_data, [])
                     )
                 except RuntimeError:
-                    logger.warning("no running loop to fire stale parked action")
+                    logger.warning("no running loop to fire abandoned parked action")
 
     def _complete_mapping(self, ctx: dict, telegram_ids: list) -> None:
         """Write a message_map row for each correlated Telegram id, so a later
