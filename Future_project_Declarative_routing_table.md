@@ -132,6 +132,57 @@ the userbot subsystem deliberately avoids. The userbot subsystem instead uses a
 small, separate, volatile "awaiting" table so `message_map` is untouched until
 this project.
 
+### 3a. Deferred bug: multi-level cascade gap (dependency still parked)
+
+Observed live (2026-07-12, supergroup, unified ids). A reaction to a
+reply-to-reply (grandchild) was silently dropped when the reaction arrived while
+the grandchild's OWN relay was still parked.
+
+Timeline: the grandchild reply was itself a parked action (waiting on its
+parent, the third child, to correlate). A few seconds after writing the
+grandchild, the user reacted to it. At that instant the grandchild's dc_msg was:
+- **not mapped** — its reply had not executed, so no message_map row; and
+- **not awaiting** — its reply was still parked, so `register_pending_mapping`
+  (which creates the awaiting-index entry) had not run yet.
+
+Neither mapped nor awaiting → the reaction hit the "not ours → drop" branch
+(no log). The gap: the awaiting-index only knows about messages whose relay has
+**executed** (and thus registered a pending mapping). A message whose relay is
+still in the parking lot — waiting behind another parked action — is invisible,
+so an action depending on it finds nothing to wait on.
+
+**Root-cause reframing (this is the fix the refactor should adopt).** Today the
+provisional record and the awaiting-index are keyed by **event_id**, and the
+event_id is not assigned until the message is **enqueued** to the gateway — which
+is exactly what a parked relay defers. But `register_pending_mapping` does NOT
+reference the parent or the message map at all; it only records dc-side context
+and writes a row when the event correlates. The ONLY reason it cannot run at
+Discord-message-arrival is the event_id key. Two things are conflated in
+"event_id":
+1. **identity of the dc_msg awaiting a mapping** — known the instant the Discord
+   message arrives; and
+2. **the correlation token** the client echoes back to report the tg_msg — known
+   only at enqueue time.
+
+Separate them: **key the provisional/awaiting record by dc_msg (known
+immediately), and treat event_id as merely the token that later resolves it.**
+Then a provisional record exists from the moment a Discord message is seen
+(tg_msg = NULL), so anything depending on that dc_msg can park against it
+immediately — regardless of how many levels of parked relays sit above it. The
+correlation later fills in the tg_msg (provisional → resolved). This is exactly
+§2a's single-table, dc_msg-keyed, NULL-tuple provisional row: the awaiting-index
+and message_map are the same table in two states. Downstream actions park on a
+dc_msg, not an event_id; the event_id is associated at enqueue and consumed at
+correlation.
+
+Deferred to this project because the principled fix is precisely the dc_msg-keyed
+provisional-row model (§2, §2a) — a bolt-on subscription in the current
+event_id-keyed machinery would be replaced by that model anyway. Low current
+exposure (requires a fast reaction to a message whose own relay is still parked —
+a multi-level cascade, reachable but narrow). When the routing table is
+dc_msg-keyed with provisional rows, this gap does not exist: the grandchild's
+provisional row is present the moment it is seen.
+
 ### Consequence analysis (worked through in design discussion)
 
 1. **Same (group,msg) can exist twice (native + gatewayed).** This is the point
@@ -397,6 +448,22 @@ Consequences if the analogy holds:
   on its transport once; there is no separate "also do it natively" path,
   because "native" is just one transport the server drives through the same
   client-like black box.
+
+**Refinement (root cause is VISIBILITY, not id-spaces).** The multiple-id-space
+problem is a *consequence*, not the root. The root is **Telegram message
+visibility** across the mix of bots and users in a group: bots cannot see other
+bots' messages/reactions; a userbot's reposts are visible to users but the
+correlation must be tracked; and the "rogue" client that invents its own tg_msg
+numbers and never posts is simply the LIMITING CASE of "this participant's
+messages are invisible to all other Telegram participants" (invisibility total).
+If the gateway boolean flags capture the visibility matrix — candidates like
+`echo`, `relay_user_messages`, `client_reposts`, and a
+`messages_invisible_to_bots` / `client_invisible` style flag — then id-space
+divergence falls out of visibility rather than being modeled as its own problem.
+Design the server-like/client-like blocks around a declared visibility model;
+the id bookkeeping (route-keyed rows) then expresses the consequences of that
+model rather than being a separate concern. This subsumes stress-test #1 below:
+id-space ownership is one facet of the visibility declaration.
 
 Stress-tests to resolve DURING design (where the analogy might strain, so we
 find out before building rather than after):
