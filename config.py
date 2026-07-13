@@ -371,6 +371,19 @@ class Config:
         )
         self.pending_work_db_file: str = str(PROJECT_ROOT / pw_filename)
 
+        # Phase 5: a pending event that never receives its correlation is
+        # declared STALE after this many seconds (the client may be idle, in
+        # FLOOD recovery, or wayward). Its finish_mapping is dropped and any
+        # parked actions fire their fallbacks.
+        self.correlation_stale_sec: float = float(os.getenv(
+            self.env_prefix + "CORRELATION_STALE_SEC", "120"
+        ))
+        # Phase 5: message_map rows referring to messages older than this many
+        # days are purged in the daily housekeeping.
+        self.purge_days: int = int(os.getenv(
+            self.env_prefix + "PURGE_DAYS", "14"
+        ))
+
         # Google Sheets
         self.google_spreadsheet_name: str = get("GOOGLE_SPREADSHEET_NAME")
 

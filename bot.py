@@ -2390,18 +2390,29 @@ async def _perform_reaction_to_target(
 
 
 def _dc_ref_of_action(action: dict) -> tuple:
-    """(dc_channel_id, dc_message_id) whose mapping this action depends on.
-    For a reply it is the PARENT; for the others it is the acted-on message."""
-    if action["action_type"] == "reply":
+    """(dc_channel_id, dc_message_id) whose mapping this action depends on, or
+    None if the action has no dependency (a plain 'message' depends on nothing,
+    so it never parks). For a reply it is the PARENT; for react/edit/delete it
+    is the acted-on message."""
+    kind = action["action_type"]
+    if kind == "message":
+        return None
+    if kind == "reply":
         return action["parent_dc_channel_id"], action["parent_dc_id"]
     return action["dc_channel_id"], action["dc_message_id"]
 
 
 async def _dispatch_or_park_action(action: dict) -> None:
     """The one quick decision, identical for every action type: execute now if
-    the dependency is mapped, else park it if the dependency is awaiting
-    correlation, else drop. The action is already fully built by the caller."""
-    dep_channel, dep_msg = _dc_ref_of_action(action)
+    the dependency is mapped (or there is no dependency), else park it if the
+    dependency is awaiting correlation, else drop. The action is already fully
+    built by the caller."""
+    dep = _dc_ref_of_action(action)
+    if dep is None:
+        # No dependency (plain message) → nothing to wait for; execute now.
+        await _execute_scheduled_action(action)
+        return
+    dep_channel, dep_msg = dep
     loop = asyncio.get_running_loop()
     record = await loop.run_in_executor(None, db.find_by_dc, dep_channel, dep_msg)
     if record:
@@ -2434,9 +2445,10 @@ async def _execute_scheduled_action(action: dict) -> None:
         dc_msg_id = action["dc_message_id"]
         record = await loop.run_in_executor(None, db.find_by_dc, dc_channel_id, dc_msg_id)
         if not record:
-            logger.info(
-                f"scheduled reaction: no target | dc_msg={dc_msg_id} | "
-                f"emoji={action.get('emoji_str')} (no-op)"
+            logger.warning(
+                f"CORRELATION_MISSING fallback (reaction) | dc_msg={dc_msg_id} | "
+                f"emoji={action.get('emoji_str')} | reason=target never correlated; "
+                f"reaction dropped"
             )
             return
         behavior = config.reactions_dtot
@@ -2468,26 +2480,35 @@ async def _execute_scheduled_action(action: dict) -> None:
             )
         return
 
-    if kind == "reply":
-        # The parent's tg_msg is resolved here, at execution time (guaranteed
-        # present). Posts nothing itself: enqueues the reply out the gateway and
-        # registers THIS reply's own pending mapping (the cascade — identical to
-        # a first-time relay).
-        parent_record = await loop.run_in_executor(
-            None, db.find_by_dc,
-            action["parent_dc_channel_id"], action["parent_dc_id"],
-        )
-        if not parent_record:
-            logger.info(
-                f"scheduled reply: parent unmapped | "
-                f"dc_msg={action['dc_message_id']} | "
-                f"parent_dc={action['parent_dc_id']} (dropped)"
+    if kind in ("reply", "message"):
+        # message and reply are the SAME relay action; a reply has a parent
+        # dependency (resolve its tg_msg → reply_to), a message has none
+        # (reply_to=None). Both enqueue a new outbound message and register their
+        # OWN pending mapping (both produce a new tg_msg → correlatable). The
+        # parent's tg_msg is resolved here at execution time (present on the
+        # success path; absent only on the STALE path → reply fallback).
+        reply_to = None
+        if kind == "reply":
+            parent_record = await loop.run_in_executor(
+                None, db.find_by_dc,
+                action["parent_dc_channel_id"], action["parent_dc_id"],
             )
-            return
-        try:
-            reply_to = int(parent_record["tg_message_id"])
-        except (ValueError, TypeError):
-            reply_to = None
+            if not parent_record:
+                # STALE fallback for reply: the parent never got a tg_msg. Send
+                # the Discord message as a NEW (non-reply) Telegram message so
+                # the content is not lost, and WARN.
+                logger.warning(
+                    f"CORRELATION_MISSING fallback (reply→message) | "
+                    f"dc_msg={action['dc_message_id']} | "
+                    f"parent_dc={action['parent_dc_id']} | "
+                    f"reason=parent never correlated; sending as new message"
+                )
+                reply_to = None
+            else:
+                try:
+                    reply_to = int(parent_record["tg_message_id"])
+                except (ValueError, TypeError):
+                    reply_to = None
         env = gp.make_message(
             action["origin_gateway"], int(action["tg_group_id"]),
             message_id=None,
@@ -2512,9 +2533,9 @@ async def _execute_scheduled_action(action: dict) -> None:
                 origin_gateway=action["origin_gateway"],
             )
         except Exception as _e:
-            logger.warning(f"register_pending_mapping failed (reply exec): {_e}")
+            logger.warning(f"register_pending_mapping failed ({kind} exec): {_e}")
         logger.info(
-            f"DC→GW server relay (reply) | gateway={action['origin_gateway']} "
+            f"DC→GW server relay ({kind}) | gateway={action['origin_gateway']} "
             f"| tg_group={action['tg_group_id']} | reply_to_tg_msg={reply_to} "
             f"| event_id={event_id} | sender={action.get('sender_name','')!r} "
             f"| attachments={len(action.get('attachments') or [])}"
@@ -2528,7 +2549,7 @@ async def _execute_scheduled_action(action: dict) -> None:
             None, db.find_all_by_dc, dc_channel_id, dc_msg_id
         )
         if not records:
-            logger.info(f"scheduled delete: no target | dc_msg={dc_msg_id} (no-op)")
+            logger.warning(f"CORRELATION_MISSING fallback (delete) | dc_msg={dc_msg_id} | reason=target never correlated; delete dropped")
             return
         if _tg_app is None:
             logger.debug("Skipping delete: Telegram app not ready yet (startup window)")
@@ -2629,7 +2650,7 @@ async def _execute_scheduled_action(action: dict) -> None:
         sender_name = action.get("sender_name", "")
         record = await loop.run_in_executor(None, db.find_by_dc, dc_channel_id, dc_msg_id)
         if not record:
-            logger.info(f"scheduled edit: no target | dc_msg={dc_msg_id} (no-op)")
+            logger.warning(f"CORRELATION_MISSING fallback (edit) | dc_msg={dc_msg_id} | reason=target never correlated; edit dropped")
             return
         tg_group_id = record["tg_group_id"]
         tg_msg_id = int(record["tg_message_id"])
@@ -3572,16 +3593,19 @@ class TDbridgeDiscordClient(discord.Client):
             )
             for _n in gw_notes:
                 logger.warning(f"GW outbound attachment ({tg_group_id}): {_n}")
-            # Build the reply action and execute it through the SAME executor the
-            # parked-reply fire uses (one build shape, one executor). The parent's
-            # tg_msg is resolved inside the executor from the map (present here,
-            # since parent_record was found). Executing assumes completeness.
+            # Build the relay action: 'reply' if this Discord message replies to
+            # a (gateway-origin) parent, else 'message' (e.g. relay_user_messages
+            # brought a plain message here). Both go through the SAME executor,
+            # which registers the pending mapping. Guard against message.reference
+            # being None (plain message) — that was a latent crash.
+            _is_reply = bool(
+                message.reference and message.reference.message_id
+                and immediate_reply_tg_id
+            )
             action = {
-                "action_type": "reply",
+                "action_type": "reply" if _is_reply else "message",
                 "origin_gateway": inherited_origin_gateway,
                 "tg_group_id": str(tg_group_id),
-                "parent_dc_channel_id": dc_channel_id,
-                "parent_dc_id": str(message.reference.message_id),
                 "relay_text": relay_text,
                 "attachments": _attachments_to_parked(gw_attachments),
                 "sender_name": sender_name,
@@ -3589,6 +3613,9 @@ class TDbridgeDiscordClient(discord.Client):
                 "dc_message_id": str(message.id),
                 "dc_user_id": str(getattr(message.author, "id", "") or ""),
             }
+            if _is_reply:
+                action["parent_dc_channel_id"] = dc_channel_id
+                action["parent_dc_id"] = str(message.reference.message_id)
             await _execute_scheduled_action(action)
             return
 
@@ -4012,7 +4039,18 @@ async def _db_purge_loop() -> None:
     while True:
         await asyncio.sleep(TWENTY_FOUR_HOURS)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, db.purge_older_than, 30)
+        # message_map rows referring to messages older than PURGE_DAYS.
+        await loop.run_in_executor(None, db.purge_older_than, config.purge_days)
+        # Also purge old completed correlations from the registry (same window).
+        _corr = getattr(_gateway_server, "_correlations", None)
+        if _corr is not None:
+            import time as _t
+            try:
+                cutoff = _t.time() - config.purge_days * 86400
+                removed = _corr.purge_older_than(cutoff)
+                logger.info(f"Correlation registry purge: removed {removed} old entries")
+            except Exception as e:
+                logger.warning(f"correlation purge failed: {e}")
         # Sweep any gateway attachment left on disk > 24h (should not happen;
         # sweep_leftovers logs an ERROR per leftover). Only meaningful when this
         # instance owns a gateway, but the call is harmless otherwise.

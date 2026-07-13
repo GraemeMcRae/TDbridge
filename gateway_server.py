@@ -92,6 +92,11 @@ class GatewayServer:
         # Kept as a hook so the pending-work dispatcher (here) stays free of
         # Discord/Telegram action logic (which lives in bot.py).
         self._perform_parked = None
+        # Phase 5 staleness: one asyncio timer per pending event. Set when the
+        # event's pending mapping is registered; cancelled when its correlation
+        # arrives or it is declared stale. On pop → sweep for stale events.
+        self._stale_sec = float(getattr(config, "correlation_stale_sec", 120))
+        self._stale_timers: dict = {}   # event_id -> asyncio.TimerHandle
         # Async hook injected by bot.py implementing the gateway's central
         # function: place the message in Telegram (Echo=true) or accept the
         # client-supplied id (Echo=false), then bridge it to Discord. Signature:
@@ -526,16 +531,23 @@ class GatewayServer:
 
     def record_correlation(self, event_id: int, telegram_ids: list) -> None:
         """Record a correlation in the registry, then dispatch any pending work
-        that was waiting on this event (Phase 3: complete the message_map
-        row(s); Phase 4 will add parked-action kinds). Called by the correlate
-        endpoint (client-sent) and (future) by the echo path (self-correlate)."""
+        that was waiting on this event. Also: (1) cancel this event's stale
+        timer; (2) apply the ACK-order rule — clients send correlations in the
+        same order they ACKed, so any still-pending event OLDER than this one
+        (lower event_id) will never be correlated and is declared stale now."""
+        event_id = int(event_id)
+        self._cancel_stale_timer(event_id)
+        # ACK-order staleness: everything still pending with a lower id is stale.
+        if self._pending is not None:
+            for older in self._pending_event_ids_below(event_id):
+                self._declare_stale(older)
         if self._correlations is not None:
-            self._correlations.record(int(event_id), [int(t) for t in telegram_ids])
+            self._correlations.record(event_id, [int(t) for t in telegram_ids])
         logger.info(
             "CORRELATE recorded | gateway=%s | event_id=%s | tg_msg=%s",
             self._own_gateway, event_id, list(telegram_ids),
         )
-        self._dispatch_pending(int(event_id), [int(t) for t in telegram_ids])
+        self._dispatch_pending(event_id, [int(t) for t in telegram_ids])
 
     def register_pending_mapping(self, event_id: int, *, dc_channel_id: str,
                                  dc_message_id: str, tg_group_id: str,
@@ -561,6 +573,27 @@ class GatewayServer:
         if self._awaiting is not None:
             self._awaiting.put(self._dc_ref(dc_channel_id, dc_message_id),
                                int(event_id))
+        # Arm a staleness timer: if this event isn't correlated within
+        # stale_sec, a sweep declares it (and any older uncorrelated events)
+        # stale and fires fallbacks. Cancelled in record_correlation.
+        self._arm_stale_timer(int(event_id))
+
+    def _arm_stale_timer(self, event_id: int) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return   # no loop yet (startup); the periodic housekeeping still covers it
+        old = self._stale_timers.pop(event_id, None)
+        if old is not None:
+            old.cancel()
+        self._stale_timers[event_id] = loop.call_later(
+            self._stale_sec, lambda: asyncio.ensure_future(self._sweep_stale())
+        )
+
+    def _cancel_stale_timer(self, event_id: int) -> None:
+        t = self._stale_timers.pop(event_id, None)
+        if t is not None:
+            t.cancel()
 
     @staticmethod
     def _dc_ref(dc_channel_id, dc_message_id) -> str:
@@ -645,6 +678,75 @@ class GatewayServer:
                     )
                 except RuntimeError:
                     logger.warning("no running loop to fire parked action")
+
+    # ---- Phase 5: staleness ------------------------------------------------ #
+    def _pending_event_ids_below(self, event_id: int) -> list:
+        """Distinct pending event ids strictly less than event_id (ACK-order
+        rule: these will never be correlated once a later one has been)."""
+        if self._pending is None:
+            return []
+        import time as _t
+        seen = set()
+        for it in self._pending.peek_older_than(_t.time() + 1e9):
+            if it.event_id < event_id:
+                seen.add(it.event_id)
+        return sorted(seen)
+
+    async def _sweep_stale(self) -> None:
+        """Timer-driven sweep: declare stale every pending event whose oldest
+        item is older than stale_sec. (A timer pop only schedules the sweep; the
+        sweep re-checks ages so a single sweep can clear several.)"""
+        if self._pending is None:
+            return
+        import time as _t
+        cutoff = _t.time() - self._stale_sec
+        stale_events = sorted({
+            it.event_id for it in self._pending.peek_older_than(cutoff)
+        })
+        for ev in stale_events:
+            self._declare_stale(ev)
+
+    def _declare_stale(self, event_id: int) -> None:
+        """Handle a pending event that will never be correlated. Per design:
+        DELETE its finish_mapping (no map row will ever be written), then FIRE
+        the remaining parked actions normally — each looks up its tg_msg, finds
+        none (mapping was never written), and runs its own fallback. This reuses
+        the exact same firing path as a successful correlation; the only
+        difference is finish_mapping is dropped rather than run."""
+        if self._pending is None:
+            return
+        event_id = int(event_id)
+        self._cancel_stale_timer(event_id)
+        items = self._pending.take(event_id)
+        if not items:
+            return
+        if self._awaiting is not None:
+            self._awaiting.remove_event(event_id)
+        parked = []
+        dropped_mapping = 0
+        for it in items:
+            if it.kind == "finish_mapping":
+                dropped_mapping += 1          # drop: no row will be written
+            elif it.kind == "perform_action":
+                parked.append(it.data)
+        logger.warning(
+            "CORRELATION_MISSING | gateway=%s | event_id=%s | "
+            "finish_mapping_dropped=%d | parked_actions_fired=%d | "
+            "reason=no correlation within stale window (%.0fs)",
+            self._own_gateway, event_id, dropped_mapping, len(parked),
+            self._stale_sec,
+        )
+        # Fire remaining parked actions with NO mapping present → each takes its
+        # fallback. Same firing path as success; empty telegram_ids is irrelevant
+        # (actions resolve their own tg_msg from the map, which won't be there).
+        if parked and self._perform_parked is not None:
+            for action_data in parked:
+                try:
+                    asyncio.get_running_loop().create_task(
+                        self._perform_parked(action_data, [])
+                    )
+                except RuntimeError:
+                    logger.warning("no running loop to fire stale parked action")
 
     def _complete_mapping(self, ctx: dict, telegram_ids: list) -> None:
         """Write a message_map row for each correlated Telegram id, so a later
