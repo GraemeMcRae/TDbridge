@@ -11,8 +11,15 @@
 # Usage: run automatically via cron (see below) or manually:
 #   bash ~/TDbridge/cert_renew.sh
 #
-# Cron entry (runs daily at 3 AM):
-#   0 3 * * * /home/graeme/TDbridge/cert_renew.sh
+# Cron entry (root crontab, runs daily at 09:02 UTC):
+#   2 9 * * * /home/graeme/TDbridge/cert_renew.sh
+#
+# 09:02 UTC is chosen to dodge Webuzo's other cron jobs: the */5 entries fire
+# at :00, :05, :10... and the hourly entry fires at :01, leaving :02 clear.
+# Only the every-minute crons.php watchdog remains to dodge, which the
+# in-minute alignment below handles.  Note that this is a fixed UTC time, so
+# it lands just after 2 AM PDT in summer and just after 1 AM PST in winter.
+# With the retry back-off (below) the script may run until roughly 09:40 UTC.
 #
 # Do NOT add a per-minute retry cron entry.  This script now handles retries
 # internally with exponential back-off (see Step 3).  Retrying every minute
@@ -47,6 +54,15 @@ ARCHIVE_GLOB="/etc/letsencrypt/archive/${DOMAIN}/*.pem"
 LOG_FILE="/home/graeme/TDbridge/TDbridge_utility.log"
 LOG_BACKUP="/home/graeme/TDbridge/TDbridge_utility.log.1"
 LOG_MAX_BYTES=$((5 * 1024 * 1024))   # 5 MB
+
+# Webuzo's crons.php watchdog fires at the top of every minute.  These two
+# values define the safe window within a minute for certbot to hold port 80:
+# WATCHDOG_SAFE_START is the earliest second by which crons.php has finished
+# and gotten out of the way; WATCHDOG_SAFE_END is the latest second at which
+# there is still enough runway (port-80 free plus certbot's bind and challenge)
+# before the next minute's crons.php fires.
+WATCHDOG_SAFE_START=20
+WATCHDOG_SAFE_END=40
 
 # Retry policy for transient ACME service conditions.
 # 4 attempts with a doubling delay starting at 300s gives sleeps of
@@ -101,26 +117,43 @@ log_block() {
 # SIGKILL (exit 137) if certbot is holding the port at that moment.
 #
 # We don't touch Webuzo's cron files (fighting the watchdog on its own turf
-# risks unpredictable escalation).  Instead we sleep 20 seconds past the top of
-# a minute so that this minute's crons.php has finished and gotten out of the
-# way.  certbot then runs in the ~40-second gap before the next minute fires.
+# risks unpredictable escalation).  Instead we wait until we are inside the
+# safe window of a minute — between WATCHDOG_SAFE_START and WATCHDOG_SAFE_END
+# seconds past the boundary — where this minute's crons.php has finished and
+# the next one has not yet fired.
 #
-# On the first call, cron has already started us at the top of a minute, so the
-# alignment sleep is a no-op.  On retry calls we arrive at an arbitrary offset
-# within the minute after a back-off sleep, so we first wait for the next minute
-# boundary and then do the usual 20 seconds.
+# This is computed as a SINGLE sleep to the target second, not as "wait for the
+# top of the minute, then sleep 20".  cron dispatches us a second or so past
+# the boundary, so the two-stage version would see :01, wait 59s for the next
+# boundary, then sleep 20 more — 79 seconds to reach a point it was 19 seconds
+# away from.
+#
+# Three cases:
+#   before the window  — sleep the remainder (the common case; from :01, 19s)
+#   inside the window  — proceed immediately, no sleep at all
+#   past the window    — too little runway left this minute, so sleep to the
+#                        start of next minute's window
+#
+# Retry calls arrive at an arbitrary offset after a back-off sleep and are
+# handled by the same three cases.
 # ---------------------------------------------------------------------------
 dodge_watchdog() {
-    local secs
-    # 10# forces base-10 so that "08" and "09" from date +%S don't get
-    # interpreted as invalid octal.
-    secs=$(( 60 - 10#$(date +%S) ))
-    if (( secs > 0 && secs < 60 )); then
-        log_info "Waiting ${secs}s for the next minute boundary before the watchdog dodge"
-        sleep "$secs"
+    local now_sec wait_secs
+    # 10# forces base-10 so that "08" and "09" from date +%S are not read as
+    # invalid octal.
+    now_sec=$(( 10#$(date +%S) ))
+
+    if (( now_sec < WATCHDOG_SAFE_START )); then
+        wait_secs=$(( WATCHDOG_SAFE_START - now_sec ))
+    elif (( now_sec <= WATCHDOG_SAFE_END )); then
+        log_info "Already ${now_sec}s past the minute boundary — inside the watchdog-safe window (${WATCHDOG_SAFE_START}-${WATCHDOG_SAFE_END}s), proceeding without delay"
+        return 0
+    else
+        wait_secs=$(( 60 - now_sec + WATCHDOG_SAFE_START ))
     fi
-    log_info "Sleeping 20 seconds to avoid colliding with Webuzo's per-minute watchdog cron"
-    sleep 20
+
+    log_info "Sleeping ${wait_secs}s (from ${now_sec}s past the boundary) to land in the watchdog-safe window and avoid Webuzo's per-minute cron"
+    sleep "$wait_secs"
 }
 
 # ---------------------------------------------------------------------------
