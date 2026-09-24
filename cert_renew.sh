@@ -157,6 +157,52 @@ dodge_watchdog() {
 }
 
 # ---------------------------------------------------------------------------
+# Back-off that lands on the safe window
+#
+# A plain "sleep 300" preserves whatever second the previous attempt failed at,
+# because 300 is an exact multiple of 60.  The start second of each attempt then
+# creeps forward by the duration of the previous attempt: an attempt starting at
+# :20 that fails at :32 puts the next attempt at :32, which fails at :41, which
+# puts the third attempt outside the window and forces a further wait.
+#
+# Instead of sleeping the nominal delay, sleep to whichever
+# :WATCHDOG_SAFE_START mark is nearest the nominal wake-up time.  The adjustment
+# is at most ±30 seconds, which is noise against a 300-second back-off, and
+# every attempt then begins at the same point in the minute regardless of how
+# long the previous attempt ran.
+#
+# A fixed "nominal minus 30" achieves the same thing for short attempts, but has
+# a blind spot: it maps a failure between :50 and :10 into :20-:40, which
+# dodge_watchdog reads as already-safe, and the creep survives.  Computing the
+# adjustment closes that band.
+#
+# dodge_watchdog is still called afterwards as a safety net, but on this path it
+# should always find itself already inside the window.
+# ---------------------------------------------------------------------------
+backoff_to_safe_window() {
+    local nominal="$1" now_sec offset adj wait_secs
+
+    now_sec=$(( 10#$(date +%S) ))
+
+    # Seconds we would need to ADD to the nominal delay to land exactly on the
+    # next WATCHDOG_SAFE_START mark.  The doubled modulo keeps the result in
+    # [0,59] despite bash's truncated-toward-zero modulo on negative operands.
+    offset=$(( ( (WATCHDOG_SAFE_START - now_sec - nominal) % 60 + 60 ) % 60 ))
+
+    # Overshooting by more than half a minute means the previous mark is nearer,
+    # so undershoot instead.  Keeps the adjustment within ±30s.
+    if (( offset > 30 )); then
+        adj=$(( offset - 60 ))
+    else
+        adj=$offset
+    fi
+
+    wait_secs=$(( nominal + adj ))
+    log_info "Backing off ${wait_secs}s (nominal ${nominal}s, adjusted ${adj}s) to wake at ${WATCHDOG_SAFE_START}s past a minute boundary"
+    sleep "$wait_secs"
+}
+
+# ---------------------------------------------------------------------------
 # Step 1 helper: Stop and disable Webuzo's httpd.service
 #
 # Webuzo runs a watchdog that may re-enable and restart httpd.service via
@@ -342,8 +388,7 @@ run_certbot_with_retry() {
             log_warning "${label} INCONCLUSIVE (exit ${rc}, attempt ${attempt}/${CERTBOT_MAX_ATTEMPTS}) — ACME service busy or unavailable. certbot output follows:"
             log_block "WARNING" "$output"
             if (( attempt < CERTBOT_MAX_ATTEMPTS )); then
-                log_info "Backing off ${delay}s before retry"
-                sleep "$delay"
+                backoff_to_safe_window "$delay"
                 delay=$(( delay * 2 ))
             fi
             continue
